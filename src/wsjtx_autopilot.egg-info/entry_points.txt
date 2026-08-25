@@ -1,0 +1,3 @@
+[console_scripts]
+wsjtx-autopilot = wsjtx_autopilot.main:main
+wsjtx-autopilot-gui = wsjtx_autopilot.gui.app:main

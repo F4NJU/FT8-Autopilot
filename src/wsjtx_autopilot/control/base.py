@@ -1,0 +1,33 @@
+from datetime import datetime
+from typing import Protocol
+
+from wsjtx_autopilot.engine.models import ActionOutcome, IntendedAction, OriginalDecode
+from wsjtx_autopilot.wsjtx.models import WsjtxPacket
+
+Endpoint = tuple[str, int]
+
+
+class ControlAdapter(Protocol):
+    @property
+    def actions_used(self) -> int: ...
+
+    @property
+    def max_actions(self) -> int | None: ...
+
+    def observe(self, packet: WsjtxPacket, endpoint: Endpoint | None) -> None: ...
+
+    def execute(self, action: IntendedAction, now: datetime) -> ActionOutcome: ...
+
+    def poll(self) -> None: ...
+
+    def disarm(self, reason: str = "software kill switch") -> None: ...
+
+    def halt_tx(self, instance_id: str | None, reason: str) -> bool: ...
+
+    def retry_final(self, decode: OriginalDecode, reason: str) -> bool: ...
+
+    def set_tx_df(self, action: IntendedAction, tx_df: int, now: datetime) -> bool: ...
+
+
+class DatagramTransport(Protocol):
+    def sendto(self, data: bytes, endpoint: Endpoint) -> int: ...

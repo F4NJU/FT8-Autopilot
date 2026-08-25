@@ -1,0 +1,52 @@
+﻿name: WIP Release
+
+on:
+  push:
+    tags:
+      - "v*-wip.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install PySide6 pyinstaller pytest
+
+      - name: Tests
+        shell: pwsh
+        run: |
+          python -m pytest
+          python -m compileall -q src tests
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller packaging/wsjtx-autopilot.spec
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/WSJTX-AutoPilot/*" -DestinationPath "FT8-AutoPilot-Windows.zip"
+
+      - name: Publish prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "FT8-AutoPilot-Windows.zip" --title "${{ github.ref_name }}" --prerelease --generate-notes
