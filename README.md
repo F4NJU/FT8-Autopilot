@@ -591,3 +591,11 @@ Licence:         GPL-3.0
 
 Do not assume that a feature mentioned in this README is available unless
 it is marked ✅ Working.
+
+## Bug reports
+
+When reporting an operating issue, please include a diagnostic log or
+use **Settings → Diagnostics → Export diagnostic**.
+
+Diagnostic logs contain FT8 messages, callsigns, frequencies and QSO
+state information, but should never contain passwords or API tokens.
