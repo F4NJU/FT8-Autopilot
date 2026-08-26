@@ -28,6 +28,8 @@ class QsoState(Enum):
 @dataclass(slots=True)
 class QsoSession:
     local_callsign: str
+    qso_id: int | None = None
+    started_at: datetime | None = None
     state: QsoState = QsoState.IDLE
     remote_callsign: str | None = None
     mode: str | None = None
@@ -64,11 +66,24 @@ class QsoStateMachine:
         self.timeout = timedelta(seconds=timeout_seconds)
         self.max_retries = max_retries
         self.progress = QsoProgressTracker(max_no_progress_periods)
+        self._next_qso_id = 1
 
     def _transition(self, state: QsoState, reason: str) -> None:
         previous = self.session.state
         self.session.state = state
-        LOGGER.info("[ENGINE] state %s -> %s reason=%s", previous.name, state.name, reason)
+        LOGGER.info(
+            "[QSO id=%s] state %s -> %s reason=%s remote=%s",
+            self.session.qso_id or "-",
+            previous.name,
+            state.name,
+            reason,
+            self.session.remote_callsign or "-",
+        )
+
+    def _begin(self, event: DecodeEvent) -> None:
+        self.session.qso_id = self._next_qso_id
+        self._next_qso_id += 1
+        self.session.started_at = event.observed_at
 
     def start_station(
         self,
@@ -80,6 +95,7 @@ class QsoStateMachine:
     ) -> None:
         if self.session.state is not QsoState.IDLE:
             raise RuntimeError("cannot start a second QSO")
+        self._begin(event)
         self.session.remote_callsign = event.parsed.sender
         self.session.mode = event.mode
         self.session.frequency = event.frequency
@@ -109,6 +125,7 @@ class QsoStateMachine:
         """Engage a session from an unambiguous message addressed to us."""
         if self.session.state is not QsoState.IDLE:
             raise RuntimeError("cannot start a second QSO")
+        self._begin(event)
         self.session.remote_callsign = event.parsed.sender
         self.session.mode = event.mode
         self.session.frequency = event.frequency
@@ -188,7 +205,8 @@ class QsoStateMachine:
         self._sync_progress()
         if progress.relevant and not progress.progressed:
             LOGGER.info(
-                "[WATCHDOG] remote=%s repeat=%s no_progress=%d/%d",
+                "[WATCHDOG] qso_id=%s remote=%s repeat=%s no_progress=%d/%d",
+                self.session.qso_id,
                 self.session.remote_callsign,
                 progress.stage.name if progress.stage is not None else "UNKNOWN",
                 progress.no_progress,
@@ -248,9 +266,22 @@ class QsoStateMachine:
     def reset(self) -> None:
         local = self.session.local_callsign
         previous = self.session.state
+        qso_id = self.session.qso_id
+        remote = self.session.remote_callsign
+        duration = (
+            (self.session.last_activity - self.session.started_at).total_seconds()
+            if self.session.started_at is not None and self.session.last_activity is not None
+            else 0.0
+        )
         self.progress.reset()
         self.session = QsoSession(local)
-        LOGGER.info("[ENGINE] state %s -> IDLE reason=session reset", previous.name)
+        LOGGER.info(
+            "[QSO id=%s] state %s -> IDLE reason=session reset remote=%s duration_seconds=%.1f",
+            qso_id or "-",
+            previous.name,
+            remote or "-",
+            duration,
+        )
 
     def _sync_progress(self) -> None:
         self.session.progress_stage = self.progress.stage

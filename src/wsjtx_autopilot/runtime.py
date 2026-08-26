@@ -13,6 +13,7 @@ from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, Candidate, 
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.engine.tx_frequency import SpectrumOccupancyTracker, TxFrequencyDecision, TxFrequencyPlanner
+from wsjtx_autopilot.logging_setup import current_logging_session
 from wsjtx_autopilot.wsjtx.models import (
     ClearPacket,
     DecodePacket,
@@ -22,6 +23,7 @@ from wsjtx_autopilot.wsjtx.models import (
     WsjtxPacket,
 )
 from wsjtx_autopilot.worked.service import WorkedTodayService
+from wsjtx_autopilot.worked.bands import BandResolver
 
 LOGGER = logging.getLogger(__name__)
 _DECODE_MODE_MARKERS = {"~": "FT8", "+": "FT4"}
@@ -85,6 +87,14 @@ class AutopilotRuntime:
         self.tx_frequency_planner = TxFrequencyPlanner()
         self.last_tx_frequency_decision: TxFrequencyDecision | None = None
         self._pending_tx_df: PendingTxDfAction | None = None
+        session = current_logging_session()
+        if session is not None:
+            session.context.feature_flags = {
+                "autocall": config.autocall_enabled,
+                "direct_reply_patch": config.wsjtx_direct_reply_patched,
+                "set_tx_df_patch": config.wsjtx_set_tx_df_patched,
+                "smart_tx": config.smart_tx_frequency,
+            }
 
     def handle(
         self,
@@ -97,7 +107,20 @@ class AutopilotRuntime:
             self.control.observe(packet, endpoint)
         handled_action: IntendedAction | None = None
         if isinstance(packet, HeartbeatPacket):
-            LOGGER.info("[WSJTX] connected instance=%s version=%s", packet.header.instance_id, packet.version)
+            source = f"{endpoint[0]}:{endpoint[1]}" if endpoint is not None else "unknown"
+            LOGGER.info(
+                "[WSJTX] heartbeat instance=%s schema=%d version=%s endpoint=%s",
+                packet.header.instance_id,
+                packet.header.schema,
+                packet.version,
+                source,
+            )
+            session = current_logging_session()
+            if session is not None:
+                session.context.wsjtx_version = packet.version
+                session.context.wsjtx_schema = packet.header.schema
+                session.context.wsjtx_instance = packet.header.instance_id
+                session.context.wsjtx_endpoint = source
         elif isinstance(packet, StatusPacket):
             period = packet.tr_period if packet.tr_period != 0xFFFFFFFF else None
             self.status = WsjtxStatus(
@@ -110,6 +133,10 @@ class AutopilotRuntime:
                 tx_message=packet.tx_message,
                 period=period,
             )
+            session = current_logging_session()
+            if session is not None:
+                session.context.band = BandResolver().resolve(packet.dial_frequency) or "unknown"
+                session.context.mode = packet.mode or "unknown"
             self._observe_finalization_status(packet, now)
             LOGGER.info(
                 "[STATUS] %d Hz %s DX=%s TX=%s transmitting=%s TX_DF=%d engine_state=%s",
@@ -139,7 +166,14 @@ class AutopilotRuntime:
             self.engine.invalidate_instance_decodes(instance_id)
             LOGGER.info("[WSJTX] Clear instance=%s window=%s", instance_id, packet.window)
         elif isinstance(packet, QsoLoggedPacket):
-            LOGGER.info("[WSJTX] QSO logged station=%s", packet.dx_call)
+            LOGGER.info(
+                "[QSO id=%s] QSOLogged station=%s frequency=%d mode=%s instance=%s",
+                self.engine.state.session.qso_id or "-",
+                packet.dx_call,
+                packet.tx_frequency,
+                packet.mode,
+                packet.header.instance_id,
+            )
             if self.worked_service is not None:
                 self.worked_service.record_qso_logged(packet)
             if self.engine.complete_qso(packet.dx_call, packet.header.instance_id, "QSOLogged received"):
@@ -216,9 +250,11 @@ class AutopilotRuntime:
             return None
         if packet.low_confidence:
             LOGGER.info("[ENGINE] type=ignored reason=low confidence text=%s", packet.message)
+            self._log_rejected_direct_packet(packet, "LOW_CONFIDENCE")
             return None
         if packet.off_air:
             LOGGER.info("[ENGINE] type=ignored reason=off-air Decode text=%s", packet.message)
+            self._log_rejected_direct_packet(packet, "OFF_AIR")
             return None
 
         if mode is None:
@@ -420,6 +456,15 @@ class AutopilotRuntime:
             pending.action.station,
             candidate.station,
         )
+
+    def _log_rejected_direct_packet(self, packet: DecodePacket, blocker: str) -> None:
+        parsed = parse_ft8_message(packet.message)
+        if parsed is None or not parsed.is_addressed_to(self.config.local_callsign):
+            return
+        LOGGER.info("[DIRECT] received station=%s df=%d", parsed.sender, packet.delta_frequency)
+        LOGGER.info("[DIRECT] hard_blockers=[%s]", blocker)
+        LOGGER.info("[DIRECT] soft_blockers=[]")
+        LOGGER.info("[DIRECT] rejected station=%s blocker=%s", parsed.sender, blocker)
 
     def _plan_tx_frequency(self, action: IntendedAction, now: datetime) -> IntendedAction:
         decode = action.original_decode

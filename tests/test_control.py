@@ -621,6 +621,37 @@ def test_runtime_never_actions_direct_low_confidence_or_old_decode() -> None:
     assert transport.sent == []
 
 
+def test_low_confidence_direct_is_hard_blocked_but_same_window_cq_is_sent() -> None:
+    transport = FakeTransport()
+    config = replace(
+        AppConfig(),
+        candidate_collection_seconds=0.25,
+        allow_dupes=True,
+        wsjtx_direct_reply_patched=True,
+    )
+    control = WsjtxUdpControl(
+        transport,
+        15,
+        2,
+        local_callsign="F4NJU",
+        direct_reply_patched=True,
+    )
+    app = AutopilotRuntime(config, control=control)
+    app.handle(
+        runtime_decode("F4NJU YO2LFP -13", ENDPOINT, low_confidence=True, df=1200),
+        NOW,
+        ENDPOINT,
+    )
+    app.handle(runtime_decode("CQ ES3BH KO28", ENDPOINT, df=1400), NOW, ENDPOINT)
+
+    action = app.handle(None, NOW + timedelta(milliseconds=250), ENDPOINT)
+
+    assert action is not None and action.station == "ES3BH"
+    reply = parse_datagram(transport.sent[0][0])
+    assert isinstance(reply, ReplyPacket)
+    assert reply.message == "CQ ES3BH KO28"
+
+
 def test_runtime_clear_removes_pending_cq() -> None:
     transport = FakeTransport()
     config = replace(AppConfig(), candidate_collection_seconds=1, max_initiation_attempts=2)

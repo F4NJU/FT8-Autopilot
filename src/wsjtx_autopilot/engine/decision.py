@@ -68,8 +68,19 @@ class DecisionEngine:
         self._prune(now)
         if self.state.session.state is QsoState.IDLE:
             self._touch_candidate_window(event, now)
+        message = event.parsed
+        direct_to_local = message.is_addressed_to(self.config.local_callsign) and message.kind in {
+            MessageKind.DIRECTED,
+            MessageKind.REPORT,
+            MessageKind.R_REPORT,
+        }
+        if direct_to_local:
+            direct_df = event.original.delta_frequency if event.original is not None else -1
+            LOGGER.info("[DIRECT] received station=%s df=%s", message.sender, direct_df if direct_df >= 0 else "-")
         if now - event.observed_at > timedelta(seconds=self.config.stale_decode_seconds):
             LOGGER.info("[ENGINE] candidate refused reason=stale text=%s", event.parsed.raw)
+            if direct_to_local:
+                self._log_direct_rejected(message.sender, "STALE")
             self._emit(EngineEventKind.CANDIDATE_REFUSED, event.parsed.sender, "stale")
             return None
         identity = self._event_identity(event)
@@ -79,14 +90,23 @@ class DecisionEngine:
             return None
         self._seen[identity] = now
 
-        message = event.parsed
-        direct_to_local = message.is_addressed_to(self.config.local_callsign) and message.kind in {
-            MessageKind.DIRECTED,
-            MessageKind.REPORT,
-            MessageKind.R_REPORT,
-        }
         qso_active = self.state.session.state is not QsoState.IDLE
         if qso_active and message.kind not in {MessageKind.CQ, MessageKind.QRZ}:
+            if direct_to_local:
+                session = self.state.session
+                progressed = session.report_received is not None or session.state in {
+                    QsoState.QSO_ACTIVE,
+                    QsoState.WAITING_R_REPORT,
+                    QsoState.WAITING_73,
+                    QsoState.COMPLETE,
+                }
+                LOGGER.info(
+                    "[DIRECT] pending direct caller %s current_attempt=%s progressed=%s",
+                    message.sender,
+                    session.remote_callsign or "-",
+                    "yes" if progressed else "no",
+                )
+                self._log_direct_rejected(message.sender, "ACTIVE_QSO" if progressed else "ATTEMPT_ALREADY_SENT")
             LOGGER.info(
                 "[ENGINE] candidate refused sender=%s reason=active QSO state=%s remote=%s",
                 event.parsed.sender,
@@ -137,6 +157,8 @@ class DecisionEngine:
                     message.sender,
                 )
                 self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, "unable to resolve band")
+                if direct_to_local:
+                    self._log_direct_rejected(message.sender, "UNKNOWN_BAND")
                 return None
             if self._scorer is None and worked.duplicate:
                 LOGGER.info(
@@ -145,6 +167,8 @@ class DecisionEngine:
                     worked.band,
                 )
                 self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, f"worked today band={worked.band}")
+                if direct_to_local:
+                    self._log_direct_rejected(message.sender, "WORKED_TODAY")
                 return None
         metadata = None
         breakdown = None
@@ -157,22 +181,52 @@ class DecisionEngine:
                     scoring.reason,
                 )
                 self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, scoring.reason)
+                if direct_to_local:
+                    self._log_direct_rejected(message.sender, self._direct_blocker_name(scoring.reason))
                 return None
             score = scoring.breakdown.total
             metadata = scoring.metadata
             breakdown = scoring.breakdown
             force_priority = scoring.force_priority
+            LOGGER.debug(
+                "[SCORE] station=%s total=%d components=%s force_priority=%s",
+                message.sender,
+                scoring.breakdown.total,
+                ",".join(f"{item.name}:{item.value}" for item in scoring.breakdown.components) or "none",
+                scoring.force_priority,
+            )
         cooldown = self._cooldowns.get(message.sender)
         if cooldown is not None and now < cooldown.until:
-            LOGGER.info(
-                "[ENGINE] candidate refused station=%s cooldown=%s reason=%s until=%s",
-                message.sender,
-                cooldown.kind.name,
-                cooldown.reason,
-                cooldown.until.isoformat(),
-            )
-            self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, cooldown.reason)
-            return None
+            if direct_to_local and cooldown.kind.is_soft_for_direct_call():
+                LOGGER.info("[DIRECT] hard_blockers=[]")
+                LOGGER.info("[DIRECT] soft_blockers=[%s]", cooldown.kind.name)
+                LOGGER.info(
+                    "[ENGINE] direct call overrides soft cooldown station=%s previous_reason=%s",
+                    message.sender,
+                    cooldown.kind.name,
+                )
+                LOGGER.info(
+                    "[DIRECT] override soft blocker=%s station=%s previous_reason=%s",
+                    cooldown.kind.name,
+                    message.sender,
+                    cooldown.reason,
+                )
+                del self._cooldowns[message.sender]
+            else:
+                LOGGER.info(
+                    "[ENGINE] candidate refused station=%s cooldown=%s reason=%s until=%s",
+                    message.sender,
+                    cooldown.kind.name,
+                    cooldown.reason,
+                    cooldown.until.isoformat(),
+                )
+                if direct_to_local:
+                    self._log_direct_rejected(message.sender, f"COOLDOWN_{cooldown.kind.name}")
+                self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, cooldown.reason)
+                return None
+        elif direct_to_local:
+            LOGGER.info("[DIRECT] hard_blockers=[]")
+            LOGGER.info("[DIRECT] soft_blockers=[]")
         candidate = Candidate(
             station=message.sender,
             kind=kind,
@@ -192,6 +246,17 @@ class DecisionEngine:
                 score,
                 self.state.session.state.name,
             )
+            LOGGER.debug(
+                "[CANDIDATE] station=%s kind=%s snr=%d frequency=%s mode=%s df=%s score=%d worked_today=%s",
+                candidate.station,
+                candidate.kind.name,
+                event.snr,
+                event.frequency or "-",
+                event.mode,
+                event.original.delta_frequency if event.original is not None else "-",
+                score,
+                worked.duplicate if worked is not None else "unknown",
+            )
             self._emit(EngineEventKind.CANDIDATE_ADDED, candidate.station, "accepted", candidate)
             LOGGER.info(
                 "[WINDOW] candidate %s %s",
@@ -199,6 +264,8 @@ class DecisionEngine:
                 candidate.station,
             )
             self._update_provisional(candidate)
+            if direct_to_local:
+                LOGGER.info("[DIRECT] candidate accepted station=%s", candidate.station)
             return candidate
         else:
             LOGGER.info(
@@ -236,7 +303,13 @@ class DecisionEngine:
         ):
             LOGGER.debug("[WINDOW] waiting for decode window last_decode=%s", window.last_decode_at.isoformat())
             return None
-        LOGGER.info("[WINDOW] closing candidates=%d", len(viable))
+        direct_count = sum(candidate.kind is CandidateKind.DIRECT_CALLER for candidate in viable)
+        LOGGER.info(
+            "[WINDOW] closing candidates=%d direct_candidates=%d cq_candidates=%d",
+            len(viable),
+            direct_count,
+            len(viable) - direct_count,
+        )
         direct = [candidate for candidate in viable if candidate.force_priority]
         if direct:
             pool = direct
@@ -356,7 +429,7 @@ class DecisionEngine:
             return False
         remote = self.state.session.remote_callsign
         self.state.mark_complete(reason)
-        LOGGER.info("[ENGINE] QSO complete remote=%s", remote)
+        LOGGER.info("[QSO id=%s] complete remote=%s reason=%s", self.state.session.qso_id, remote, reason)
         self._candidates.clear()
         self._pending_actions.clear()
         self.state.reset()
@@ -366,7 +439,7 @@ class DecisionEngine:
         if self.state.session.state is not QsoState.COMPLETE:
             return False
         remote = self.state.session.remote_callsign
-        LOGGER.info("[ENGINE] QSO complete remote=%s reason=%s", remote, reason)
+        LOGGER.info("[QSO id=%s] complete remote=%s reason=%s", self.state.session.qso_id, remote, reason)
         self._candidates.clear()
         self._pending_actions.clear()
         self.state.reset()
@@ -383,7 +456,7 @@ class DecisionEngine:
         if self.state.session.state is QsoState.IDLE:
             return False
         remote = self.state.session.remote_callsign
-        LOGGER.info("[ENGINE] QSO abandoned remote=%s reason=%s", remote, reason)
+        LOGGER.info("[QSO id=%s] abandoned remote=%s reason=%s", self.state.session.qso_id, remote, reason)
         if remote is not None and now is not None and cooldown_seconds is not None:
             reason_text = (
                 "remote busy with another QSO"
@@ -529,6 +602,27 @@ class DecisionEngine:
                 previous.station,
                 provisional.station,
             )
+
+    @staticmethod
+    def _log_direct_rejected(station: str, blocker: str) -> None:
+        LOGGER.info("[DIRECT] hard_blockers=[%s]", blocker)
+        LOGGER.info("[DIRECT] soft_blockers=[]")
+        LOGGER.info("[DIRECT] rejected station=%s blocker=%s", station, blocker)
+
+    @staticmethod
+    def _direct_blocker_name(reason: str) -> str:
+        lowered = reason.lower()
+        if "worked today" in lowered:
+            return "WORKED_TODAY"
+        if "blacklisted" in lowered:
+            return "BLACKLIST"
+        if "snr below" in lowered:
+            return "MINIMUM_SNR"
+        if "ignored until" in lowered:
+            return "USER_TEMPORARY_IGNORE"
+        if "direct calls ignored" in lowered:
+            return "USER_POLICY"
+        return "USER_RULE"
 
     @staticmethod
     def _candidate_period_key(event: DecodeEvent) -> tuple[object, ...]:

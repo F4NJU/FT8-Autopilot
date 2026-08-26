@@ -63,6 +63,7 @@ class UserSettings:
     tx_df_min: int = 300
     tx_df_max: int = 2800
     minimum_free_gap_hz: int = 120
+    logging_level: str = "normal"
 
     def normalize(self) -> None:
         self.local_callsign = self.local_callsign.strip().upper()
@@ -86,6 +87,7 @@ class UserSettings:
         self.tx_df_min = max(0, int(self.tx_df_min))
         self.tx_df_max = max(self.tx_df_min + 1, int(self.tx_df_max))
         self.minimum_free_gap_hz = max(1, int(self.minimum_free_gap_hz))
+        self.logging_level = "debug" if str(self.logging_level).strip().lower() == "debug" else "normal"
 
 
 class SettingsStore:

@@ -140,6 +140,15 @@ class CooldownKind(Enum):
     REMOTE_BUSY_OTHER_QSO = auto()
     REMOTE_RETURNED_TO_CQ = auto()
 
+    def is_soft_for_direct_call(self) -> bool:
+        return self in {
+            CooldownKind.STATION_RETRY,
+            CooldownKind.STALLED_QSO,
+            CooldownKind.TEMPORARY_IGNORE,
+            CooldownKind.REMOTE_BUSY_OTHER_QSO,
+            CooldownKind.REMOTE_RETURNED_TO_CQ,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class StationCooldown:

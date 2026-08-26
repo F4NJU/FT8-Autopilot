@@ -1,3 +1,4 @@
+import logging
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -10,11 +11,14 @@ from .main_window import MainWindow
 
 def run_gui() -> int:
     paths = AppPaths.from_environment().ensure_directories()
-    configure_logging(paths)
+    settings_store = SettingsStore(paths.settings_path)
+    settings = settings_store.load()
+    level = logging.DEBUG if settings.logging_level == "debug" else logging.INFO
+    configure_logging(paths, level)
     application = QApplication.instance() or QApplication(sys.argv)
     application.setApplicationName("WSJTX AutoPilot")
     application.setOrganizationName("WSJTX AutoPilot")
-    window = MainWindow(SettingsStore(paths.settings_path))
+    window = MainWindow(settings_store)
     window.show()
     return application.exec()
 

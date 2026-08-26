@@ -3,6 +3,9 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 
+SCHEMA_VERSION = 1
+
+
 def normalize_callsign(callsign: str) -> str:
     return callsign.strip().upper()
 

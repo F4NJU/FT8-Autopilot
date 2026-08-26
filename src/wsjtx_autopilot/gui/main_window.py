@@ -2,8 +2,8 @@ from dataclasses import replace
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QCloseEvent
+from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -33,6 +33,11 @@ from PySide6.QtWidgets import (
 
 from wsjtx_autopilot.config import ActivityPolicy, AppPaths, DirectCallPolicy, SettingsStore, UserSettings
 from wsjtx_autopilot.engine.models import EngineEvent, EngineEventKind
+from wsjtx_autopilot.logging_setup import (
+    current_logging_session,
+    export_diagnostic,
+    set_file_log_level,
+)
 
 from .viewmodels import ActivityRow, CandidateRow, StatusView
 from .worker import BackendWorker
@@ -51,6 +56,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._priority_tab(), "Priority")
         tabs.addTab(self._smart_tx_tab(), "Smart TX")
         tabs.addTab(self._safety_tab(), "Safety & Data")
+        tabs.addTab(self._diagnostic_tab(), "Diagnostic")
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -97,6 +103,7 @@ class SettingsDialog(QDialog):
             tx_df_min=self.tx_df_min.value(),
             tx_df_max=self.tx_df_max.value(),
             minimum_free_gap_hz=self.minimum_gap.value(),
+            logging_level=self.logging_level.currentData(),
         )
 
     def _station_tab(self) -> QWidget:
@@ -236,6 +243,42 @@ class SettingsDialog(QDialog):
         form.addRow("Minimum free gap", self.minimum_gap)
         form.addRow(note)
         return widget
+
+    def _diagnostic_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        form = QFormLayout()
+        self.logging_level = QComboBox()
+        self.logging_level.addItem("Normal", "normal")
+        self.logging_level.addItem("Debug", "debug")
+        self.logging_level.setCurrentIndex(max(0, self.logging_level.findData(self._settings.logging_level)))
+        session = current_logging_session()
+        log_path = session.path if session is not None else AppPaths.from_environment().log_dir
+        current_log = QLabel(str(log_path))
+        current_log.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        current_log.setWordWrap(True)
+        form.addRow("File logging", self.logging_level)
+        form.addRow("Current session log", current_log)
+        layout.addLayout(form)
+        open_folder = QPushButton("OPEN LOG FOLDER")
+        open_folder.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(AppPaths.from_environment().log_dir)))
+        )
+        export = QPushButton("EXPORT DIAGNOSTIC ZIP")
+        export.clicked.connect(self._export_diagnostic)
+        layout.addWidget(open_folder)
+        layout.addWidget(export)
+        layout.addStretch()
+        return widget
+
+    def _export_diagnostic(self) -> None:
+        try:
+            path = export_diagnostic(AppPaths.from_environment().ensure_directories(), self.settings())
+        except Exception as exc:
+            LOGGER.exception("[DIAGNOSTIC] export failed")
+            QMessageBox.critical(self, "Diagnostic export failed", str(exc))
+            return
+        QMessageBox.information(self, "Diagnostic exported", f"Diagnostic ZIP created:\n{path}")
 
 
 class MainWindow(QMainWindow):
@@ -507,6 +550,7 @@ class MainWindow(QMainWindow):
             return
         self._settings = dialog.settings()
         self._store.save(self._settings)
+        set_file_log_level(self._settings.logging_level)
         self.apply_settings_requested.emit(self._settings)
         self.statusBar().showMessage("Preferences saved; backend restarted DISARMED", 6000)
 

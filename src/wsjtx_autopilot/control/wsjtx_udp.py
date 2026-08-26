@@ -130,7 +130,14 @@ class WsjtxUdpControl:
                 0,
             )
             sent = self._transport.sendto(datagram, decode.source_endpoint)
-            LOGGER.info("[CONTROL] sendto result=%d expected=%d", sent, len(datagram))
+            LOGGER.info(
+                "[UDP] command=Reply endpoint=%s:%d bytes=%d expected=%d outcome=%s",
+                decode.source_endpoint[0],
+                decode.source_endpoint[1],
+                sent,
+                len(datagram),
+                "sent" if sent == len(datagram) else "partial",
+            )
             if sent != len(datagram):
                 raise OSError(f"partial UDP send ({sent}/{len(datagram)} bytes)")
         except (OSError, ProtocolError) as exc:
@@ -193,7 +200,13 @@ class WsjtxUdpControl:
         except (OSError, ProtocolError) as exc:
             LOGGER.error("[CONTROL] HaltTx failed reason=%s error=%s", reason, exc)
             return False
-        LOGGER.warning("[CONTROL] HaltTx sent reason=%s instance=%s", reason, instance_id)
+        LOGGER.warning(
+            "[UDP] command=HaltTx endpoint=%s:%d instance=%s outcome=sent reason=%s",
+            session.endpoint[0],
+            session.endpoint[1],
+            instance_id,
+            reason,
+        )
         return True
 
     def set_tx_df(self, action: IntendedAction, tx_df: int, now: datetime) -> bool:
@@ -212,7 +225,13 @@ class WsjtxUdpControl:
         except (OSError, ProtocolError) as exc:
             LOGGER.error("[CONTROL] SetTxDF failed df=%d error=%s", tx_df, exc)
             return False
-        LOGGER.info("[CONTROL] SetTxDF sent df=%d", tx_df)
+        LOGGER.info(
+            "[UDP] command=SetTxDF endpoint=%s:%d instance=%s df=%d outcome=sent",
+            decode.source_endpoint[0],
+            decode.source_endpoint[1],
+            decode.instance_id,
+            tx_df,
+        )
         return True
 
     def retry_final(self, decode: OriginalDecode, reason: str) -> bool:

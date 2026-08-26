@@ -30,7 +30,7 @@ class AppPaths:
             config_dir=config_dir,
             data_dir=data_dir,
             database_path=data_dir / "autopilot.sqlite3",
-            log_dir=data_dir / "logs",
+            log_dir=local_root / "FT8-AutoPilot" / "logs",
             settings_path=config_dir / "settings.json",
             default_adif_path=standard_adif,
             adif_candidates=(standard_adif, explicit_variant),

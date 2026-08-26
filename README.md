@@ -79,6 +79,12 @@ Direct calls can take priority over ordinary CQ candidates.
 This currently requires a small modification to WSJT-X because the standard
 WSJT-X network Reply command normally only permits CQ/QRZ decodes.
 
+An inbound Direct Call that passes hard filters (Worked Today, blacklist,
+confidence, freshness, and user policy) clears soft station cooldowns left by
+an earlier unanswered, stalled, remote-busy, or returned-to-CQ attempt. It is
+treated as new inbound intent. It does not override hard filters or preempt an
+already-sent Reply/QSO; that case is logged as a pending direct caller.
+
 QSO lifecycle tracking
 
 Status: ✅ Working / 🧪 being refined

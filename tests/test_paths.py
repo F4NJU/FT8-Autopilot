@@ -47,7 +47,7 @@ def test_app_paths_use_roaming_for_settings_and_local_for_mutable_data(tmp_path:
 
     assert paths.settings_path == tmp_path / "Roaming" / "WSJTX-AutoPilot" / "settings.json"
     assert paths.database_path == tmp_path / "Local" / "WSJTX-AutoPilot" / "autopilot.sqlite3"
-    assert paths.log_dir == tmp_path / "Local" / "WSJTX-AutoPilot" / "logs"
+    assert paths.log_dir == tmp_path / "Local" / "FT8-AutoPilot" / "logs"
     assert paths.default_adif_path == tmp_path / "Local" / "WSJT-X" / "wsjtx_log.adi"
 
 
