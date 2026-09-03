@@ -22,7 +22,7 @@ BUILD_INFO_PATH.write_text(
         {
             "app_version": os.environ.get("FT8_AUTOPILOT_VERSION")
             or os.environ.get("GITHUB_REF_NAME")
-            or "v0.1.0-wip.4",
+            or "v0.1.0-wip.5",
             "git_commit": os.environ.get("FT8_AUTOPILOT_GIT_COMMIT")
             or os.environ.get("GITHUB_SHA")
             or GIT_COMMIT,

@@ -199,7 +199,7 @@ def build_metadata(log_path: Path | None = None) -> dict[str, Any]:
     except OSError:
         build_time = "unknown"
     return {
-        "app_version": version or f"v{__version__}-wip.4",
+        "app_version": version or f"v{__version__}-wip.5",
         "git_commit": (
             os.environ.get("FT8_AUTOPILOT_GIT_COMMIT")
             or os.environ.get("GITHUB_SHA")

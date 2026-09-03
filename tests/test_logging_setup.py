@@ -40,7 +40,7 @@ def test_configure_logging_creates_timestamped_session_with_metadata(tmp_path: P
     assert session.path.parent == tmp_path / "Local" / "FT8-AutoPilot" / "logs"
     assert session.path.name == "FT8-AutoPilot_2026-08-26_123456_789.log"
     content = session.path.read_text(encoding="utf-8")
-    assert "[APP] FT8-AutoPilot version=v0.1.0-wip.4" in content
+    assert "[APP] FT8-AutoPilot version=v0.1.0-wip.5" in content
     assert "[APP] git_commit=" in content
     assert "[APP] build_time=" in content
     assert "[TEST] visible" in content
