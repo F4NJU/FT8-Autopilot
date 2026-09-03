@@ -4,7 +4,10 @@ __pycache__/
 *.py[cod]
 
 build/
+build-*/
 dist/
+dist-*/
+.pytest_cache/
 
 *.sqlite
 *.sqlite3

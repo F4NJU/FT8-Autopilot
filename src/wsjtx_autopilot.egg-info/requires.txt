@@ -1,3 +1,4 @@
+pyserial>=3.5
 
 [build]
 PyInstaller>=6.0

@@ -204,7 +204,7 @@ def test_progressing_qso_to_rr73_is_never_halted() -> None:
     for index, message in enumerate(messages, 1):
         app.handle(decode(message, index), NOW + timedelta(seconds=index), ENDPOINT)
 
-    assert app.engine.state.session.state is QsoState.COMPLETE
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
     assert not any(isinstance(parse_datagram(data), HaltTxPacket) for data, _ in transport.sent)
 
 

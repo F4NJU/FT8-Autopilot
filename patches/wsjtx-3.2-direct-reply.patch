@@ -7,7 +7,6 @@ diff --git a/widgets/mainwindow.h b/widgets/mainwindow.h
                        bool dedupe = false);
 +  bool isNetworkReplyAllowed (DecodedText const& message, QString const& mode,
 +                              bool low_confidence) const;
-+  bool m_networkTxDfPending {false};
    void replyToCQ (QTime, qint32 snr, float delta_time, quint32 delta_frequency, QString const& mode, QString const& message_text, bool low_confidence, quint8 modifiers);
    void locationChange(QString const& location);
    void replayDecodes ();
@@ -79,7 +78,6 @@ diff --git a/widgets/mainwindow.cpp b/widgets/mainwindow.cpp
 +      m_bDoubleClicked = true;
        Qt::KeyboardModifiers kbmod {modifiers << 24};
        processMessage (message, kbmod);
-+      m_networkTxDfPending = false;
        tx_watchdog (false);
 diff --git a/revision_utils.cpp b/revision_utils.cpp
 --- a/revision_utils.cpp
@@ -89,94 +87,6 @@ diff --git a/revision_utils.cpp b/revision_utils.cpp
  QString revision (QString const& scs_rev_string)
  {
 -  return "260818";
-+  return "260818 AutoPilot-STX1";
++  return "260818 AutoPilot-AP1";
    QString result;
    auto revision_from_scs = revision_extract_number (scs_rev_string);
- 
-diff --git a/Network/NetworkMessage.hpp b/Network/NetworkMessage.hpp
---- a/Network/NetworkMessage.hpp
-+++ b/Network/NetworkMessage.hpp
-@@ -531,5 +531,16 @@
-  *      Callsigns without a sort order will be valued at zero for sorting purposes
-  *      in the hound display.
-  *
-+ * SetTxDF         In      18                     quint32
-+ *                         Id (target unique key) utf8
-+ *                         Tx DF                  quint32
-+ *
-+ *      AutoPilot extension for the Improved 3.2.0 PLUS 260818 build. The
-+ *      requested audio Tx frequency is accepted only in FT8/FT4, while not
-+ *      transmitting, and within the native Tx frequency control range. A
-+ *      successful change follows the native Tx frequency control path and
-+ *      emits the normal Status message. Type 17 is already InhibitStatus in
-+ *      this exact source release, so this extension uses the next free value.
-+ *
-  *
-  * InhibitStatus  Out      17
-@@ -586,4 +597,5 @@ namespace NetworkMessage
-       Configure,
-       AnnotationInfo,
-       InhibitStatus,            // Out 17 — see protocol comment above
-+      SetTxDF,                  // In 18 - AutoPilot extension
-       maximum_message_type_     // ONLY add new message types
-diff --git a/Network/MessageClient.hpp b/Network/MessageClient.hpp
---- a/Network/MessageClient.hpp
-+++ b/Network/MessageClient.hpp
-@@ -133,4 +133,7 @@ public:
-   // this signal is emitted if the server has sent information about a callsign
-   Q_SIGNAL void annotation_info (QString const& dx_call, bool sort_order_provided, quint32 sort_order);
- 
-+  // AutoPilot extension: request an explicit audio Tx frequency.
-+  Q_SIGNAL void set_tx_df (quint32 tx_df);
-+
-   // this signal is emitted when network errors occur or if a host
-diff --git a/Network/MessageClient.cpp b/Network/MessageClient.cpp
---- a/Network/MessageClient.cpp
-+++ b/Network/MessageClient.cpp
-@@ -407,4 +407,16 @@ void MessageClient::impl::parse_message (QByteArray const& msg)
-             }
-             break;
- 
-+            case NetworkMessage::SetTxDF:
-+              {
-+                quint32 tx_df {0};
-+                in >> tx_df;
-+                TRACE_UDP ("SetTxDF tx df:" << tx_df);
-+                if (check_status (in) != Fail)
-+                  {
-+                    Q_EMIT self_->set_tx_df (tx_df);
-+                  }
-+              }
-+              break;
-+
-             default:
-diff --git a/widgets/mainwindow.cpp b/widgets/mainwindow.cpp
---- a/widgets/mainwindow.cpp
-+++ b/widgets/mainwindow.cpp
-@@ -921,3 +921,19 @@ MainWindow::MainWindow(QDir const& temp_directory, bool multiple,
-     });
-   connect (m_messageClient, &MessageClient::reply, this, &MainWindow::replyToCQ);
-+  connect (m_messageClient, &MessageClient::set_tx_df, [this] (quint32 tx_df) {
-+      if (m_transmitting
-+          || (m_mode != "FT8" && m_mode != "FT4")
-+          || tx_df < quint32 (ui->TxFreqSpinBox->minimum ())
-+          || tx_df > quint32 (ui->TxFreqSpinBox->maximum ()))
-+        {
-+          qDebug () << "SetTxDF ignored, invalid state or frequency:" << tx_df;
-+          return;
-+        }
-+      // setValue uses the native handler: waterfall marker, audio/XIT,
-+      // band checks, settings and normal Status publication all stay coherent.
-+      m_networkTxDfPending = true;
-+      ui->TxFreqSpinBox->setValue (int (tx_df));
-+      statusUpdate ();          // also acknowledge an unchanged requested DF
-+      QTimer::singleShot (10000, this, [this] {m_networkTxDfPending = false;});
-+    });
-   connect (m_messageClient, &MessageClient::close, this, &MainWindow::close);
-@@ -10128,4 +10144,5 @@ void MainWindow::processMessage (DecodedText const& message, Qt::KeyboardModifiers modifiers,
-       if (((SpecOp::HOUND != m_specOp) || m_mode != "FT8")
--          && (!ui->cbHoldTxFreq->isChecked () || shift || ctrl)) {
-+          && !m_networkTxDfPending
-+          && (!ui->cbHoldTxFreq->isChecked () || shift || ctrl)) {
-         ui->TxFreqSpinBox->setValue(frequency);
-       }

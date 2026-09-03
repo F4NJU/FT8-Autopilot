@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Dry-run FT8 decision companion for WSJT-X"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["pyserial>=3.5"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]

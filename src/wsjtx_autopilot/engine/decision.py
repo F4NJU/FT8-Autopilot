@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from wsjtx_autopilot.config import AppConfig
@@ -17,12 +17,16 @@ from .models import (
     EngineEventKind,
     IntendedAction,
     MessageKind,
+    ScoreBreakdown,
+    ScoreComponent,
     StationProfile,
     StationCooldown,
     WorkedCheck,
 )
+from .pending_direct import PendingDirectCall, PendingDirectCallQueue
 from .scoring import CandidateScorer
 from .state import QsoState, QsoStateMachine
+from wsjtx_autopilot.worked.bands import BandResolver
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +58,10 @@ class DecisionEngine:
         self._seen: dict[str, datetime] = {}
         self._cooldowns: dict[str, StationCooldown] = {}
         self._pending_actions: dict[str, DecodeEvent] = {}
+        self.pending_direct_calls = PendingDirectCallQueue(config.pending_direct_ttl_seconds)
+        self._pending_candidate_stations: set[str] = set()
+        self._promoting_pending: PendingDirectCall | None = None
+        self._pending_rejection_reason = "USER_RULE"
         self._candidate_window: CandidateWindow | None = None
         self._worked_lookup = worked_lookup
         self._scorer = scorer
@@ -66,7 +74,8 @@ class DecisionEngine:
     def observe(self, event: DecodeEvent, now: datetime | None = None) -> Candidate | None:
         now = now or event.observed_at
         self._prune(now)
-        if self.state.session.state is QsoState.IDLE:
+        promoting_pending = self._promoting_pending is not None
+        if self.state.session.state is QsoState.IDLE and not promoting_pending:
             self._touch_candidate_window(event, now)
         message = event.parsed
         direct_to_local = message.is_addressed_to(self.config.local_callsign) and message.kind in {
@@ -77,14 +86,19 @@ class DecisionEngine:
         if direct_to_local:
             direct_df = event.original.delta_frequency if event.original is not None else -1
             LOGGER.info("[DIRECT] received station=%s df=%s", message.sender, direct_df if direct_df >= 0 else "-")
-        if now - event.observed_at > timedelta(seconds=self.config.stale_decode_seconds):
+        freshness_seconds = (
+            self.config.pending_direct_ttl_seconds
+            if promoting_pending
+            else self.config.stale_decode_seconds
+        )
+        if now - event.observed_at > timedelta(seconds=freshness_seconds):
             LOGGER.info("[ENGINE] candidate refused reason=stale text=%s", event.parsed.raw)
             if direct_to_local:
                 self._log_direct_rejected(message.sender, "STALE")
             self._emit(EngineEventKind.CANDIDATE_REFUSED, event.parsed.sender, "stale")
             return None
         identity = self._event_identity(event)
-        if identity in self._seen:
+        if identity in self._seen and not promoting_pending:
             LOGGER.info("[ENGINE] candidate refused reason=duplicate text=%s", event.parsed.raw)
             self._emit(EngineEventKind.CANDIDATE_REFUSED, event.parsed.sender, "duplicate decode")
             return None
@@ -92,21 +106,9 @@ class DecisionEngine:
 
         qso_active = self.state.session.state is not QsoState.IDLE
         if qso_active and message.kind not in {MessageKind.CQ, MessageKind.QRZ}:
-            if direct_to_local:
-                session = self.state.session
-                progressed = session.report_received is not None or session.state in {
-                    QsoState.QSO_ACTIVE,
-                    QsoState.WAITING_R_REPORT,
-                    QsoState.WAITING_73,
-                    QsoState.COMPLETE,
-                }
-                LOGGER.info(
-                    "[DIRECT] pending direct caller %s current_attempt=%s progressed=%s",
-                    message.sender,
-                    session.remote_callsign or "-",
-                    "yes" if progressed else "no",
-                )
-                self._log_direct_rejected(message.sender, "ACTIVE_QSO" if progressed else "ATTEMPT_ALREADY_SENT")
+            if direct_to_local and message.sender != self.state.session.remote_callsign:
+                self.queue_pending_direct(event, now, "current QSO active")
+                return None
             LOGGER.info(
                 "[ENGINE] candidate refused sender=%s reason=active QSO state=%s remote=%s",
                 event.parsed.sender,
@@ -150,7 +152,8 @@ class DecisionEngine:
         scorer_checks_dupes = self._scorer is not None and not self._scorer.preferences.allow_dupes
         worked: WorkedCheck | None = None
         if (not self.config.allow_dupes or scorer_checks_dupes) and self._worked_lookup is not None:
-            worked = self._worked_lookup(message.sender, event.frequency, event.observed_at)
+            eligibility_at = now if promoting_pending else event.observed_at
+            worked = self._worked_lookup(message.sender, event.frequency, eligibility_at)
             if worked.band is None:
                 LOGGER.info(
                     "[ENGINE] candidate refused station=%s reason=unable to resolve band",
@@ -173,7 +176,7 @@ class DecisionEngine:
         metadata = None
         breakdown = None
         if self._scorer is not None:
-            scoring = self._scorer.evaluate(event, kind, worked)
+            scoring = self._scorer.evaluate(event, kind, worked, now if promoting_pending else None)
             if not scoring.accepted:
                 LOGGER.info(
                     "[ENGINE] candidate refused station=%s reason=%s",
@@ -239,11 +242,32 @@ class DecisionEngine:
         current = self._candidates.get(candidate.station)
         if current is None or candidate.score > current.score:
             self._candidates[candidate.station] = candidate
+            if promoting_pending:
+                age = self._promoting_pending.age_seconds(now) if self._promoting_pending is not None else 0.0
+                recency = max(
+                    0,
+                    round(20 * (1 - age / self.config.pending_direct_ttl_seconds)),
+                )
+                components = candidate.score_breakdown.components + (ScoreComponent("RECENCY", recency),)
+                candidate = replace(
+                    candidate,
+                    score=candidate.score + recency,
+                    score_breakdown=ScoreBreakdown(candidate.score + recency, components),
+                )
+                self._candidates[candidate.station] = candidate
+                self._pending_candidate_stations.add(candidate.station)
+                LOGGER.info(
+                    "[DIRECT] pending candidate %s score=%d age=%.1f repeats=%d",
+                    candidate.station,
+                    candidate.score,
+                    age,
+                    self._promoting_pending.repeat_count if self._promoting_pending is not None else 1,
+                )
             LOGGER.info(
                 "[ENGINE] candidate %s: %s score=%d state=%s",
                 "direct call" if kind is CandidateKind.DIRECT_CALLER else "CQ",
                 candidate.station,
-                score,
+                candidate.score,
                 self.state.session.state.name,
             )
             LOGGER.debug(
@@ -254,7 +278,7 @@ class DecisionEngine:
                 event.frequency or "-",
                 event.mode,
                 event.original.delta_frequency if event.original is not None else "-",
-                score,
+                candidate.score,
                 worked.duplicate if worked is not None else "unknown",
             )
             self._emit(EngineEventKind.CANDIDATE_ADDED, candidate.station, "accepted", candidate)
@@ -263,7 +287,8 @@ class DecisionEngine:
                 "DIRECT" if candidate.kind is CandidateKind.DIRECT_CALLER else "CQ",
                 candidate.station,
             )
-            self._update_provisional(candidate)
+            if not promoting_pending:
+                self._update_provisional(candidate)
             if direct_to_local:
                 LOGGER.info("[DIRECT] candidate accepted station=%s", candidate.station)
             return candidate
@@ -289,16 +314,28 @@ class DecisionEngine:
                 self.state.session.state.name,
             )
             return None
+        self._promote_pending_direct_calls(now)
         viable = [
             candidate
             for candidate in self._candidates.values()
-            if now - candidate.event.observed_at <= timedelta(seconds=self.config.stale_decode_seconds)
+            if (
+                now - candidate.event.observed_at
+                <= timedelta(
+                    seconds=(
+                        self.config.pending_direct_ttl_seconds
+                        if candidate.station in self._pending_candidate_stations
+                        else self.config.stale_decode_seconds
+                    )
+                )
+            )
         ]
         if not viable:
             return None
         window = self._candidate_window
+        has_pending = any(candidate.station in self._pending_candidate_stations for candidate in viable)
         if (
-            window is not None
+            not has_pending
+            and window is not None
             and now - window.last_decode_at < timedelta(seconds=self.config.candidate_collection_seconds)
         ):
             LOGGER.debug("[WINDOW] waiting for decode window last_decode=%s", window.last_decode_at.isoformat())
@@ -310,22 +347,37 @@ class DecisionEngine:
             direct_count,
             len(viable) - direct_count,
         )
-        direct = [candidate for candidate in viable if candidate.force_priority]
-        if direct:
-            pool = direct
+        direct = [candidate for candidate in viable if candidate.kind is CandidateKind.DIRECT_CALLER]
+        forced_direct = [candidate for candidate in direct if candidate.force_priority]
+        if forced_direct:
+            pool = forced_direct
             reason = "direct caller"
+        elif direct:
+            pool = viable
+            reason = "direct caller competes by score"
         else:
             pool = viable
             reason = "CQ candidate"
-        selected = max(pool, key=lambda candidate: (candidate.score, -candidate.event.observed_at.timestamp()))
-        reason = "direct caller" if selected.kind is CandidateKind.DIRECT_CALLER else "CQ candidate"
+        selected = max(pool, key=lambda candidate: (candidate.score, candidate.event.observed_at.timestamp()))
+        selected_was_pending = selected.station in self._pending_candidate_stations
+        reason = (
+            "PENDING_DIRECT_CALL"
+            if selected_was_pending
+            else "direct caller"
+            if selected.kind is CandidateKind.DIRECT_CALLER
+            else "CQ candidate"
+        )
         self._candidates.clear()
+        self._pending_candidate_stations.clear()
         self._candidate_window = None
+        if selected_was_pending:
+            self.pending_direct_calls.remove(selected.station)
+            self._emit(EngineEventKind.PENDING_DIRECT_REMOVED, selected.station, "selected", selected)
         self._pending_actions[selected.station] = selected.event
         LOGGER.info(
             "[ENGINE] selected: %s reason=%s state=%s",
             selected.station,
-            "DIRECT_CALL" if selected.kind is CandidateKind.DIRECT_CALLER else "CQ",
+            reason,
             self.state.session.state.name,
         )
         self._emit(EngineEventKind.CANDIDATE_SELECTED, selected.station, reason, selected)
@@ -360,18 +412,12 @@ class DecisionEngine:
             if action.kind is ActionKind.DIRECT_REPLY:
                 self.state.start_from_observed_exchange(
                     event,
-                    action.selected_tx_df,
-                    action.tx_df_reason,
-                    action.tx_df_gap_width,
                 )
                 self.state.mark_direct_reply_sent(now)
             elif self.state.session.state is QsoState.IDLE:
                 self.state.start_station(
                     event,
                     now,
-                    action.selected_tx_df,
-                    action.tx_df_reason,
-                    action.tx_df_gap_width,
                 )
             LOGGER.info(
                 "[ENGINE] action sent station=%s state=%s reason=reply sent",
@@ -416,7 +462,43 @@ class DecisionEngine:
             for station, event in self._pending_actions.items()
             if event.original is None or event.original.instance_id != instance_id
         }
+        for entry in self.pending_direct_calls.invalidate_instance(instance_id):
+            LOGGER.info("[DIRECT] pending rejected station=%s reason=CLEAR", entry.station)
+            self._emit(EngineEventKind.PENDING_DIRECT_REMOVED, entry.station, "CLEAR")
         LOGGER.info("[ENGINE] invalidated Decode candidates instance=%s reason=Clear", instance_id)
+
+    def queue_pending_direct(self, event: DecodeEvent, now: datetime, reason: str) -> None:
+        """Retain an addressed Direct Call until the active QSO/finalization can release it."""
+        station = event.parsed.sender
+        band = BandResolver().resolve(event.frequency) if event.frequency is not None else None
+        self.pending_direct_calls.offer(event, now, band or "unknown")
+        session = self.state.session
+        LOGGER.info(
+            "[DIRECT] pending station=%s reason=%s current_remote=%s",
+            station,
+            reason,
+            session.remote_callsign or "-",
+        )
+        if session.state is not QsoState.IDLE:
+            LOGGER.info(
+                "[DIRECT] pending direct caller %s current_attempt=%s progressed=%s",
+                station,
+                session.remote_callsign or "-",
+                "yes" if session.state is QsoState.QSO_ACTIVE else "no",
+            )
+        pending_candidate = Candidate(
+            station,
+            CandidateKind.DIRECT_CALLER,
+            event,
+            self.config.direct_caller_priority + event.snr,
+            force_priority=True,
+        )
+        self._emit(
+            EngineEventKind.PENDING_DIRECT_ADDED,
+            station,
+            "Waiting for current QSO to finish",
+            pending_candidate,
+        )
 
     def cancel_pending_action(self, action: IntendedAction, reason: str) -> bool:
         if self._pending_actions.pop(action.station, None) is None:
@@ -561,8 +643,47 @@ class DecisionEngine:
             if cooldown.until > now
         }
         self._candidates = {
-            call: candidate for call, candidate in self._candidates.items() if candidate.event.observed_at >= cutoff
+            call: candidate
+            for call, candidate in self._candidates.items()
+            if call in self._pending_candidate_stations or candidate.event.observed_at >= cutoff
         }
+        for entry in self.pending_direct_calls.prune(now):
+            self._emit(EngineEventKind.PENDING_DIRECT_REMOVED, entry.station, "TTL_EXPIRED")
+
+    def _promote_pending_direct_calls(self, now: datetime) -> None:
+        for entry in self.pending_direct_calls.entries(now):
+            self._promoting_pending = entry
+            self._pending_rejection_reason = "USER_RULE"
+            try:
+                candidate = self.observe(entry.event, now)
+            finally:
+                self._promoting_pending = None
+            if candidate is not None:
+                continue
+            self.pending_direct_calls.remove(entry.station)
+            LOGGER.info(
+                "[DIRECT] pending rejected station=%s reason=%s",
+                entry.station,
+                self._pending_rejection_reason,
+            )
+            self._emit(
+                EngineEventKind.PENDING_DIRECT_REMOVED,
+                entry.station,
+                self._pending_rejection_reason,
+            )
+
+    def invalidate_pending_context(self, instance_id: str, band: str, mode: str) -> None:
+        for entry in self.pending_direct_calls.invalidate_context(instance_id, band, mode):
+            LOGGER.info("[DIRECT] pending rejected station=%s reason=CONTEXT_CHANGED", entry.station)
+            self._emit(EngineEventKind.PENDING_DIRECT_REMOVED, entry.station, "CONTEXT_CHANGED")
+
+    def pending_direct_snapshot(self, now: datetime) -> list[dict[str, object]]:
+        return self.pending_direct_calls.snapshot(now)
+
+    def clear_candidates(self) -> None:
+        self._candidates.clear()
+        self._pending_candidate_stations.clear()
+        self._candidate_window = None
 
     def _touch_candidate_window(self, event: DecodeEvent, now: datetime) -> None:
         self._touch_candidate_window_key(self._candidate_period_key(event), now)
@@ -637,6 +758,8 @@ class DecisionEngine:
         reason: str,
         candidate: Candidate | None = None,
     ) -> None:
+        if self._promoting_pending is not None and kind is EngineEventKind.CANDIDATE_REFUSED:
+            self._pending_rejection_reason = self._direct_blocker_name(reason)
         if self._event_sink is not None:
             self._event_sink(EngineEvent(kind, station, reason, candidate))
 

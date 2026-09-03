@@ -13,13 +13,21 @@ def event(text: str) -> DecodeEvent:
     return DecodeEvent(parsed, NOW, "FT8", -8)
 
 
-def test_rr73_completes_active_qso() -> None:
+def test_rr73_waits_for_local_terminal_tx() -> None:
     machine = QsoStateMachine("F4NJU", timeout_seconds=120, max_retries=3)
     machine.start_station(event("F4NJU ON4ABC -08"))
 
     assert machine.observe(event("F4NJU ON4ABC RR73"))
-    assert machine.session.state is QsoState.COMPLETE
-    assert machine.session.completed
+    assert machine.session.state is QsoState.WAITING_FINAL_TX
+    assert not machine.session.completed
+
+
+def test_rrr_waits_for_local_terminal_tx() -> None:
+    machine = QsoStateMachine("F4NJU", timeout_seconds=120, max_retries=3)
+    machine.start_station(event("F4NJU ON4ABC -08"))
+
+    assert machine.observe(event("F4NJU ON4ABC RRR"))
+    assert machine.session.state is QsoState.WAITING_FINAL_TX
 
 
 def test_73_completes_active_qso() -> None:

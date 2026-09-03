@@ -108,9 +108,21 @@ class HaltTxPacket:
 
 
 @dataclass(frozen=True, slots=True)
-class SetTxDfPacket:
+class SetTxPeriodPacket:
     header: PacketHeader
-    tx_df: int
+    tx_first: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SetDialFrequencyPacket:
+    header: PacketHeader
+    frequency_hz: int
+
+
+@dataclass(frozen=True, slots=True)
+class TxAudioAttenuationStatePacket:
+    header: PacketHeader
+    attenuation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +138,8 @@ WsjtxPacket = (
     | ReplyPacket
     | QsoLoggedPacket
     | HaltTxPacket
-    | SetTxDfPacket
+    | SetTxPeriodPacket
+    | SetDialFrequencyPacket
+    | TxAudioAttenuationStatePacket
     | UnknownPacket
 )

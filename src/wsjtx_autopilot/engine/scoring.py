@@ -72,13 +72,14 @@ class CandidateScorer:
         event: DecodeEvent,
         kind: CandidateKind,
         worked: WorkedCheck | None = None,
+        evaluated_at: datetime | None = None,
     ) -> ScoringResult:
         station = event.parsed.sender.strip().upper()
         metadata = self.dxcc_resolver.resolve(station)
         empty = ScoreBreakdown(0, ())
         ignored_until = self._ignored_until.get(station)
         if ignored_until is not None:
-            if event.observed_at < ignored_until:
+            if (evaluated_at or event.observed_at) < ignored_until:
                 return ScoringResult(False, f"ignored until {ignored_until.isoformat()}", metadata, empty)
             del self._ignored_until[station]
         if station in self.preferences.blacklist:

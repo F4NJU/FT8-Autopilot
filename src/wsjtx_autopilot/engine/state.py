@@ -21,6 +21,7 @@ class QsoState(Enum):
     WAITING_R_REPORT = auto()
     QSO_ACTIVE = auto()
     WAITING_73 = auto()
+    WAITING_FINAL_TX = auto()
     COMPLETE = auto()
     ABORTED = auto()
 
@@ -48,10 +49,6 @@ class QsoSession:
     reply_sent_at: datetime | None = None
     remote_cq_count: int = 0
     last_remote_cq_period: tuple[object, ...] | None = None
-    remote_df: int | None = None
-    chosen_tx_df: int | None = None
-    tx_df_reason: str = ""
-    tx_df_gap_width: int = 0
 
 
 class QsoStateMachine:
@@ -89,9 +86,6 @@ class QsoStateMachine:
         self,
         event: DecodeEvent,
         now: datetime | None = None,
-        chosen_tx_df: int | None = None,
-        tx_df_reason: str = "",
-        tx_df_gap_width: int = 0,
     ) -> None:
         if self.session.state is not QsoState.IDLE:
             raise RuntimeError("cannot start a second QSO")
@@ -107,10 +101,6 @@ class QsoStateMachine:
         self.session.instance_id = event.original.instance_id if event.original is not None else None
         self.session.reply_sent_at = now or event.observed_at
         self.session.reply_confirmed = False
-        self.session.remote_df = event.original.delta_frequency if event.original is not None else None
-        self.session.chosen_tx_df = chosen_tx_df
-        self.session.tx_df_reason = tx_df_reason
-        self.session.tx_df_gap_width = tx_df_gap_width
         self.progress.start(QsoProgressStage.CALL_OR_GRID)
         self._sync_progress()
         self._transition(QsoState.CALLING_STATION, "reply sent")
@@ -118,9 +108,6 @@ class QsoStateMachine:
     def start_from_observed_exchange(
         self,
         event: DecodeEvent,
-        chosen_tx_df: int | None = None,
-        tx_df_reason: str = "",
-        tx_df_gap_width: int = 0,
     ) -> None:
         """Engage a session from an unambiguous message addressed to us."""
         if self.session.state is not QsoState.IDLE:
@@ -134,10 +121,6 @@ class QsoStateMachine:
         self.session.last_activity = event.observed_at
         self.session.report_received = event.parsed.report
         self.session.instance_id = event.original.instance_id if event.original is not None else None
-        self.session.remote_df = event.original.delta_frequency if event.original is not None else None
-        self.session.chosen_tx_df = chosen_tx_df
-        self.session.tx_df_reason = tx_df_reason
-        self.session.tx_df_gap_width = tx_df_gap_width
         self.progress.start(progress_stage_for(event.parsed.kind), _period_key(event))
         self._sync_progress()
         self._transition(QsoState.DIRECT_CALL_RECEIVED, "direct exchange observed")
@@ -221,11 +204,11 @@ class QsoStateMachine:
         elif message.kind is MessageKind.R_REPORT:
             self.session.report_received = message.report
             self._transition(QsoState.QSO_ACTIVE, "acknowledged report received")
-        elif message.kind in {MessageKind.RR73, MessageKind.SEVENTY_THREE}:
+        elif message.kind in {MessageKind.RRR, MessageKind.RR73}:
+            self._transition(QsoState.WAITING_FINAL_TX, "remote terminal received; awaiting local 73")
+        elif message.kind is MessageKind.SEVENTY_THREE:
             self.session.completed = True
             self._transition(QsoState.COMPLETE, "QSO completion received")
-        elif message.kind is MessageKind.RRR:
-            self._transition(QsoState.QSO_ACTIVE, "report acknowledgement received")
         return True
 
     def matches_remote(self, station: str, instance_id: str | None = None) -> bool:

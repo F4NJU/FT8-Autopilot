@@ -1,163 +1,24 @@
-# WSJT-X Improved 3.2 AutoPilot Direct Reply and SetTxDF Patch
+# WSJT-X AP1 Direct Reply
 
-## Target Source
+FT8-AutoPilot uses the standard WSJT-X UDP Reply message for a selected CQ,
+QRZ, or valid direct caller. The AP1 WSJT-X fork extends WSJT-X acceptance of
+direct caller Reply packets while retaining the native WSJT-X Reply path.
 
-- Publisher: Uwe Risse, DG2YCB
-- Project: WSJT-X Improved on SourceForge
-- Release: `WSJT-X Improved 3.2.0 PLUS 260818`
-- Archive: `wsjtx-3.2.0_improved_PLUS_260818.tgz`
-- Published: 2026-08-19
-- SHA-256: `075D71E6C447B85A8D78FDD3A41753F856752690F6A671A9F0CE86FDE5A85D04`
-- Source URL: <https://sourceforge.net/projects/wsjt-x-improved/files/WSJT-X_v3.2.0/Source%20code/>
+The exact Decode fields are sent back to WSJT-X. WSJT-X performs its normal
+Reply handling, including TX audio DF selection and Hold Tx Freq behavior.
+Autopilot does not modify or validate TX DF before or after Reply.
 
-This is a release archive, not a Git repository, so no upstream commit hash is
-available. The source identifies itself as project version `3.2.0.0` in
-`CMakeLists.txt` and revision `260818` in `revision_utils.cpp`. The nearest
-official WSJTX GitHub tag is `v3.0.2` at commit
-`ccdfaf3c1c109010d15399674ce278167cfde848`; it is not the patch base.
-
-## Exact Change
-
-The patch is `patches/wsjtx-3.2-direct-reply.patch`. It modifies:
-
-- `widgets/mainwindow.h`
-- `widgets/mainwindow.cpp`
-- `Network/NetworkMessage.hpp`
-- `Network/MessageClient.hpp`
-- `Network/MessageClient.cpp`
-- `revision_utils.cpp`
-
-The network Reply signal is connected to `MainWindow::replyToCQ()`. In the
-target source, that function first reconstructs the formatted Decode and finds
-an exact matching line in Band Activity. Its original acceptance block sets
-`m_bDoubleClicked` for CQ/QRZ, any text containing `73`, or whenever Hold Tx
-Freq is enabled, and then always invokes `processMessage()`.
-
-The patch introduces `MainWindow::isNetworkReplyAllowed()`. After the exact
-Band Activity match, the handler now continues only when:
+## AP1 wire IDs
 
 ```text
-CQ_OR_QRZ
-OR
-(
-  FT8_OR_FT4
-  AND NOT_LOW_CONFIDENCE
-  AND DecodedText::isStandardMessage()
-  AND native_recipient_matches_configured_my_call_or_base_call
-)
+18 retired/reserved
+19 SetTxPeriod
+20 SetDialFrequency
+21 SetTxAudioAttenuation
+22 QueryTxAudioAttenuation
+23 TxAudioAttenuationState
 ```
 
-The recipient comes from `DecodedText::call()`. Message validity comes from
-WSJT-X's existing `stdmsg_` pack/unpack validation through
-`DecodedText::isStandardMessage()`. Callsign validation and portable/compound
-handling use `Radio::is_callsign()`, `Radio::base_callsign()`,
-`m_config.my_callsign()`, and `m_baseCall`. No FT8 grammar is reimplemented.
-
-Rejected network Reply packets never set `m_bDoubleClicked` and never call
-`processMessage()`. An accepted packet follows the existing native
-`processMessage()` path used by a manual double-click.
-
-The revision is changed from `260818` to `260818 AutoPilot-STX1`, making the
-experimental binary identifiable in its title/about/version output.
-
-The exact target source already assigns message type `16` to `AnnotationInfo`
-and type `17` to `InhibitStatus`. The patch therefore appends `SetTxDF` as type
-`18`, with `Id` (`utf8`) followed by `Tx DF` (`quint32`). WSJT-X accepts it only
-for FT8/FT4, while not transmitting, and within the native `200..5000 Hz`
-spin-box range. It changes the native `TxFreqSpinBox`, preserving the normal
-waterfall, audio/XIT, band-check and Status mechanisms. The next network Reply
-preserves this Tx DF with Hold Tx Freq ON or OFF; the one-Reply lock expires
-after ten seconds.
-
-## Apply
-
-Extract the official Improved self-contained source archive. Its superbuild
-applies the top-level `wsjtx.patch` automatically to the nested `src/wsjtx.tgz`
-source before configuration. The shipped `wsjtx.patch` is empty. Replace it
-with this project's patch before configuring:
-
-```powershell
-Copy-Item `
-  C:\path\to\wsjtx-autocall-starter\patches\wsjtx-3.2-direct-reply.patch `
-  C:\src\wsjtx-3.2.0\wsjtx.patch
-```
-
-Alternatively, when working directly in an extracted nested WSJT-X tree, apply
-the diff there with `git apply`. Do not apply this patch to another release
-without rechecking `replyToCQ()`, `DecodedText`, and the exact context.
-
-## Windows Build
-
-The 3.2.0 Improved source archive includes top-level `INSTALL`, `README`,
-`CMakeLists.txt`, `wsjtx.patch`, bundled WSJT-X source, and Hamlib 4.7.2. Use
-the toolchain documented by that release. JTSDK64 is the preferred reproducible
-Windows environment when its Qt, MinGW, CMake, Ninja, Boost, FFTW, and Fortran
-versions satisfy the source's `INSTALL` checks.
-
-Run from the JTSDK64 build shell so its compiler, Fortran, Qt, CMake, Ninja,
-Boost, FFTW, Git, and `patch` are all on `PATH`. Configure the top-level
-self-contained superbuild, not the manually extracted nested source:
-
-```powershell
-cmake -S C:\src\wsjtx-3.2.0 `
-      -B C:\build\wsjtx-autopilot-dr1 `
-      -G Ninja `
-      -DCMAKE_BUILD_TYPE=Release `
-      -DWSJT_SKIP_MANPAGES=ON `
-      -DWSJT_GENERATE_DOCS=OFF `
-      -DCMAKE_INSTALL_PREFIX=C:\WSJT\wsjtx-autopilot-dr1
-cmake --build C:\build\wsjtx-autopilot-dr1 --parallel
-cmake --build C:\build\wsjtx-autopilot-dr1 --target install
-```
-
-If tests are generated by that toolchain, run
-`ctest --test-dir C:\build\wsjtx-autopilot-dr1 --output-on-failure` before
-installing. The exact dependency flags are environment-specific; follow
-`INSTALL` and CMake diagnostics rather than guessing paths. This repository
-does not bundle or replace WSJT-X dependencies.
-
-## Safe Installation
-
-1. Back up `WSJT-X.ini`, `wsjtx_log.adi`, and the WSJT-X log directory.
-2. Keep the stock WSJT-X installation unchanged.
-3. Install the patched build under `C:\WSJT\wsjtx-autopilot-dr1` or another
-   separate directory.
-4. Start it with a distinct `--rig-name` during initial testing if appropriate.
-5. Confirm the displayed revision includes `AutoPilot-STX1`.
-6. Verify radio, audio, CAT, frequency, and Reporting settings manually before
-   arming AutoPilot.
-
-Do not copy the patched executable over the stock installation.
-
-## Rollback
-
-Stop the patched application and launch the untouched stock executable. Remove
-the separate patched installation only after preserving any logs created there.
-If the same configuration profile was used, restore the backed-up INI only when
-necessary. No radio firmware or persisted protocol migration is involved.
-
-## Risks And Compatibility
-
-- Stock WSJT-X ignores Direct Reply; CQ/QRZ Reply remains supported.
-- This patch deliberately changes network-control behavior and is not an
-  official WSJT-X binary.
-- UDP send success does not prove WSJT-X acted. AutoPilot waits for coherent
-  Status evidence and otherwise returns safely to IDLE.
-- AutoPilot sends Reply only after normal Status confirms the requested Tx DF.
-  A timeout retries the caller DF, then uses native Reply behavior without
-  claiming an unconfirmed Tx DF.
-- The patch does not permit free text, ambiguous messages, low-confidence direct
-  decodes, messages addressed to third parties, or approximate/reconstructed
-  Decode fields.
-- `Clear` and removal from Band Activity continue to invalidate the exact-match
-  lookup before the new condition is evaluated.
-
-## First Direct Test
-
-Use one action only:
-
-```powershell
-wsjtx-autopilot --control --arm-auto-reply --wsjtx-direct-reply-patched --max-actions 1
-```
-
-Monitor WSJT-X manually and keep the `DISARM_AUTOPILOT` kill-switch file ready.
+Type 18 has no active implementation and must not be reused. The fork source,
+build instructions, and source archive are maintained in the companion
+`WSJTX-AutoPilot-AP1` repository.

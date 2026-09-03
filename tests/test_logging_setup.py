@@ -79,6 +79,7 @@ def test_export_contains_logs_metadata_and_sanitized_settings(tmp_path: Path) ->
     app_paths = paths(tmp_path)
     session = configure_logging(app_paths, now=NOW)
     session.context.wsjtx_version = "2.7.0"
+    session.context.pending_direct_calls = [{"callsign": "S51DD", "repeat_count": 2}]
     logging.getLogger("test").info("session content")
     flush_logs()
     settings = {"local_callsign": "F4NJU", "api_token": "do-not-export"}
@@ -90,6 +91,7 @@ def test_export_contains_logs_metadata_and_sanitized_settings(tmp_path: Path) ->
         diagnostic = json.loads(archive.read("diagnostic.json"))
         exported_settings = json.loads(archive.read("settings-sanitized.json"))
     assert diagnostic["wsjtx_version"] == "2.7.0"
+    assert diagnostic["pending_direct_calls"] == [{"callsign": "S51DD", "repeat_count": 2}]
     assert exported_settings["api_token"] == "***REDACTED***"
     assert "do-not-export" not in destination.read_bytes().decode("latin1")
 

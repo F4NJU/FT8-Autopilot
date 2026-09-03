@@ -194,7 +194,6 @@ def main() -> None:
         control_enabled=args.control,
         auto_reply_armed=args.arm_auto_reply,
         wsjtx_direct_reply_patched=args.wsjtx_direct_reply_patched,
-        wsjtx_set_tx_df_patched=args.wsjtx_direct_reply_patched,
         direct_reply_confirmation_timeout_seconds=args.direct_reply_confirmation_timeout,
         allow_dupes=args.allow_dupes,
         respond_to_cq_dx=args.respond_to_cq_dx,

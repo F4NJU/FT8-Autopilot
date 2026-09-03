@@ -24,7 +24,6 @@ class AppConfig:
     control_enabled: bool = AUTO_TX_ENABLED
     auto_reply_armed: bool = False
     wsjtx_direct_reply_patched: bool = False
-    wsjtx_set_tx_df_patched: bool = False
     direct_reply_confirmation_timeout_seconds: float = 20.0
     qso_completion_grace_seconds: float = 2.0
     allow_dupes: bool = False
@@ -35,16 +34,27 @@ class AppConfig:
     max_remote_cq_during_attempt: int = 2
     remote_returned_to_cq_cooldown_seconds: float = 90.0
     finalization_hold_periods: int = 1
+    final_tx_timeout_periods: int = 2
     max_final_retries: int = 3
-    smart_tx_frequency: bool = True
-    smart_tx_find_free: bool = True
-    smart_tx_fallback_remote: bool = True
-    occupied_guard_hz: int = 70
-    occupancy_history_seconds: float = 45.0
-    tx_df_min: int = 300
-    tx_df_max: int = 2800
-    minimum_free_gap_hz: int = 120
-    tx_df_confirmation_timeout_seconds: float = 2.0
+    adaptive_operation_enabled: bool = True
+    stagnation_attempt_window: int = 8
+    stagnation_min_failed_attempts: int = 6
+    stagnation_max_unique_calls: int = 3
+    adaptive_parity_enabled: bool = True
+    parity_trial_failed_attempts: int = 6
+    automatic_band_hopping_enabled: bool = False
+    allowed_auto_hop_bands: tuple[str, ...] = ()
+    auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
+    minimum_band_dwell_minutes: float = 5.0
+    dial_change_confirmation_timeout_seconds: float = 5.0
+    pending_direct_ttl_seconds: float = 120.0
+    ftx1_cat2_enabled: bool = False
+    ftx1_cat2_confirmed_ftx1: bool = False
+    ftx1_cat2_port: str = ""
+    ftx1_cat2_baudrate: int = 38_400
+    ftx1_cat2_timeout_seconds: float = 0.25
+    ftx1_auto_apply_band_profiles: bool = False
+    ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
     cty_dat_path: Path | None = None
     worked_store_path: Path = field(default_factory=lambda: AppPaths.from_environment().database_path)
     wsjtx_log_path: Path | None = None

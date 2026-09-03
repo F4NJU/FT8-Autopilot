@@ -11,7 +11,9 @@ from wsjtx_autopilot.wsjtx.models import (
     QsoLoggedPacket,
     ReplyPacket,
     StatusPacket,
-    SetTxDfPacket,
+    SetTxPeriodPacket,
+    SetDialFrequencyPacket,
+    TxAudioAttenuationStatePacket,
     UnknownPacket,
 )
 from wsjtx_autopilot.wsjtx.protocol import (
@@ -20,7 +22,8 @@ from wsjtx_autopilot.wsjtx.protocol import (
     parse_datagram,
     serialize_halt_tx,
     serialize_reply,
-    serialize_set_tx_df,
+    serialize_set_tx_period,
+    serialize_set_dial_frequency,
 )
 
 
@@ -204,14 +207,57 @@ def test_parses_clear_without_optional_window() -> None:
     assert packet.window is None
 
 
-@pytest.mark.parametrize("schema", [2, 3])
-def test_serializes_patched_set_tx_df(schema: int) -> None:
-    datagram = serialize_set_tx_df(schema, "WSJT-X", 1740)
-    packet = parse_datagram(datagram)
-    assert isinstance(packet, SetTxDfPacket)
+def test_retired_ap1_type_18_is_ignored() -> None:
+    data = struct.pack(">III", MAGIC, 3, 18) + qbytearray("WSJT-X") + struct.pack(">I", 1740)
+
+    packet = parse_datagram(data)
+
+    assert isinstance(packet, UnknownPacket)
     assert packet.header.packet_type == 18
+
+
+@pytest.mark.parametrize("tx_first", [False, True])
+def test_serializes_ap1_set_tx_period(tx_first: bool) -> None:
+    datagram = serialize_set_tx_period(3, "WSJT-X", tx_first)
+    packet = parse_datagram(datagram)
+    assert isinstance(packet, SetTxPeriodPacket)
+    assert packet.header.packet_type == 19
     assert packet.header.instance_id == "WSJT-X"
-    assert packet.tx_df == 1740
+    assert packet.tx_first is tx_first
+
+
+def test_serializes_ap1_set_dial_frequency() -> None:
+    datagram = serialize_set_dial_frequency(3, "WSJT-X", 18_100_000)
+    packet = parse_datagram(datagram)
+    assert isinstance(packet, SetDialFrequencyPacket)
+    assert packet.header.packet_type == 20
+    assert packet.frequency_hz == 18_100_000
+
+
+def test_serializes_ap1_tx_audio_attenuation() -> None:
+    from wsjtx_autopilot.wsjtx.protocol import serialize_set_tx_audio_attenuation
+
+    data = serialize_set_tx_audio_attenuation(3, "WSJT-X", 220)
+
+    assert data.endswith(b"\x00\xdc")
+    assert data[8:12] == (21).to_bytes(4, "big")
+
+
+@pytest.mark.parametrize("attenuation", [0, 125, 450])
+def test_parses_ap1_tx_audio_attenuation_state(attenuation: int) -> None:
+    data = struct.pack(">III", MAGIC, 3, 23) + qbytearray("WSJT-X") + struct.pack(">H", attenuation)
+
+    packet = parse_datagram(data)
+
+    assert isinstance(packet, TxAudioAttenuationStatePacket)
+    assert packet.attenuation == attenuation
+
+
+def test_rejects_truncated_ap1_tx_audio_attenuation_state() -> None:
+    data = struct.pack(">III", MAGIC, 3, 23) + qbytearray("WSJT-X") + b"\x00"
+
+    with pytest.raises(ProtocolError, match="truncated"):
+        parse_datagram(data)
 
 
 @pytest.mark.parametrize("schema", [2, 3])

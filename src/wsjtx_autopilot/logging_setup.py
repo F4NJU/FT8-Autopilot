@@ -25,10 +25,14 @@ class DiagnosticContext:
     wsjtx_schema: int | None = None
     wsjtx_instance: str = "unknown"
     wsjtx_endpoint: str = "unknown"
+    wsjtx_revision: str = "unknown"
+    ap1_controls_available: bool = False
     band: str = "unknown"
     mode: str = "unknown"
     database_schema_version: int = 1
     feature_flags: dict[str, bool] = field(default_factory=dict)
+    pending_direct_calls: list[dict[str, object]] = field(default_factory=list)
+    adaptive: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

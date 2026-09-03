@@ -131,6 +131,8 @@ class EngineEventKind(Enum):
     CANDIDATE_ADDED = auto()
     CANDIDATE_REFUSED = auto()
     CANDIDATE_SELECTED = auto()
+    PENDING_DIRECT_ADDED = auto()
+    PENDING_DIRECT_REMOVED = auto()
 
 
 class CooldownKind(Enum):
@@ -184,8 +186,3 @@ class IntendedAction:
     reason: str
     original_decode: OriginalDecode | None = None
     observed_at: datetime | None = None
-    remote_df: int | None = None
-    selected_tx_df: int | None = None
-    tx_df_reason: str = ""
-    tx_df_gap_width: int = 0
-    tx_df_fallback: bool = False

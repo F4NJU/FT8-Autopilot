@@ -4,224 +4,626 @@ Version: 0.1.0
 Summary: Dry-run FT8 decision companion for WSJT-X
 Requires-Python: >=3.12
 Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pyserial>=3.5
 Provides-Extra: test
 Requires-Dist: pytest>=8.0; extra == "test"
 Provides-Extra: gui
 Requires-Dist: PySide6>=6.7; extra == "gui"
 Provides-Extra: build
 Requires-Dist: PyInstaller>=6.0; extra == "build"
+Dynamic: license-file
 
-# WSJTX AutoPilot
+# FT8-Autopilot
+WIP Windows companion for WSJT-X that automates FT8/FT4 station selection, CQ/direct-call replies, QSO sequencing support, duplicate filtering, DXCC/continent priorities and safety watchdogs. Experimental software for supervised amateur-radio operation.
+# FT8-AutoPilot
 
-Windows companion for observing WSJT-X UDP traffic and evaluating a minimal
-FT8/FT4 AutoCall policy. Armed control can initiate a QSO from a decoded CQ/QRZ
-using the documented WSJT-X Reply packet. Milestone 3 optionally supports calls
-addressed directly to the local station when used with the documented patched
-WSJT-X Improved build.
+> [!WARNING]
+> **WORK IN PROGRESS — EXPERIMENTAL SOFTWARE**
+>
+> FT8-AutoPilot can automatically initiate amateur-radio transmissions.
+> The station operator remains responsible for all transmissions and for
+> compliance with applicable regulations.
 
-> **Safety warning:** the default mode is observation/dry-run only. Armed
-> control sends a WSJT-X Reply equivalent to double-clicking an exact Decode.
-> Depending on WSJT-X state, this may enable or initiate transmission. The GUI
-> always starts DISARMED. No CAT, Hamlib, PTT, or complete automatic QSO
-> sequence is implemented.
+FT8-AutoPilot is a Windows companion for WSJT-X providing automatic
+FT8/FT4 station selection, CQ and direct-call handling, duplicate filtering,
+DXCC/continent priorities and QSO safety watchdogs.
 
-## Requirements
+## Status
 
-- Windows 10/11
-- Python 3.12 or newer
-- WSJT-X using network protocol schema 2 or 3
+🚧 **WIP / Experimental**
 
-## Install
+## FTX-1 CAT-2
 
-In PowerShell from this directory:
+Experimental FTX-1-only CAT-2 USB MOD GAIN support is documented in
+[`docs/FTX1_CAT2.md`](docs/FTX1_CAT2.md). It is disabled by default and never
+uses the CAT port configured for WSJT-X.
 
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install -e ".[test]"
-```
+This project is under active development and interfaces with a modified
+WSJT-X build for some advanced functions.
 
-For the desktop interface and executable build tools:
+## License
 
-```powershell
-python -m pip install -e ".[test,gui,build]"
-```
+GPL-3.0-or-later
 
-## Configure WSJT-X
 
-1. Open **File > Settings > Reporting** in WSJT-X.
-2. Under **UDP Server**, set **Server name or IP address** to `127.0.0.1`.
-3. Set **Server port number** to `2237`.
-4. Enable **Accept UDP requests**. This is only needed for explicitly armed
-   Reply control; dry-run sends nothing.
-5. Apply the settings. Do not configure another program on the same local UDP
-   port unless it supports forwarding or multicast.
+FT8-AutoPilot is an experimental Windows companion for WSJT-X, designed to automate FT8/FT4 station selection and QSO handling while keeping WSJT-X responsible for the actual digital-mode sequencing.
 
-If WSJT-X runs on another computer, start this application with `--bind 0.0.0.0`
-and point WSJT-X at the Windows computer's LAN address. Adjust Windows Firewall
-to permit inbound UDP port 2237 on the appropriate private network only.
+The project is currently WIP and interfaces with a modified WSJT-X build for some advanced control functions.
 
-## Run
+Development status
 
-Desktop interface:
+Legend:
 
-```powershell
-wsjtx-autopilot --gui
-```
+Status	Meaning
+✅ Working	Implemented and tested in real operation
+🧪 Experimental	Implemented but still being validated
+🚧 In development	Currently being implemented/debugged
+📋 Planned	Intended feature, not functional yet
+Feature status
+Core WSJT-X communication
+Feature	Status
+WSJT-X UDP listener	✅ Working
+Heartbeat / Status / Decode parsing	✅ Working
+FT8 support	✅ Working
+FT4 protocol support	🧪 Experimental
+CQ detection	✅ Working
+Real WSJT-X UDP Reply	✅ Working
+WSJT-X QSOLogged handling	✅ Working
+Multiple successive QSOs	✅ Working
+GUI Windows	🧪 Experimental
+PyInstaller Windows build	🧪 Experimental
+Automatic CQ selection
 
-Preferences are stored in `%APPDATA%\WSJTX-AutoPilot\settings.json`. The GUI
-shows live Decode activity, explicit candidate score components, QSO state and
-WSJT-X connection state. ARM CONTROL always requires an operator confirmation;
-arm state is never saved. DISARM blocks new initiations without stopping QSO
-observation.
+Status: ✅ Working / continuously improving
 
-Command-line dry-run:
+FT8-AutoPilot analyses CQ messages received from WSJT-X and automatically selects eligible stations.
 
-```powershell
-wsjtx-autopilot
-```
+Example:
 
-This command is always dry-run. It may print `[WOULD_ACTION]`, but sends no UDP
-Reply.
+CQ DL3DLP JO33
 
-For the first controlled live test, use the one-shot limit:
+Candidate selection can take into account filtering and scoring rules.
 
-```powershell
-wsjtx-autopilot --control --arm-auto-reply --max-actions 1
-```
+The selection engine is separate from the GUI and WSJT-X control layer.
 
-Both `--control` and `--arm-auto-reply` are required. With only one flag, the
-application remains dry-run. Armed startup prints:
+Direct-call support
 
-```text
-[AUTO CONTROL ARMED]
-WSJT-X Reply packets may initiate transmissions
-```
+Status: ✅ Working with modified WSJT-X
 
-Create a file named `DISARM_AUTOPILOT` in the working directory to trigger the
-software kill switch while leaving the listener running. A different path can
-be selected with `--kill-switch-file`. The one-shot command disarms new
-initiations after its first successfully sent Reply. A failed local `sendto()`
-does not consume an action.
+FT8-AutoPilot can detect stations explicitly calling the local station:
 
-Options:
+F4NJU YO6LM KN25
+F4NJU YO6LM -10
 
-```text
---callsign F4NJU       Local callsign (default: F4NJU)
---bind 127.0.0.1       UDP bind address
---port 2237            UDP port
---stale-seconds 15     Maximum decode age
---worked-store data/autopilot.sqlite3  Persistent Worked Today database
---wsjtx-log PATH       Explicit wsjtx_log.adi path for startup synchronization
---allow-dupes          Permit same-day/same-band duplicate initiations
---dry-run-cooldown-seconds 90  Delay before proposing the same station again
---control               Enable the control adapter (does not arm it alone)
---arm-auto-reply        Arm Reply packets (requires --control)
---wsjtx-direct-reply-patched  Permit direct Reply with the patched WSJT-X only
---direct-reply-confirmation-timeout 20  Wait for coherent Status evidence
---max-actions 1         Maximum successfully sent Reply initiations
---kill-switch-file DISARM_AUTOPILOT  Runtime software kill switch
---record capture.bin   Record timestamped UDP datagrams
---replay capture.bin   Replay a capture without opening the UDP port
---verbose              Debug logging
-```
+Direct calls can take priority over ordinary CQ candidates.
 
-The listener displays Heartbeat, Status, and Decode packets. Valid recent CQ
-messages are collected briefly; an unambiguous call addressed to the local
-callsign takes priority while the state machine is idle. A selected candidate
-produces output such as:
+This currently requires a small modification to WSJT-X because the standard
+WSJT-X network Reply command normally only permits CQ/QRZ decodes.
 
-```text
-[ENGINE] direct caller detected: ON4ABC
-[WOULD_ACTION] direct-reply ON4ABC
-```
+An inbound Direct Call that passes hard filters (Worked Today, blacklist,
+confidence, freshness, and user policy) clears soft station cooldowns left by
+an earlier unanswered, stalled, remote-busy, or returned-to-CQ attempt. It is
+treated as new inbound intent. It does not override hard filters or preempt an
+already-sent Reply/QSO; that case is logged as a pending direct caller.
 
-## Tests
+QSO lifecycle tracking
 
-```powershell
-python -m pytest
-```
+Status: ✅ Working / 🧪 being refined
 
-Build the windowed executable after installing the build extras:
+Typical state flow:
 
-```powershell
-pyinstaller packaging/wsjtx-autopilot.spec
-```
+IDLE
+  ↓
+Candidate selected
+  ↓
+Reply sent
+  ↓
+CALLING
+  ↓
+QSO ACTIVE
+  ↓
+WSJT-X Auto Seq
+  ↓
+QSOLogged
+  ↓
+COMPLETE
+  ↓
+IDLE
 
-The executable is written to `dist\WSJTX-AutoPilot.exe`.
+FT8-AutoPilot can continue automatically with another candidate after a QSO
+has completed.
 
-## Reply Control
+Recovery logic for unusual FT8 sequences is still being refined.
 
-Reply type 4 reproduces the selected Decode's original instance id, schema,
-time, SNR, delta time, delta frequency, raw mode marker, message, and
-low-confidence flag. It is sent only to the source endpoint associated with the
-same observed WSJT-X instance. Clear invalidates pending Decodes.
+Worked Today / duplicate filtering
 
-Stock WSJT-X accepts Reply only when it exactly matches a CQ/QRZ Decode still
-present in its decode window. Direct Reply is therefore disabled by default.
-It requires the minimal patch and build procedure in
-[`docs/WSJTX_DIRECT_REPLY.md`](docs/WSJTX_DIRECT_REPLY.md), plus the explicit
-`--wsjtx-direct-reply-patched` option.
+Status: 🧪 Experimental / being integrated
 
-First direct-call test, always one-shot:
+The intended duplicate policy is:
 
-```powershell
-wsjtx-autopilot --control --arm-auto-reply --wsjtx-direct-reply-patched --max-actions 1
-```
+UTC day + callsign + band
 
-After a Direct Reply UDP send, AutoPilot waits in `DIRECT_REPLY_SENT`. It only
-enters `CALLING_STATION` after a coherent Status combines the expected DX Call
-with transmitting state or matching enabled TX message. DX Call alone is not
-confirmation. A timeout produces `DIRECT_REPLY_UNCONFIRMED` and safely resets
-to `IDLE`, which also detects a stock WSJT-X that ignored the packet.
+Example:
 
-Once a CQ or Direct Reply is sent, WSJT-X Auto Seq remains solely responsible
-for reports, R-reports, RR73, 73, and logging. AutoPilot observes those exchanges
-without sending additional Reply packets. A matching QSOLogged type 5 is the
-strong completion event: the session transitions through `COMPLETE`, clears its
-remote station and old candidates, and returns to `IDLE`. RR73/73 can also mark
-completion; AutoPilot waits for inactive TX status and a short grace period
-before returning to `IDLE` when QSOLogged is absent.
+YO6LM worked today on 20 m
+→ blocked on 20 m
 
-`--max-actions` counts only CQ Reply and Direct Reply datagrams successfully
-sent by AutoPilot. Auto Seq transmissions do not consume actions. Reaching the
-limit blocks new initiations but does not interfere with completion tracking for
-the QSO already started.
+YO6LM worked today on 20 m
+→ still eligible on 40 m
 
-## Worked Today
+A station must only become Worked Today after a confirmed/logged QSO.
 
-Automatic initiations are filtered by default using this key:
+The following must NOT count as worked:
 
-```text
-UTC date + normalized callsign + canonical amateur band
-```
+Reply sent;
+unanswered call;
+watchdog timeout;
+aborted QSO;
+failed sequence.
 
-For example, working `YO6LM` on 20m blocks another automatic CQ or Direct Reply
-to `YO6LM` on any 20m frequency until 00:00 UTC. The same station remains
-eligible on 40m. FT8 versus FT4 does not change duplicate status.
+QSOLogged is intended to be the primary confirmation source.
 
-Records are persisted in `data/autopilot.sqlite3` by default. Every valid
-QSOLogged packet is recorded, including QSOs initiated manually in WSJT-X.
-Reply transmission alone never marks a station as worked; failed or timed-out
-QSOs therefore do not create duplicate records.
+Persistent Worked database
 
-At startup AutoPilot imports `wsjtx_log.adi` when one unambiguous Windows
-WSJT-X profile is found under `%LOCALAPPDATA%`. Use `--wsjtx-log PATH` when the
-log is elsewhere or multiple profiles exist. The ADIF import reads only CALL,
-QSO_DATE, BAND/FREQ, and MODE/SUBMODE data and is idempotent. A missing log emits
-a warning but does not prevent startup.
+Status: 🚧 In development
 
-Use `--allow-dupes` to bypass only this Worked Today filter. Active-QSO,
-cooldown, stale Decode, low-confidence, max-actions, and datagram duplicate
-protections remain enabled.
+Planned storage:
 
-## Current Limits
+%LOCALAPPDATA%\FT8-AutoPilot\autopilot.sqlite3
 
-- Documented WSJT-X schema 2/3 packet types 0 through 5 needed by this milestone
-  are supported.
-- Only common structured FT8/FT4 CQ, grid, report, RRR, RR73, and 73 messages
-  are accepted; ambiguous free text is deliberately ignored.
-- Direct-call response requires the separately built, visibly identified
-  `AutoPilot-DR1` WSJT-X Improved binary. Complete QSO sequencing, logging,
-  CAT/radio control and full QSO sequencing do not exist.
-- QSO decisions are in-memory and are lost when the process exits.
+The SQLite database will store confirmed QSOs used by duplicate filtering.
+
+The database is intended to survive application updates and restarts.
+
+Wavelog / ADIF synchronization
+
+Status: 📋 Planned
+
+Automatic synchronization with a local ADIF file is planned.
+
+The objective is to import existing QSOs at application startup so FT8-AutoPilot
+already knows which stations have been worked that day.
+
+Planned behaviour:
+
+ADIF
+  ↓
+CALL / DATE / BAND / MODE
+  ↓
+Worked database
+
+Import should be idempotent and configurable through the GUI.
+
+This feature should not currently be assumed to be functional unless explicitly
+reported by the application.
+
+Candidate priorities
+
+Status: 🚧 In development
+
+The candidate engine is being extended to support operator preferences.
+
+Planned / developing criteria include:
+
+DXCC entity;
+continent;
+signal level;
+direct calls;
+POTA;
+SOTA;
+QRP;
+user blacklist;
+temporary ignore;
+Worked Today.
+
+The design separates:
+
+Blocking rules
+
+Example:
+
+Worked Today
+Blacklist
+Directed CQ not intended for us
+Stale decode
+Low-confidence decode
+
+from:
+
+Priority bonuses
+
+Example:
+
+Direct Call          high priority
+Preferred DXCC       bonus
+Preferred continent  bonus
+POTA / SOTA / QRP    optional bonus
+Signal level         small bonus
+
+Exact scoring values are still subject to change.
+
+DXCC / country / continent information
+
+Status: 🚧 In development
+
+The GUI is intended to display:
+
+Callsign
+Country
+DXCC entity
+Continent
+Locator
+SNR
+
+An offline DXCC/prefix resolver is planned so normal operation does not depend
+on Internet access.
+
+Directed CQ support
+
+Status: 🚧 In development / experimental
+
+FT8-AutoPilot is being extended to distinguish general CQ calls from directed
+CQ calls such as:
+
+CQ EU DL1ABC JO40
+CQ OC VK3ABC QF22
+CQ JA JA1ABC PM95
+
+The local station should only automatically answer a directed CQ if it matches
+the requested criterion.
+
+Unknown directed CQ formats should be handled conservatively.
+
+POTA / SOTA / QRP awareness
+
+Status: 📋 Planned / partially under development
+
+The candidate model is intended to expose activity information such as:
+
+POTA
+SOTA
+QRP
+
+This information may later be used for filtering or priority scoring.
+
+Important:
+
+/P ≠ automatically POTA
+
+and a weak signal must never automatically be assumed to mean QRP.
+
+Detecting a remote station working someone else
+
+Status: 🧪 Experimental
+
+FT8-AutoPilot can detect situations where the currently selected station
+clearly begins communicating with another station.
+
+Example:
+
+Current remote:
+II7MGXX
+
+Decode:
+UT2UB II7MGXX +13
+
+The intended behaviour is:
+
+abort current attempt
+→ temporary cooldown for II7MGXX only
+→ immediately search for another candidate
+
+This logic is still being tuned to avoid unnecessary dead periods.
+
+Remote returning to CQ
+
+Status: 🧪 Experimental
+
+A remote station transmitting CQ again does not necessarily mean the QSO should
+be abandoned immediately.
+
+The current development goal is to tolerate a limited number of repeated CQs
+before considering the attempt lost.
+
+This avoids loops such as:
+
+call station
+→ remote CQ
+→ abort
+→ immediately select same station again
+QSO progress watchdog
+
+Status: 🚧 In development
+
+A normal time-based watchdog is not sufficient when the remote station keeps
+replying without advancing the FT8 exchange.
+
+Example:
+
+F4NJU M9VVE IO93
+F4NJU M9VVE IO93
+F4NJU M9VVE IO93
+...
+
+The planned semantic watchdog tracks stages such as:
+
+CALL / GRID
+REPORT
+R-REPORT
+RRR / RR73
+73
+
+Repeated messages at the same protocol stage should eventually cause the QSO
+to be aborted even if packets continue to arrive.
+
+Final 73 / RRR retry handling
+
+Status: 🚧 In development
+
+Example:
+
+F4NJU UI6O RRR
+UI6O F4NJU 73
+
+...
+
+F4NJU UI6O RRR
+
+The remote station may not have received the final 73.
+
+FT8-AutoPilot is being developed to maintain a short finalization window and
+retransmit the terminal response when appropriate.
+
+Planned safeguards include:
+
+one short RX grace period;
+limited retry count;
+no duplicate QSO entry;
+no interruption of a newer QSO that has already genuinely progressed.
+Smart TX Frequency
+
+Status: 📋 Planned
+
+An experimental Smart TX Frequency feature is planned.
+
+The idea is to use recent WSJT-X Decode frequencies to estimate occupied areas
+inside the FT8 passband.
+
+Example:
+
+Remote DF: 895 Hz
+
+Estimated free slot:
+1650 Hz
+
+RX remote: 895 Hz
+TX:        1650 Hz
+
+If no suitable free area exists:
+
+TX = remote frequency
+
+This would be a Decode-based occupancy estimate, not a real spectrum
+analyser or FFT.
+
+Implementation will require additional WSJT-X control because the standard UDP
+API does not provide all of the required TX-frequency control.
+
+Windows GUI
+
+Status: 🧪 Experimental
+
+FT8-AutoPilot includes a native Windows GUI based on PySide6.
+
+Current/developing interface elements include:
+
+WSJT-X connection state;
+current band;
+current mode;
+Armed / Disarmed state;
+candidate station;
+active station;
+direct-call indication;
+QSO state;
+activity log.
+
+Planned additions include:
+
+country / DXCC / continent;
+candidate score explanation;
+Worked Today status;
+POTA/SOTA/QRP information;
+watchdog counters;
+blacklist management;
+DXCC preferences;
+continent preferences;
+session statistics;
+update management.
+
+The GUI is still under active development.
+
+Arm / Disarm safety model
+
+Status: 🧪 Experimental
+
+The intended safety model is:
+
+application startup
+→ DISARMED
+
+The operator must explicitly enable automatic operation.
+
+Disarming should stop new automatic initiations without unnecessarily
+breaking a QSO already being completed by WSJT-X Auto Seq.
+
+Halt TX integration
+
+Status: 🚧 In development
+
+FT8-AutoPilot is intended to use WSJT-X network control to stop TX when a
+watchdog detects a genuinely stalled or invalid QSO.
+
+No GUI mouse automation should be required.
+
+Local Windows data paths
+
+Status: 📋 Planned / migration in progress
+
+Target locations:
+
+%APPDATA%\FT8-AutoPilot\
+
+for configuration, and:
+
+%LOCALAPPDATA%\FT8-AutoPilot\
+
+for:
+
+database;
+logs;
+runtime data.
+
+Persistent user data should never depend on the installation directory.
+
+Automatic updates
+
+Status: 🚧 Infrastructure working / application updater planned
+
+GitHub Actions currently builds WIP Windows releases automatically.
+
+Development tags use:
+
+v0.1.0-wip.1
+v0.1.0-wip.2
+v0.1.0-wip.3
+
+The GitHub pipeline can:
+
+run tests
+→ build Windows application
+→ create ZIP
+→ publish GitHub prerelease
+
+Planned application-side update features:
+
+check for updates;
+Stable / WIP update channel;
+update notification in GUI;
+download release;
+automatic replacement of program files;
+restart FT8-AutoPilot.
+
+The in-application updater is not yet functional.
+
+GitHub automated builds
+
+Status: ✅ Working
+
+WIP releases are automatically built using:
+
+GitHub Actions;
+Python;
+PyInstaller;
+Windows runners.
+
+Published WIP versions are marked as prereleases.
+
+WSJT-X patch
+
+Status: 🧪 Experimental
+
+Some advanced features require a modified WSJT-X build.
+
+Currently this includes direct-reply functionality not available through the
+standard WSJT-X Reply command.
+
+Future features such as Smart TX Frequency may require additional minimal
+extensions.
+
+The patch should remain isolated and documented separately.
+
+Future ideas
+
+Status: 📋 Planned / exploratory
+
+Possible future additions include:
+
+new DXCC priority;
+new grid priority;
+band-specific priorities;
+DXCC wanted list;
+continent wanted list;
+advanced blacklist/whitelist;
+POTA/SOTA prioritisation;
+Wavelog integration;
+automatic ADIF synchronization;
+integrated updater;
+richer session statistics;
+candidate history;
+optional real spectrum occupancy detection;
+additional WSJT-X safety controls.
+
+These are not commitments and should not be considered functional features.
+
+Current focus
+
+The current development priorities are:
+
+1. Reliable automatic QSO lifecycle
+2. Correct Direct Call handling
+3. No unnecessary duplicate QSOs
+4. Efficient recovery after failed attempts
+5. Robust watchdog behaviour
+6. Candidate filtering and scoring
+7. Stable Windows GUI
+8. Safe unattended-assistance controls
+Legal & safety notice
+
+FT8-AutoPilot is experimental software intended for licensed amateur-radio
+operators.
+
+The station operator remains responsible for all transmissions made by their
+station and for compliance with:
+
+licence conditions;
+applicable national regulations;
+band plans;
+power limits;
+identification rules;
+interference requirements.
+
+Do not rely on FT8-AutoPilot as a safety system.
+
+Software bugs, decoding errors, WSJT-X behaviour, network failures or operating
+system failures may result in unintended transmissions.
+
+The software is provided as is, without warranty.
+
+Licence
+
+GNU General Public License v3.0
+
+See LICENSE.
+
+Project summary
+Platform:        Windows
+Language:        Python
+GUI:             PySide6
+WSJT-X control:  UDP
+Packaging:       PyInstaller
+Database:        SQLite (planned/in integration)
+Modes:           FT8 / FT4
+Status:          WIP / Experimental
+Licence:         GPL-3.0
+
+Do not assume that a feature mentioned in this README is available unless
+it is marked ✅ Working.
+
+## Bug reports
+
+When reporting an operating issue, please include a diagnostic log or
+use **Settings → Diagnostics → Export diagnostic**.
+
+Diagnostic logs contain FT8 messages, callsigns, frequencies and QSO
+state information, but should never contain passwords or API tokens.

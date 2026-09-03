@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
-from wsjtx_autopilot.config import AppConfig, AppPaths, UserSettings
+from wsjtx_autopilot.config import AppConfig, AppPaths, SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.cq import CqEligibility
@@ -34,7 +34,8 @@ class BackendWorker(QObject):
     activity_received = Signal(object)
     engine_event = Signal(object)
     status_changed = Signal(object)
-    qso_changed = Signal(str, str, str, str, int, int, int, int, str, str, str, str)
+    adaptive_changed = Signal(object)
+    qso_changed = Signal(str, str, str, str, int, int, int, int, str)
 
     def __init__(self, settings: UserSettings) -> None:
         super().__init__()
@@ -47,6 +48,7 @@ class BackendWorker(QObject):
         self._scorer: CandidateScorer | None = None
         self._last_packet_at: datetime | None = None
         self._connected = False
+        self._last_reported_armed = False
 
     @Slot()
     def start(self) -> None:
@@ -87,6 +89,7 @@ class BackendWorker(QObject):
 
     @Slot()
     def arm(self) -> None:
+        LOGGER.info("[WORKER] ARM request received")
         if self._runtime is None or self._listener is None:
             self.error.emit("Backend is not running")
             return
@@ -101,14 +104,16 @@ class BackendWorker(QObject):
             type(control).__name__,
             id(self._listener),
         )
-        control.arm()
-        self.armed_changed.emit(control.armed)
+        armed = self._runtime.arm_control()
+        self._last_reported_armed = armed
+        self.armed_changed.emit(armed)
 
     @Slot(str)
-    def disarm(self, reason: str = "operator request") -> None:
+    def disarm(self, reason: str = "user_request") -> None:
         if self._runtime is None:
             return
-        self._runtime.control.disarm(reason)
+        self._disarm_control(reason, "BackendWorker.disarm")
+        self._last_reported_armed = False
         self.armed_changed.emit(False)
 
     @Slot(str)
@@ -116,6 +121,26 @@ class BackendWorker(QObject):
         if self._scorer is not None:
             until = datetime.now(timezone.utc) + timedelta(minutes=self._settings.ignore_minutes)
             self._scorer.ignore_station(station, until)
+
+    @Slot()
+    def reset_adaptive_strategy(self) -> None:
+        if self._runtime is not None:
+            self._runtime.reset_adaptive_strategy()
+
+    @Slot()
+    def save_ftx1_current_band_profile(self) -> None:
+        if self._runtime is not None:
+            self._runtime.save_ftx1_current_band_profile()
+
+    @Slot()
+    def delete_ftx1_current_band_profile(self) -> None:
+        if self._runtime is not None:
+            self._runtime.delete_ftx1_current_band_profile()
+
+    @Slot()
+    def reset_all_ftx1_band_profiles(self) -> None:
+        if self._runtime is not None:
+            self._runtime.reset_all_ftx1_band_profiles()
 
     @Slot()
     def _poll(self) -> None:
@@ -156,26 +181,23 @@ class BackendWorker(QObject):
                 session.remote_cq_count,
                 self._runtime.config.max_remote_cq_during_attempt,
                 self._runtime.last_qso_notice,
-                f"RX  {session.remote_df} Hz" if session.remote_df is not None else "RX  -",
-                f"TX  {session.chosen_tx_df} Hz" if session.chosen_tx_df is not None else "TX  -",
-                (
-                    f"Smart TX  {session.tx_df_reason}"
-                    + (f" / gap {session.tx_df_gap_width} Hz" if session.tx_df_gap_width else "")
-                    if session.tx_df_reason
-                    else "Smart TX  -"
-                ),
             )
+            self.adaptive_changed.emit(self._runtime.adaptive_snapshot())
             control = self._runtime.control
-            self.armed_changed.emit(
-                isinstance(control, WsjtxUdpControl) and control.armed,
-            )
+            backend_armed = isinstance(control, WsjtxUdpControl) and control.armed
+            periodic_state = received is not None and isinstance(received.packet, (StatusPacket, HeartbeatPacket))
+            if periodic_state or backend_armed != self._last_reported_armed:
+                self._last_reported_armed = backend_armed
+                if periodic_state:
+                    LOGGER.info("[WORKER] control state backend_armed=%s", backend_armed)
+                self.armed_changed.emit(backend_armed)
             if (
                 self._last_packet_at is not None
                 and (now - self._last_packet_at).total_seconds() > CONNECTION_TIMEOUT_SECONDS
             ):
                 self._set_connected(False)
         except Exception as exc:
-            LOGGER.exception("GUI backend poll failed")
+            LOGGER.exception("[GUI] backend_exception; control armed state is unchanged")
             self.error.emit(str(exc))
 
     def _open_backend(self) -> None:
@@ -219,7 +241,6 @@ class BackendWorker(QObject):
             allow_dupes=self._settings.allow_dupes,
             max_initiation_attempts=1,
             wsjtx_direct_reply_patched=self._settings.direct_reply_patched,
-            wsjtx_set_tx_df_patched=self._settings.direct_reply_patched,
             worked_store_path=store_path,
             wsjtx_log_path=Path(self._settings.wsjtx_log_path) if self._settings.wsjtx_log_path else None,
             respond_to_cq_dx=self._settings.respond_to_cq_dx,
@@ -229,15 +250,27 @@ class BackendWorker(QObject):
             max_remote_cq_during_attempt=self._settings.max_remote_cq_during_attempt,
             remote_returned_to_cq_cooldown_seconds=self._settings.remote_returned_to_cq_cooldown_seconds,
             finalization_hold_periods=self._settings.finalization_hold_periods,
+            final_tx_timeout_periods=self._settings.final_tx_timeout_periods,
             max_final_retries=self._settings.max_final_retries,
-            smart_tx_frequency=self._settings.smart_tx_frequency,
-            smart_tx_find_free=self._settings.smart_tx_find_free,
-            smart_tx_fallback_remote=self._settings.smart_tx_fallback_remote,
-            occupied_guard_hz=self._settings.occupied_guard_hz,
-            occupancy_history_seconds=self._settings.occupancy_history_seconds,
-            tx_df_min=self._settings.tx_df_min,
-            tx_df_max=self._settings.tx_df_max,
-            minimum_free_gap_hz=self._settings.minimum_free_gap_hz,
+            adaptive_operation_enabled=self._settings.adaptive_operation_enabled,
+            stagnation_attempt_window=self._settings.stagnation_attempt_window,
+            stagnation_min_failed_attempts=self._settings.stagnation_min_failed_attempts,
+            stagnation_max_unique_calls=self._settings.stagnation_max_unique_calls,
+            adaptive_parity_enabled=self._settings.adaptive_parity_enabled,
+            parity_trial_failed_attempts=self._settings.parity_trial_failed_attempts,
+            automatic_band_hopping_enabled=self._settings.automatic_band_hopping_enabled,
+            allowed_auto_hop_bands=tuple(self._settings.allowed_auto_hop_bands),
+            auto_hop_band_frequencies=self._settings.auto_hop_band_frequencies,
+            minimum_band_dwell_minutes=self._settings.minimum_band_dwell_minutes,
+            dial_change_confirmation_timeout_seconds=self._settings.dial_change_confirmation_timeout_seconds,
+            pending_direct_ttl_seconds=self._settings.pending_direct_ttl_seconds,
+            ftx1_cat2_enabled=self._settings.ftx1_cat2_enabled,
+            ftx1_cat2_confirmed_ftx1=self._settings.ftx1_cat2_confirmed_ftx1,
+            ftx1_cat2_port=self._settings.ftx1_cat2_port,
+            ftx1_cat2_baudrate=self._settings.ftx1_cat2_baudrate,
+            ftx1_cat2_timeout_seconds=self._settings.ftx1_cat2_timeout_seconds,
+            ftx1_auto_apply_band_profiles=self._settings.ftx1_auto_apply_band_profiles,
+            ftx1_band_profiles=deepcopy(self._settings.ftx1_band_profiles),
             cty_dat_path=Path(self._settings.cty_dat_path) if self._settings.cty_dat_path else None,
         )
         local_profile = StationProfile(config.local_callsign, resolver.resolve(config.local_callsign))
@@ -253,7 +286,14 @@ class BackendWorker(QObject):
             self._settings.direct_reply_patched,
             armed=False,
         )
-        self._runtime = AutopilotRuntime(config, engine, control, worked)
+        self._runtime = AutopilotRuntime(
+            config,
+            engine,
+            control,
+            worked,
+            ftx1_band_profiles_changed=self._persist_ftx1_band_profiles,
+        )
+        self._runtime.initialize_ftx1_cat2()
         LOGGER.info(
             "[GUI] backend runtime=%d control=%d runtime_control=%d transport=%d implementation=%s armed=%s",
             id(self._runtime),
@@ -264,10 +304,14 @@ class BackendWorker(QObject):
             control.armed,
         )
         self._last_packet_at = None
+        self._last_reported_armed = False
         self._set_connected(False)
         self.armed_changed.emit(False)
+        self.adaptive_changed.emit(self._runtime.adaptive_snapshot())
 
     def _close_backend(self) -> None:
+        if self._runtime is not None and self._runtime.ftx1_band_drive is not None:
+            self._runtime.ftx1_band_drive.close()
         if self._listener is not None:
             self._listener.close()
         if self._store is not None:
@@ -278,16 +322,31 @@ class BackendWorker(QObject):
         self._scorer = None
         self._set_connected(False)
 
+    def _persist_ftx1_band_profiles(self, profiles: dict[str, dict[str, int]]) -> None:
+        self._settings.ftx1_band_profiles = deepcopy(profiles)
+        SettingsStore().save(self._settings)
+
     def _on_engine_event(self, event: EngineEvent) -> None:
         if event.kind.name == "CANDIDATE_SELECTED":
             LOGGER.info("[GUI] candidate selected station=%s", event.station)
+        elif event.kind.name == "PENDING_DIRECT_ADDED":
+            LOGGER.info("[GUI] next pending Direct Call: %s", event.station)
         self.engine_event.emit(event)
 
     def _set_connected(self, connected: bool) -> None:
         if not connected and self._connected and self._runtime is not None:
-            self._runtime.control.disarm("WSJT-X connection lost")
+            self._disarm_control("wsjtx_offline", "BackendWorker._set_connected")
             self._runtime.clear_finalization("WSJT-X connection lost")
             self.armed_changed.emit(False)
         if connected != self._connected:
             self._connected = connected
             self.connection_changed.emit(connected)
+
+    def _disarm_control(self, reason: str, source: str) -> None:
+        if self._runtime is None:
+            return
+        control = self._runtime.control
+        if isinstance(control, WsjtxUdpControl):
+            control.disarm(reason, source=source)
+        else:
+            control.disarm(reason)

@@ -3,6 +3,8 @@ import struct
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, IntendedAction
@@ -62,6 +64,18 @@ def decode(message: str, snr: int, df: int) -> DecodePacket:
     packet = parse_datagram(data)
     assert isinstance(packet, DecodePacket)
     return packet
+
+
+@pytest.mark.parametrize("attenuation", [0, 125, 450])
+def test_ap1_attenuation_state_reaches_runtime_without_heartbeat_fields(attenuation: int) -> None:
+    instance_id = b"WSJT-X"
+    data = struct.pack(">III", MAGIC, 3, 23) + struct.pack(">I", len(instance_id)) + instance_id + struct.pack(">H", attenuation)
+    packet = parse_datagram(data)
+    app, _ = runtime()
+
+    app.handle(packet, NOW)
+
+    assert app.current_tx_audio_attenuation == attenuation
 
 
 def runtime(

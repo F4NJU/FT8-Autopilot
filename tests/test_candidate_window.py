@@ -11,7 +11,6 @@ from wsjtx_autopilot.engine.models import ActionOutcome, CandidateKind, Cooldown
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.scoring import CandidateScorer, ScoringPreferences
 from wsjtx_autopilot.engine.dxcc import StaticDxccResolver
-from wsjtx_autopilot.engine.tx_frequency import TxFrequencyDecision
 from wsjtx_autopilot.runtime import AutopilotRuntime
 from wsjtx_autopilot.wsjtx.models import DecodePacket, PacketHeader
 
@@ -271,15 +270,6 @@ def test_preferred_cq_never_beats_always_priority_direct_call() -> None:
     assert app.state.session.state.name == "IDLE"
 
 
-class SpyPlanner:
-    def __init__(self) -> None:
-        self.remote_dfs: list[int] = []
-
-    def plan(self, remote_df: int, *args: object) -> TxFrequencyDecision:
-        self.remote_dfs.append(remote_df)
-        return TxFrequencyDecision(remote_df, "test fallback", fallback=True)
-
-
 class SentControl(DryRunControl):
     def __init__(self) -> None:
         self.actions: list[IntendedAction] = []
@@ -304,19 +294,15 @@ def packet(message: str, df: int) -> DecodePacket:
     )
 
 
-def test_smart_tx_is_planned_only_for_final_candidate() -> None:
+def test_final_candidate_is_replied_to_without_tx_df_planning() -> None:
     config = replace(AppConfig(), candidate_collection_seconds=DEBOUNCE, allow_dupes=True)
     runtime = AutopilotRuntime(config, control=DryRunControl())
-    planner = SpyPlanner()
-    runtime.tx_frequency_planner = planner  # type: ignore[assignment]
     runtime.handle(packet("CQ TA1SW KN41", 900), NOW)
     runtime.handle(packet("F4NJU RW1CW KO59", 1200), NOW + timedelta(milliseconds=50))
-    assert planner.remote_dfs == []
 
     action = runtime.handle(None, NOW + timedelta(milliseconds=300))
 
     assert action is not None and action.station == "RW1CW"
-    assert planner.remote_dfs == [1200]
 
 
 def test_exact_capture_sends_second_reply_to_yo2lfp_not_es3bh() -> None:

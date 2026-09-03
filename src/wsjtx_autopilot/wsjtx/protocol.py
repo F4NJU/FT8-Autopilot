@@ -15,7 +15,9 @@ from .models import (
     PacketHeader,
     QsoLoggedPacket,
     ReplyPacket,
-    SetTxDfPacket,
+    SetTxPeriodPacket,
+    SetDialFrequencyPacket,
+    TxAudioAttenuationStatePacket,
     StatusPacket,
     UnknownPacket,
     WsjtxPacket,
@@ -46,6 +48,9 @@ class _Reader:
 
     def u8(self) -> int:
         return int(self._unpack(">B"))
+
+    def u16(self) -> int:
+        return int(self._unpack(">H"))
 
     def u32(self) -> int:
         return int(self._unpack(">I"))
@@ -285,8 +290,12 @@ def parse_datagram(data: bytes) -> WsjtxPacket:
         )
     if packet_type == 8:
         return HaltTxPacket(header, reader.boolean())
-    if packet_type == 18:
-        return SetTxDfPacket(header, reader.u32())
+    if packet_type == 19:
+        return SetTxPeriodPacket(header, reader.boolean())
+    if packet_type == 20:
+        return SetDialFrequencyPacket(header, reader.u64())
+    if packet_type == 23:
+        return TxAudioAttenuationStatePacket(header, reader.u16())
     return UnknownPacket(header)
 
 
@@ -341,16 +350,43 @@ def serialize_halt_tx(schema: int, instance_id: str, auto_tx_only: bool = False)
     )
 
 
-def serialize_set_tx_df(schema: int, instance_id: str, tx_df: int) -> bytes:
-    """Serialize the AutoPilot-patched SetTxDF extension (type 18)."""
+def serialize_set_tx_period(schema: int, instance_id: str, tx_first: bool) -> bytes:
+    """Serialize the AP1 SetTxPeriod extension (type 19)."""
     if schema not in SUPPORTED_SCHEMAS:
         raise ProtocolError(f"unsupported WSJT-X schema {schema}")
-    if not 0 <= tx_df <= 0xFFFFFFFF:
-        raise ProtocolError("invalid Tx DF")
     encoded_id = instance_id.encode("utf-8")
     return (
-        struct.pack(">III", MAGIC, schema, 18)
+        struct.pack(">III", MAGIC, schema, 19)
         + struct.pack(">I", len(encoded_id))
         + encoded_id
-        + struct.pack(">I", tx_df)
+        + struct.pack(">B", int(tx_first))
     )
+
+
+def serialize_set_dial_frequency(schema: int, instance_id: str, frequency_hz: int) -> bytes:
+    """Serialize the AP1 SetDialFrequency extension (type 20)."""
+    if schema not in SUPPORTED_SCHEMAS:
+        raise ProtocolError(f"unsupported WSJT-X schema {schema}")
+    if not 0 <= frequency_hz <= 0xFFFFFFFFFFFFFFFF:
+        raise ProtocolError("invalid dial frequency")
+    encoded_id = instance_id.encode("utf-8")
+    return (
+        struct.pack(">III", MAGIC, schema, 20)
+        + struct.pack(">I", len(encoded_id))
+        + encoded_id
+        + struct.pack(">Q", frequency_hz)
+    )
+
+
+def serialize_set_tx_audio_attenuation(schema: int, instance_id: str, attenuation: int) -> bytes:
+    if schema not in SUPPORTED_SCHEMAS or not 0 <= attenuation <= 450:
+        raise ProtocolError("invalid TX audio attenuation")
+    encoded_id = instance_id.encode("utf-8")
+    return struct.pack(">III", MAGIC, schema, 21) + struct.pack(">I", len(encoded_id)) + encoded_id + struct.pack(">H", attenuation)
+
+
+def serialize_query_tx_audio_attenuation(schema: int, instance_id: str) -> bytes:
+    if schema not in SUPPORTED_SCHEMAS:
+        raise ProtocolError(f"unsupported WSJT-X schema {schema}")
+    encoded_id = instance_id.encode("utf-8")
+    return struct.pack(">III", MAGIC, schema, 22) + struct.pack(">I", len(encoded_id)) + encoded_id

@@ -22,12 +22,19 @@ class FinalizationState:
     last_terminal_period: tuple[object, ...]
     retry_count: int = 0
     tx_confirmed: bool = False
+    qso_logged: bool = False
 
 
 class FinalizationTracker:
-    def __init__(self, hold_periods: int = 1, max_retries: int = 3) -> None:
+    def __init__(
+        self,
+        hold_periods: int = 1,
+        max_retries: int = 3,
+        final_tx_timeout_periods: int = 2,
+    ) -> None:
         self.hold_periods = max(1, hold_periods)
         self.max_retries = max(0, max_retries)
+        self.final_tx_timeout_periods = max(1, final_tx_timeout_periods)
         self.state: FinalizationState | None = None
 
     @property
@@ -47,17 +54,18 @@ class FinalizationTracker:
             frequency=event.frequency,
             last_terminal_kind=event.parsed.kind,
             source_decode=event.original,
-            deadline=now + timedelta(seconds=period * (self.hold_periods + 1)),
+            deadline=now + timedelta(seconds=period * self.final_tx_timeout_periods),
             period_seconds=period,
             started_at=now,
             last_terminal_period=_period_key(event),
         )
         LOGGER.info(
-            "[FINALIZE] started remote=%s type=%s hold_periods=%d",
+            "[FINALIZE] remote terminal received remote=%s type=%s",
             event.parsed.sender,
             event.parsed.kind.name,
-            self.hold_periods,
         )
+        LOGGER.info("[FINALIZE] expected local terminal=73")
+        LOGGER.info("[FINALIZE] waiting local TX timeout_periods=%d", self.final_tx_timeout_periods)
         return True
 
     def confirm_final_tx(self, now: datetime) -> None:
@@ -65,7 +73,8 @@ class FinalizationTracker:
             return
         self.state.tx_confirmed = True
         self.state.deadline = now + timedelta(seconds=self.state.period_seconds * self.hold_periods)
-        LOGGER.info("[FINALIZE] final 73 transmitted remote=%s", self.state.remote_callsign)
+        LOGGER.info("[FINALIZE] local terminal TX observed message=73 remote=%s", self.state.remote_callsign)
+        LOGGER.info("[FINALIZE] final TX complete remote=%s", self.state.remote_callsign)
 
     def matches_retry(self, event: DecodeEvent) -> bool:
         if self.state is None:
@@ -91,7 +100,9 @@ class FinalizationTracker:
         self.state.last_terminal_kind = event.parsed.kind
         self.state.source_decode = event.original
         self.state.last_terminal_period = _period_key(event)
-        self.state.deadline = now + timedelta(seconds=self.state.period_seconds * (self.hold_periods + 1))
+        self.state.deadline = now + timedelta(
+            seconds=self.state.period_seconds * self.final_tx_timeout_periods
+        )
         LOGGER.info(
             "[FINALIZE] terminal progression remote=%s type=%s",
             self.state.remote_callsign,
@@ -107,7 +118,9 @@ class FinalizationTracker:
         self.state.last_terminal_kind = event.parsed.kind
         self.state.source_decode = event.original
         self.state.last_terminal_period = _period_key(event)
-        self.state.deadline = now + timedelta(seconds=self.state.period_seconds * self.hold_periods)
+        self.state.deadline = now + timedelta(
+            seconds=self.state.period_seconds * self.final_tx_timeout_periods
+        )
         LOGGER.info(
             "[FINALIZE] retry final 73 count=%d/%d remote=%s",
             self.state.retry_count,
@@ -121,6 +134,17 @@ class FinalizationTracker:
             return
         LOGGER.info("[FINALIZE] closed remote=%s reason=%s", self.state.remote_callsign, reason)
         self.state = None
+
+    def note_qso_logged(self, station: str, instance_id: str) -> bool:
+        """Retain radio state until the expected terminal TX is observed."""
+        if self.state is None:
+            return False
+        if self.state.remote_callsign.upper() != station.upper():
+            return False
+        if self.state.instance_id is not None and self.state.instance_id != instance_id:
+            return False
+        self.state.qso_logged = True
+        return not self.state.tx_confirmed
 
     def expire(self, now: datetime) -> bool:
         if self.state is None or now < self.state.deadline:

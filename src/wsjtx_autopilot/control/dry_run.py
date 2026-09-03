@@ -40,6 +40,10 @@ class DryRunControl:
         LOGGER.info("[WOULD_ACTION] RETRY_FINAL_73 station_decode=%s reason=%s", decode.message, reason)
         return False
 
-    def set_tx_df(self, action: IntendedAction, tx_df: int, now: datetime) -> bool:
-        LOGGER.info("[WOULD_ACTION] SET_TX_DF station=%s df=%d", action.station, tx_df)
+    def set_tx_period(self, instance_id: str, tx_first: bool) -> bool:
+        LOGGER.info("[WOULD_ACTION] SET_TX_PERIOD instance=%s first=%s", instance_id, tx_first)
+        return False
+
+    def set_dial_frequency(self, instance_id: str, frequency_hz: int) -> bool:
+        LOGGER.info("[WOULD_ACTION] SET_DIAL_FREQUENCY instance=%s frequency=%d", instance_id, frequency_hz)
         return False
