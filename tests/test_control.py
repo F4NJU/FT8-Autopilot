@@ -3,6 +3,8 @@ from dataclasses import replace
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
