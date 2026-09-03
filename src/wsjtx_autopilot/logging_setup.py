@@ -190,7 +190,6 @@ def build_metadata(log_path: Path | None = None) -> dict[str, Any]:
     embedded = _embedded_build_info()
     version = (
         os.environ.get("FT8_AUTOPILOT_VERSION")
-        or os.environ.get("GITHUB_REF_NAME")
         or embedded.get("app_version")
     )
     executable = Path(sys.executable)
