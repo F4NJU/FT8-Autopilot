@@ -61,6 +61,7 @@ class DecisionEngine:
         self.pending_direct_calls = PendingDirectCallQueue(config.pending_direct_ttl_seconds)
         self._pending_candidate_stations: set[str] = set()
         self._promoting_pending: PendingDirectCall | None = None
+        self._direct_reply_events: dict[str, DecodeEvent] = {}
         self._pending_rejection_reason = "USER_RULE"
         self._candidate_window: CandidateWindow | None = None
         self._worked_lookup = worked_lookup
@@ -86,12 +87,7 @@ class DecisionEngine:
         if direct_to_local:
             direct_df = event.original.delta_frequency if event.original is not None else -1
             LOGGER.info("[DIRECT] received station=%s df=%s", message.sender, direct_df if direct_df >= 0 else "-")
-        freshness_seconds = (
-            self.config.pending_direct_ttl_seconds
-            if promoting_pending
-            else self.config.stale_decode_seconds
-        )
-        if now - event.observed_at > timedelta(seconds=freshness_seconds):
+        if now - event.observed_at > timedelta(seconds=self.config.stale_decode_seconds):
             LOGGER.info("[ENGINE] candidate refused reason=stale text=%s", event.parsed.raw)
             if direct_to_local:
                 self._log_direct_rejected(message.sender, "STALE")
@@ -124,6 +120,10 @@ class DecisionEngine:
                 message.sender,
                 self.state.session.remote_callsign,
             )
+        elif direct_to_local:
+            band = BandResolver().resolve(event.frequency) if event.frequency is not None else None
+            if self.pending_direct_calls.refresh(event, now, band or "unknown"):
+                LOGGER.info("[DIRECT] pending refreshed station=%s reason=fresh Decode", message.sender)
         if direct_to_local:
             kind = CandidateKind.DIRECT_CALLER
             score = self.config.direct_caller_priority + event.snr
@@ -318,16 +318,7 @@ class DecisionEngine:
         viable = [
             candidate
             for candidate in self._candidates.values()
-            if (
-                now - candidate.event.observed_at
-                <= timedelta(
-                    seconds=(
-                        self.config.pending_direct_ttl_seconds
-                        if candidate.station in self._pending_candidate_stations
-                        else self.config.stale_decode_seconds
-                    )
-                )
-            )
+            if now - candidate.event.observed_at <= timedelta(seconds=self.config.stale_decode_seconds)
         ]
         if not viable:
             return None
@@ -348,6 +339,15 @@ class DecisionEngine:
             len(viable) - direct_count,
         )
         direct = [candidate for candidate in viable if candidate.kind is CandidateKind.DIRECT_CALLER]
+        waiting_refresh = tuple(
+            entry for entry in self.pending_direct_calls.entries(now) if entry.waiting_for_refresh
+        )
+        if waiting_refresh and not direct:
+            LOGGER.info(
+                "[DIRECT] WAITING_DIRECT_REFRESH stations=%s",
+                ",".join(entry.station for entry in waiting_refresh),
+            )
+            return None
         forced_direct = [candidate for candidate in direct if candidate.force_priority]
         if forced_direct:
             pool = forced_direct
@@ -370,8 +370,12 @@ class DecisionEngine:
         self._candidates.clear()
         self._pending_candidate_stations.clear()
         self._candidate_window = None
-        if selected_was_pending:
+        selected_pending = (
             self.pending_direct_calls.remove(selected.station)
+            if selected.kind is CandidateKind.DIRECT_CALLER
+            else None
+        )
+        if selected_pending is not None:
             self._emit(EngineEventKind.PENDING_DIRECT_REMOVED, selected.station, "selected", selected)
         self._pending_actions[selected.station] = selected.event
         LOGGER.info(
@@ -410,6 +414,7 @@ class DecisionEngine:
                 "initiation cooldown",
             )
             if action.kind is ActionKind.DIRECT_REPLY:
+                self._direct_reply_events[action.station] = event
                 self.state.start_from_observed_exchange(
                     event,
                 )
@@ -428,12 +433,16 @@ class DecisionEngine:
                 LOGGER.info("[ENGINE] QSO active remote=%s", action.station)
             return
         if outcome is ActionOutcome.REJECTED_LOCAL:
+            if action.kind is ActionKind.DIRECT_REPLY:
+                self._retain_direct_reply_for_refresh(action.station, event, now, "local Reply rejection")
             LOGGER.info(
                 "[ENGINE] action rejected locally station=%s state=%s cooldown=none",
                 action.station,
                 self.state.session.state.name,
             )
             return
+        if action.kind is ActionKind.DIRECT_REPLY and outcome is ActionOutcome.FAILED:
+            self._retain_direct_reply_for_refresh(action.station, event, now, "Reply transport failure")
         cooldown_until = now + timedelta(seconds=self.config.dry_run_cooldown_seconds)
         self._set_station_cooldown(
             action.station,
@@ -460,6 +469,11 @@ class DecisionEngine:
         self._pending_actions = {
             station: event
             for station, event in self._pending_actions.items()
+            if event.original is None or event.original.instance_id != instance_id
+        }
+        self._direct_reply_events = {
+            station: event
+            for station, event in self._direct_reply_events.items()
             if event.original is None or event.original.instance_id != instance_id
         }
         for entry in self.pending_direct_calls.invalidate_instance(instance_id):
@@ -514,6 +528,7 @@ class DecisionEngine:
         LOGGER.info("[QSO id=%s] complete remote=%s reason=%s", self.state.session.qso_id, remote, reason)
         self._candidates.clear()
         self._pending_actions.clear()
+        self._direct_reply_events.pop(station.upper(), None)
         self.state.reset()
         return True
 
@@ -524,6 +539,7 @@ class DecisionEngine:
         LOGGER.info("[QSO id=%s] complete remote=%s reason=%s", self.state.session.qso_id, remote, reason)
         self._candidates.clear()
         self._pending_actions.clear()
+        self._direct_reply_events.clear()
         self.state.reset()
         return True
 
@@ -558,6 +574,7 @@ class DecisionEngine:
         if not preserve_candidates:
             self._candidates.clear()
         self._pending_actions.clear()
+        self._direct_reply_events.pop((remote or "").upper(), None)
         self.state.abort(reason)
         if preserve_candidates:
             LOGGER.info("[ENGINE] immediate candidate rescan candidates=%d", len(self._candidates))
@@ -645,13 +662,22 @@ class DecisionEngine:
         self._candidates = {
             call: candidate
             for call, candidate in self._candidates.items()
-            if call in self._pending_candidate_stations or candidate.event.observed_at >= cutoff
+            if candidate.event.observed_at >= cutoff
         }
         for entry in self.pending_direct_calls.prune(now):
             self._emit(EngineEventKind.PENDING_DIRECT_REMOVED, entry.station, "TTL_EXPIRED")
 
     def _promote_pending_direct_calls(self, now: datetime) -> None:
         for entry in self.pending_direct_calls.entries(now):
+            age = now - entry.event.observed_at
+            if entry.waiting_for_refresh or age > timedelta(seconds=self.config.stale_decode_seconds):
+                self.pending_direct_calls.require_refresh(entry.station)
+                LOGGER.info(
+                    "[DIRECT] WAITING_DIRECT_REFRESH station=%s age=%.1f",
+                    entry.station,
+                    age.total_seconds(),
+                )
+                continue
             self._promoting_pending = entry
             self._pending_rejection_reason = "USER_RULE"
             try:
@@ -702,6 +728,27 @@ class DecisionEngine:
             self._candidate_window = CandidateWindow(period_key, now)
             return
         self._candidate_window.last_decode_at = now
+
+    def confirm_direct_reply(self, station: str) -> None:
+        self._direct_reply_events.pop(station.upper(), None)
+
+    def retain_unconfirmed_direct_reply(self, station: str | None, now: datetime) -> None:
+        if station is None:
+            return
+        event = self._direct_reply_events.pop(station.upper(), None)
+        if event is not None:
+            self._retain_direct_reply_for_refresh(station, event, now, "Reply confirmation timeout")
+
+    def _retain_direct_reply_for_refresh(
+        self,
+        station: str,
+        event: DecodeEvent,
+        now: datetime,
+        reason: str,
+    ) -> None:
+        self.queue_pending_direct(event, now, reason)
+        self.pending_direct_calls.require_refresh(station)
+        LOGGER.info("[DIRECT] WAITING_DIRECT_REFRESH station=%s reason=%s", station, reason)
 
     def _update_provisional(self, candidate: Candidate) -> None:
         window = self._candidate_window

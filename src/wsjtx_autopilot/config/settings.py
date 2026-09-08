@@ -67,7 +67,11 @@ class UserSettings:
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
     minimum_band_dwell_minutes: float = 5.0
     dial_change_confirmation_timeout_seconds: float = 5.0
-    pending_direct_ttl_seconds: float = 120.0
+    forced_band_hopping_enabled: bool = False
+    forced_band_hop_bands: list[str] = field(default_factory=list)
+    forced_band_hop_interval_minutes: float = 10.0
+    forced_band_hop_settle_seconds: float = 30.0
+    pending_direct_ttl_seconds: float = 30.0
     ftx1_cat2_enabled: bool = False
     ftx1_cat2_confirmed_ftx1: bool = False
     ftx1_cat2_port: str = ""
@@ -111,6 +115,10 @@ class UserSettings:
         }
         self.minimum_band_dwell_minutes = max(0.0, float(self.minimum_band_dwell_minutes))
         self.dial_change_confirmation_timeout_seconds = max(1.0, float(self.dial_change_confirmation_timeout_seconds))
+        self.forced_band_hopping_enabled = self.forced_band_hopping_enabled is True
+        self.forced_band_hop_bands = [value.strip().lower() for value in self.forced_band_hop_bands if value.strip()]
+        self.forced_band_hop_interval_minutes = max(0.0, float(self.forced_band_hop_interval_minutes))
+        self.forced_band_hop_settle_seconds = max(0.0, float(self.forced_band_hop_settle_seconds))
         self.pending_direct_ttl_seconds = max(1.0, float(self.pending_direct_ttl_seconds))
         self.ftx1_cat2_enabled = self.ftx1_cat2_enabled is True
         self.ftx1_cat2_confirmed_ftx1 = self.ftx1_cat2_confirmed_ftx1 is True
@@ -160,6 +168,8 @@ class SettingsStore:
                 values[key] = set(raw_values) if isinstance(raw_values, list) else set()
         if "allowed_auto_hop_bands" in values and not isinstance(values["allowed_auto_hop_bands"], list):
             values["allowed_auto_hop_bands"] = []
+        if "forced_band_hop_bands" in values and not isinstance(values["forced_band_hop_bands"], list):
+            values["forced_band_hop_bands"] = []
         if "auto_hop_band_frequencies" in values and not isinstance(values["auto_hop_band_frequencies"], dict):
             values["auto_hop_band_frequencies"] = {}
         if "ftx1_band_profiles" in values and not isinstance(values["ftx1_band_profiles"], dict):

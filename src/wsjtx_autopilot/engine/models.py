@@ -91,6 +91,8 @@ class StationMetadata:
     primary_prefix: str = "unknown"
     country_name: str = "unknown"
     continent: str = "unknown"
+    reference_latitude: float | None = None
+    reference_longitude: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

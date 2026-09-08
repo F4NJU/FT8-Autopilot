@@ -23,6 +23,11 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
         final_tx_timeout_periods=3,
         max_final_retries=4,
         pending_direct_ttl_seconds=90,
+        forced_band_hopping_enabled=True,
+        forced_band_hop_bands=["20m", "30m", "40m"],
+        forced_band_hop_interval_minutes=10,
+        forced_band_hop_settle_seconds=30,
+        allowed_auto_hop_bands=["20m", "30m", "40m"],
         ftx1_cat2_enabled=True,
         ftx1_cat2_confirmed_ftx1=True,
         ftx1_cat2_port="COM5",
@@ -52,6 +57,11 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     assert loaded.final_tx_timeout_periods == 3
     assert loaded.max_final_retries == 4
     assert loaded.pending_direct_ttl_seconds == 90
+    assert loaded.forced_band_hopping_enabled
+    assert loaded.forced_band_hop_bands == ["20m", "30m", "40m"]
+    assert loaded.forced_band_hop_interval_minutes == 10
+    assert loaded.forced_band_hop_settle_seconds == 30
+    assert loaded.allowed_auto_hop_bands == ["20m", "30m", "40m"]
     assert loaded.ftx1_cat2_enabled
     assert loaded.ftx1_cat2_confirmed_ftx1
     assert loaded.ftx1_cat2_port == "COM5"

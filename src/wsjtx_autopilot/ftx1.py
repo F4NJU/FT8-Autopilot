@@ -217,6 +217,8 @@ class FTX1BandDriveController:
             return False
         self.current_usb_mod_gain = gain
         self.save_profile(band, gain, attenuation)
+        LOGGER.info("[BAND-DRIVE] Saved current band profile: %s", band.lower())
+        LOGGER.info("[BAND-DRIVE] USB MOD GAIN=%d, TX attenuation=%d", gain, attenuation)
         return True
 
     def save_profile(self, band: str, gain: int, attenuation: int) -> None:
@@ -225,7 +227,7 @@ class FTX1BandDriveController:
         self._notify()
         LOGGER.info("[FTX1] Saved manual band profile %s USB_GAIN=%d ATT=%d", profile.band, gain, attenuation)
 
-    def apply_profile(self, band: str, current_attenuation: int | None) -> bool:
+    def apply_profile(self, band: str, current_attenuation: int | None, *, force_attenuation: bool = False) -> bool:
         profile = self.profiles.get(band.lower())
         if profile is None:
             LOGGER.info("[FTX1] No saved drive profile for %s; keeping current settings", band)
@@ -237,7 +239,7 @@ class FTX1BandDriveController:
             LOGGER.error("[FTX1] Manual band profile apply failed: USB MOD GAIN")
             return False
         self.current_usb_mod_gain = profile.usb_mod_gain
-        if current_attenuation != profile.tx_audio_attenuation:
+        if force_attenuation or current_attenuation != profile.tx_audio_attenuation:
             if self._set_tx_audio_attenuation is None or not self._set_tx_audio_attenuation(profile.tx_audio_attenuation):
                 LOGGER.error("[FTX1] Manual band profile apply failed: WSJT-X attenuation")
                 return False

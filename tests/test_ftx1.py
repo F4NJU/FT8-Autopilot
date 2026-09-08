@@ -4,7 +4,7 @@ from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.ftx1 import FTX1BandDriveController, FTX1CatController
 from wsjtx_autopilot.runtime import AutopilotRuntime, PendingDialFrequency
-from wsjtx_autopilot.wsjtx.models import HeartbeatPacket, PacketHeader, StatusPacket, TxAudioAttenuationStatePacket
+from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, StatusPacket, TxAudioAttenuationStatePacket
 from wsjtx_autopilot.wsjtx.protocol import parse_datagram
 
 
@@ -204,3 +204,162 @@ def test_non_ftx1_runtime_is_unchanged() -> None:
     runtime = AutopilotRuntime(AppConfig())
     assert runtime.ftx1_band_drive is None
     assert not runtime.save_ftx1_current_band_profile()
+
+
+def test_save_current_band_updates_confirmed_band_profile_only() -> None:
+    cat = FakeCat(30)
+    controller = FTX1BandDriveController(cat)
+    runtime = AutopilotRuntime(AppConfig(), ftx1_band_drive=controller)
+    runtime.current_tx_audio_attenuation = 24
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+
+    assert runtime.save_ftx1_current_band_profile()
+
+    assert controller.profiles["20m"].usb_mod_gain == 30
+    assert controller.profiles["20m"].tx_audio_attenuation == 24
+    assert "40m" not in controller.profiles
+
+
+def test_save_current_band_refuses_pending_band_or_attenuation_changes() -> None:
+    controller = FTX1BandDriveController(FakeCat(30))
+    runtime = AutopilotRuntime(AppConfig(), ftx1_band_drive=controller)
+    runtime.current_tx_audio_attenuation = 24
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    runtime._pending_dial_frequency = PendingDialFrequency("WSJT-X", 7_074_000, "40m", NOW + timedelta(seconds=5), "20m")
+
+    assert not runtime.save_ftx1_current_band_profile()
+    assert controller.profiles == {}
+
+    runtime._pending_dial_frequency = None
+    runtime.pending_tx_audio_attenuation = 25
+    assert not runtime.save_ftx1_current_band_profile()
+    assert controller.profiles == {}
+
+
+def test_forced_hop_restores_destination_profile_and_waits_for_attenuation_confirmation() -> None:
+    cat = FakeCat(35)
+    transport = FakeTransport()
+    controller = FTX1BandDriveController(cat, {
+        "20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118},
+        "40m": {"usb_mod_gain": 32, "tx_audio_attenuation": 145},
+    })
+    runtime = AutopilotRuntime(
+        AppConfig(
+            candidate_collection_seconds=0,
+            ftx1_auto_apply_band_profiles=True,
+            forced_band_hopping_enabled=True,
+            forced_band_hop_bands=("20m", "40m"),
+            forced_band_hop_interval_minutes=10,
+            forced_band_hop_settle_seconds=5,
+        ),
+        control=WsjtxUdpControl(transport, 15, None, armed=True),
+        ftx1_band_drive=controller,
+    )
+    runtime.current_tx_audio_attenuation = 118
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    transport.sent.clear()
+
+    runtime.handle(None, NOW + timedelta(minutes=10), ENDPOINT)
+    assert parse_datagram(transport.sent[-1][0]).header.packet_type == 20
+    runtime.handle(status(7_074_000), NOW + timedelta(minutes=10, seconds=1), ENDPOINT)
+
+    assert cat.gains == [32]
+    assert parse_datagram(transport.sent[-1][0]).header.packet_type == 21
+    assert runtime.pending_tx_audio_attenuation == 145
+    assert runtime._band_resume_at is None
+
+    runtime.handle(TxAudioAttenuationStatePacket(PacketHeader(3, 1, "WSJT-X"), 144), NOW + timedelta(minutes=10, seconds=2), ENDPOINT)
+    assert runtime.pending_tx_audio_attenuation == 145
+    assert runtime._band_resume_at is None
+    cq = DecodePacket(PacketHeader(3, 2, "WSJT-X"), True, NOW.time(), -8, 0.2, 900, "~", "CQ OH2ZZ KP20", False, False)
+    assert runtime.handle(cq, NOW + timedelta(minutes=10, seconds=2), ENDPOINT) is None
+
+    runtime.handle(TxAudioAttenuationStatePacket(PacketHeader(3, 1, "WSJT-X"), 145), NOW + timedelta(minutes=10, seconds=3), ENDPOINT)
+    assert runtime.pending_tx_audio_attenuation is None
+    ready_at = NOW + timedelta(minutes=10, seconds=3)
+    assert runtime._band_resume_at == ready_at + timedelta(seconds=5)
+    assert runtime.handle(None, ready_at + timedelta(seconds=1), ENDPOINT) is None
+    assert runtime.handle(None, ready_at + timedelta(seconds=5), ENDPOINT) is not None
+
+
+def test_forced_hop_blocks_calls_when_destination_profile_is_missing() -> None:
+    cat = FakeCat(35)
+    transport = FakeTransport()
+    controller = FTX1BandDriveController(cat, {"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}})
+    runtime = AutopilotRuntime(
+        AppConfig(
+            candidate_collection_seconds=0,
+            ftx1_auto_apply_band_profiles=True,
+            forced_band_hopping_enabled=True,
+            forced_band_hop_bands=("20m", "40m"),
+            forced_band_hop_interval_minutes=10,
+        ),
+        control=WsjtxUdpControl(transport, 15, None, armed=True),
+        ftx1_band_drive=controller,
+    )
+    runtime.current_tx_audio_attenuation = 118
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    transport.sent.clear()
+    runtime.handle(None, NOW + timedelta(minutes=10), ENDPOINT)
+    runtime.handle(status(7_074_000), NOW + timedelta(minutes=10, seconds=1), ENDPOINT)
+    cq = DecodePacket(PacketHeader(3, 2, "WSJT-X"), True, NOW.time(), -8, 0.2, 900, "~", "CQ OH2ZZ KP20", False, False)
+
+    assert runtime._blocked_band_drive_change is not None
+    assert runtime.handle(cq, NOW + timedelta(minutes=10, seconds=2), ENDPOINT) is None
+    assert not any(parse_datagram(data).header.packet_type == 0 for data, _ in transport.sent)
+
+
+def test_manual_band_change_restores_saved_profile_once() -> None:
+    cat = FakeCat(35)
+    transport = FakeTransport()
+    controller = FTX1BandDriveController(cat, {
+        "20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118},
+        "40m": {"usb_mod_gain": 32, "tx_audio_attenuation": 145},
+    })
+    runtime = AutopilotRuntime(
+        AppConfig(ftx1_auto_apply_band_profiles=True),
+        control=WsjtxUdpControl(transport, 15, None, armed=True),
+        ftx1_band_drive=controller,
+    )
+    runtime.current_tx_audio_attenuation = 118
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    transport.sent.clear()
+
+    runtime.handle(status(7_074_000), NOW + timedelta(seconds=1), ENDPOINT)
+    runtime.handle(status(7_074_000), NOW + timedelta(seconds=2), ENDPOINT)
+
+    assert cat.gains == [32]
+    assert sum(parse_datagram(data).header.packet_type == 21 for data, _ in transport.sent) == 1
+
+
+def test_forced_hop_attenuation_timeout_blocks_automatic_tx() -> None:
+    cat = FakeCat(35)
+    transport = FakeTransport()
+    controller = FTX1BandDriveController(cat, {
+        "20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118},
+        "40m": {"usb_mod_gain": 32, "tx_audio_attenuation": 145},
+    })
+    runtime = AutopilotRuntime(
+        AppConfig(
+            ftx1_auto_apply_band_profiles=True,
+            forced_band_hopping_enabled=True,
+            forced_band_hop_bands=("20m", "40m"),
+            forced_band_hop_interval_minutes=10,
+        ),
+        control=WsjtxUdpControl(transport, 15, None, armed=True),
+        ftx1_band_drive=controller,
+    )
+    runtime.current_tx_audio_attenuation = 118
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    runtime.handle(None, NOW + timedelta(minutes=10), ENDPOINT)
+    runtime.handle(status(7_074_000), NOW + timedelta(minutes=10, seconds=1), ENDPOINT)
+    runtime._tx_audio_attenuation_deadline = NOW + timedelta(minutes=10, seconds=2)
+
+    runtime.handle(None, NOW + timedelta(minutes=10, seconds=3), ENDPOINT)
+
+    assert runtime._blocked_band_drive_change is not None
+    assert runtime._band_resume_at is None

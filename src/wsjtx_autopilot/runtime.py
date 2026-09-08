@@ -10,9 +10,10 @@ from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.adaptive import AdaptiveState, AttemptOutcome, AttemptRecord, DEFAULT_BAND_PROFILES, StagnationTracker
 from wsjtx_autopilot.engine.cq import CqEligibility
 from wsjtx_autopilot.engine.decision import DecisionEngine
-from wsjtx_autopilot.engine.dxcc import CtyDatResolver, UnknownDxccResolver
+from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
 from wsjtx_autopilot.engine.finalization import FinalizationTracker
-from wsjtx_autopilot.engine.models import ActionOutcome, Candidate, CooldownKind, DecodeEvent, IntendedAction, MessageKind, OriginalDecode, StationProfile
+from wsjtx_autopilot.engine.location import StationLocatorCache, distance_and_bearing, grid_to_location
+from wsjtx_autopilot.engine.models import ActionOutcome, Candidate, CooldownKind, DecodeEvent, IntendedAction, MessageKind, OriginalDecode, StationMetadata, StationProfile
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.ftx1 import FTX1BandDriveController, FTX1CatController
@@ -46,6 +47,7 @@ class WsjtxStatus:
     tx_message: str = ""
     period: int | None = None
     instance_id: str = ""
+    local_grid: str = ""
 
 
 @dataclass(slots=True)
@@ -55,6 +57,7 @@ class PendingDialFrequency:
     band: str
     deadline: datetime
     previous_band: str | None
+    source: str = "adaptive"
 
 
 class AutopilotRuntime:
@@ -72,7 +75,7 @@ class AutopilotRuntime:
         self.config = config
         self.worked_service = worked_service
         if engine is None:
-            resolver = CtyDatResolver(config.cty_dat_path) if config.cty_dat_path else UnknownDxccResolver()
+            resolver = FallbackDxccResolver(CtyDatResolver(config.cty_dat_path)) if config.cty_dat_path else PrefixDxccResolver()
             local_profile = StationProfile(config.local_callsign, resolver.resolve(config.local_callsign))
             engine = DecisionEngine(
                 config,
@@ -82,6 +85,8 @@ class AutopilotRuntime:
         self.engine = engine
         self.control = control or DryRunControl()
         self.status = WsjtxStatus()
+        self.station_locator_cache = StationLocatorCache()
+        self._last_reported_band: str | None = None
         self._last_runtime_at: datetime | None = None
         self._last_heartbeat_at: datetime | None = None
         self.current_tx_audio_attenuation: int | None = None
@@ -102,6 +107,7 @@ class AutopilotRuntime:
         self._pending_dial_frequency: PendingDialFrequency | None = None
         self._pending_ftx1_band_change: PendingDialFrequency | None = None
         self._pending_ftx1_profile_apply: PendingDialFrequency | None = None
+        self._blocked_band_drive_change: PendingDialFrequency | None = None
         self.ftx1_band_drive = ftx1_band_drive
         if self.ftx1_band_drive is None and config.ftx1_cat2_enabled and config.ftx1_cat2_confirmed_ftx1:
             self.ftx1_band_drive = FTX1BandDriveController(
@@ -131,6 +137,11 @@ class AutopilotRuntime:
         )
         self.last_band_change_at: datetime | None = None
         self._band_resume_at: datetime | None = None
+        self._band_resume_band: str | None = None
+        self._forced_band_hop_dwell_started_at: datetime | None = None
+        self._forced_band_hop_dwell_band: str | None = None
+        self._forced_band_hop_pending_band: str | None = None
+        self._forced_band_hop_config_warning_logged = False
         if isinstance(self.control, WsjtxUdpControl):
             self.control.set_disarm_context(self._disarm_context)
         session = current_logging_session()
@@ -157,6 +168,23 @@ class AutopilotRuntime:
             return False
         LOGGER.info("[FTX1] CAT-2 ready")
         return True
+
+    def working_location_detail(self, callsign: str, metadata: StationMetadata) -> str:
+        """Return observed-grid distance first, then an approximate DXCC reference."""
+        local = grid_to_location(self.status.local_grid)
+        if local is None:
+            return ""
+        observed = self.station_locator_cache.get(callsign)
+        if observed is not None:
+            result = distance_and_bearing(local, observed)
+            if result is not None:
+                distance, bearing = result
+                return f"{distance} km {bearing}°"
+        result = distance_and_bearing(local, metadata)
+        if result is None:
+            return ""
+        distance, bearing = result
+        return f"~{distance} km ~{bearing}°"
 
     def arm_control(self) -> bool:
         """Arm the live UDP control adapter on an explicit GUI request."""
@@ -234,7 +262,9 @@ class AutopilotRuntime:
                 tx_df=packet.tx_df,
                 tx_message=packet.tx_message,
                 period=period,
+                local_grid=packet.de_grid,
             )
+            self.station_locator_cache.note(packet.dx_call, packet.dx_grid)
             band = BandResolver().resolve(packet.dial_frequency) or "unknown"
             self.engine.invalidate_pending_context(packet.header.instance_id, band, packet.mode or "unknown")
             session = current_logging_session()
@@ -244,6 +274,8 @@ class AutopilotRuntime:
             self._observe_finalization_status(packet, now)
             self._observe_adaptive_status(packet, now)
             self._confirm_dial_frequency(packet, now)
+            self._observe_manual_band_change(packet, now)
+            self._observe_forced_band_hop_status(now)
             if was_transmitting != packet.transmitting:
                 LOGGER.info("[WSJTX] transmitting=%s -> %s", was_transmitting, packet.transmitting)
             LOGGER.info(
@@ -259,6 +291,7 @@ class AutopilotRuntime:
             if self._status_confirms_reply(packet):
                 if self.engine.state.session.state is QsoState.DIRECT_REPLY_SENT:
                     self.engine.state.confirm_direct_reply(now)
+                    self.engine.confirm_direct_reply(packet.dx_call)
                 else:
                     self.engine.state.confirm_reply(now)
                 LOGGER.info("[ENGINE] QSO active remote=%s", self.engine.state.session.remote_callsign)
@@ -295,6 +328,7 @@ class AutopilotRuntime:
             now,
             self.config.direct_reply_confirmation_timeout_seconds,
         ):
+            self.engine.retain_unconfirmed_direct_reply(remote_before_expiry, now)
             self.note_adaptive_failure(remote_before_expiry, AttemptOutcome.NO_RESPONSE, now)
         remote_before_expiry = self.engine.state.session.remote_callsign
         if self.engine.state.expire_reply_confirmation(
@@ -322,14 +356,22 @@ class AutopilotRuntime:
         self._expire_tx_audio_attenuation_request(now)
         self._query_tx_audio_attenuation_if_needed(self._attenuation_query_instance_id, now)
         self._complete_pending_ftx1_band_change(now)
-        if self._pending_dial_frequency is not None or self._pending_ftx1_band_change is not None or self._pending_ftx1_profile_apply is not None:
+        self._run_forced_band_hop(now)
+        if self._pending_dial_frequency is None and self._pending_ftx1_band_change is None and self._pending_ftx1_profile_apply is None:
+            self._run_adaptive(now)
+        if self._pending_dial_frequency is not None or self._pending_ftx1_band_change is not None or self._pending_ftx1_profile_apply is not None or self._blocked_band_drive_change is not None:
             action = None
         elif self.finalization.active and self.engine.state.session.state is QsoState.IDLE:
             LOGGER.debug("[FINALIZE] candidate selection held during RX grace")
             action = None
+        elif self._band_resume_at is not None and now < self._band_resume_at:
+            action = None
         else:
-            self._run_adaptive(now)
-            action = None if self._band_resume_at is not None and now < self._band_resume_at else self.engine.decide(now)
+            if self._band_resume_band is not None:
+                LOGGER.info("[BAND-HOP] Resuming Autopilot on %s", self._band_resume_band)
+                self._band_resume_band = None
+            self._band_resume_at = None
+            action = self.engine.decide(now)
         if action is not None:
             LOGGER.info(
                 "[RUNTIME] requesting control action station=%s kind=%s implementation=%s armed=%s",
@@ -552,6 +594,7 @@ class AutopilotRuntime:
         if self.finalization.active and direct_to_local:
             self.engine.queue_pending_direct(event, now, "finalization hold")
             return None
+        self.station_locator_cache.note(parsed.sender, parsed.grid)
         return self.engine.observe(event, now)
 
     def _log_rejected_direct_packet(self, packet: DecodePacket, blocker: str) -> None:
@@ -612,11 +655,46 @@ class AutopilotRuntime:
         if packet.dial_frequency != pending.frequency_hz:
             return
         self._pending_dial_frequency = None
-        if self.ftx1_band_drive is not None and self.config.ftx1_auto_apply_band_profiles:
+        if pending.source == "forced":
+            LOGGER.info("[BAND-HOP] Frequency confirmed: %s / %.3f MHz", pending.band, pending.frequency_hz / 1_000_000)
+            if self.ftx1_band_drive is None or not self.config.ftx1_auto_apply_band_profiles:
+                self._block_for_unready_band_drive(pending, "automatic per-band drive profiles are unavailable")
+                return
+        if self._requires_band_drive_restore(pending):
             self._pending_ftx1_band_change = pending
             self._complete_pending_ftx1_band_change(now)
             return
         self._finish_band_change(pending, packet.tr_period, now)
+
+    def _observe_manual_band_change(self, packet: StatusPacket, now: datetime) -> None:
+        band = BandResolver().resolve(packet.dial_frequency)
+        previous_band = self._last_reported_band
+        self._last_reported_band = band
+        if (
+            band is None
+            or previous_band is None
+            or band == previous_band
+            or self._pending_dial_frequency is not None
+            or self._pending_ftx1_band_change is not None
+            or self._pending_ftx1_profile_apply is not None
+            or self.status.transmitting
+            or self.ftx1_band_drive is None
+            or not self.config.ftx1_auto_apply_band_profiles
+        ):
+            return
+        if band.lower() not in self.ftx1_band_drive.profiles:
+            LOGGER.info("[DRIVE] No saved drive profile for manually selected %s", band)
+            return
+        LOGGER.info("[DRIVE] Manual band change detected: restoring saved drive profile for %s", band)
+        self._pending_ftx1_band_change = PendingDialFrequency(
+            packet.header.instance_id,
+            packet.dial_frequency,
+            band,
+            now + timedelta(seconds=self.config.dial_change_confirmation_timeout_seconds),
+            previous_band,
+            "manual",
+        )
+        self._complete_pending_ftx1_band_change(now)
 
     def _complete_pending_ftx1_band_change(self, now: datetime) -> None:
         pending = self._pending_ftx1_band_change
@@ -625,6 +703,9 @@ class AutopilotRuntime:
         assert self.ftx1_band_drive is not None
         if pending.band.lower() not in self.ftx1_band_drive.profiles:
             self._pending_ftx1_band_change = None
+            if pending.source == "forced":
+                self._block_for_unready_band_drive(pending, "no saved destination drive profile")
+                return
             self.ftx1_band_drive.apply_profile(pending.band, self.current_tx_audio_attenuation)
             self._finish_band_change(pending, self.status.period, now)
             return
@@ -632,9 +713,26 @@ class AutopilotRuntime:
             self._query_tx_audio_attenuation_if_needed(pending.instance_id, now)
             return
         self._pending_ftx1_band_change = None
-        self.ftx1_band_drive.apply_profile(pending.band, self.current_tx_audio_attenuation)
+        if pending.source == "forced":
+            LOGGER.info("[DRIVE] Restoring saved drive profile for %s", pending.band)
+            profile = self.ftx1_band_drive.profiles[pending.band.lower()]
+            LOGGER.info("[DRIVE] Applying USB MOD GAIN: %d", profile.usb_mod_gain)
+            LOGGER.info("[DRIVE] Requesting TX attenuation: %d", profile.tx_audio_attenuation)
+        applied = self.ftx1_band_drive.apply_profile(
+            pending.band,
+            self.current_tx_audio_attenuation,
+            force_attenuation=pending.source == "forced",
+        )
+        if not applied:
+            if pending.source == "forced":
+                self._block_for_unready_band_drive(pending, "destination drive profile could not be applied")
+                return
+            self._finish_band_change(pending, self.status.period, now)
+            return
         if self.pending_tx_audio_attenuation is not None:
             self._pending_ftx1_profile_apply = pending
+            if pending.source == "forced":
+                LOGGER.info("[DRIVE] Waiting for attenuation confirmation")
             return
         self._finish_band_change(pending, self.status.period, now)
 
@@ -643,19 +741,44 @@ class AutopilotRuntime:
         if pending is None or self.pending_tx_audio_attenuation is not None:
             return
         self._pending_ftx1_profile_apply = None
+        if pending.source == "forced":
+            LOGGER.info("[BAND-HOP] Drive state ready")
         self._finish_band_change(pending, self.status.period, now)
 
     def _finish_band_change(self, pending: PendingDialFrequency, period_seconds: int | None, now: datetime) -> None:
         self.adaptive_state = AdaptiveState.BAND_TRIAL
         self.last_band_change_at = now
-        self._band_resume_at = now + timedelta(seconds=period_seconds or 15)
+        if pending.source == "forced":
+            self._start_forced_band_hop_dwell(pending.band, now)
+            settle_seconds = self.config.forced_band_hop_settle_seconds
+            self._band_resume_at = now + timedelta(seconds=settle_seconds)
+            self._band_resume_band = pending.band
+            LOGGER.info("[BAND-HOP] Confirmed on %s", pending.band)
+            LOGGER.info("[BAND-HOP] Settling for %g s", settle_seconds)
+        else:
+            self._band_resume_at = now + timedelta(seconds=period_seconds or 15)
+            self._band_resume_band = None
         LOGGER.info("[BAND] confirmed=%s", pending.band)
+
+    def _requires_band_drive_restore(self, pending: PendingDialFrequency) -> bool:
+        return self.ftx1_band_drive is not None and self.config.ftx1_auto_apply_band_profiles
+
+    def _block_for_unready_band_drive(self, pending: PendingDialFrequency, reason: str) -> None:
+        self._blocked_band_drive_change = pending
+        LOGGER.warning("[BAND-HOP] Drive state for %s is not ready: %s; automatic TX remains blocked", pending.band, reason)
 
     def _expire_dial_frequency_request(self, now: datetime) -> None:
         pending = self._pending_dial_frequency
         if pending is None or now <= pending.deadline:
             return
-        LOGGER.error("[BAND] requested=%d confirmation timeout", pending.frequency_hz)
+        if pending.source == "forced":
+            LOGGER.warning("[BAND-HOP] Request to %s / %.3f MHz timed out waiting for Status", pending.band, pending.frequency_hz / 1_000_000)
+            self._forced_band_hop_pending_band = None
+            current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+            if current_band is not None:
+                self._start_forced_band_hop_dwell(current_band, now)
+        else:
+            LOGGER.error("[BAND] requested=%d confirmation timeout", pending.frequency_hz)
         self._pending_dial_frequency = None
         self.adaptive_state = AdaptiveState.NORMAL
 
@@ -747,6 +870,9 @@ class AutopilotRuntime:
         pending_save = self._pending_ftx1_profile_save_band
         if pending_save is not None and self.ftx1_band_drive is not None:
             self._pending_ftx1_profile_save_band = None
+            if self._pending_dial_frequency is not None or self._pending_ftx1_band_change is not None or self._pending_ftx1_profile_apply is not None:
+                LOGGER.error("[BAND-DRIVE] Save current band profile refused: band changed while attenuation was queried")
+                return
             self.ftx1_band_drive.save_current_profile(pending_save, attenuation)
 
     def _query_tx_audio_attenuation_if_needed(self, instance_id: str, now: datetime) -> None:
@@ -780,9 +906,15 @@ class AutopilotRuntime:
 
     def _expire_tx_audio_attenuation_request(self, now: datetime) -> None:
         if self.pending_tx_audio_attenuation is not None and self._tx_audio_attenuation_deadline is not None and now > self._tx_audio_attenuation_deadline:
-            LOGGER.error("[WSJTX] TX attenuation confirmation timeout requested=%d current=%s", self.pending_tx_audio_attenuation, self.current_tx_audio_attenuation)
+            requested = self.pending_tx_audio_attenuation
+            pending_band_change = self._pending_ftx1_profile_apply
+            LOGGER.error("[WSJTX] TX attenuation confirmation timeout requested=%d current=%s", requested, self.current_tx_audio_attenuation)
             self.pending_tx_audio_attenuation = None
             self._tx_audio_attenuation_deadline = None
+            if pending_band_change is not None and pending_band_change.source == "forced":
+                self._pending_ftx1_profile_apply = None
+                self._block_for_unready_band_drive(pending_band_change, f"TX attenuation {requested} was not confirmed")
+                return
             self._finish_pending_ftx1_profile_apply(now)
 
     def save_ftx1_current_band_profile(self) -> bool:
@@ -791,8 +923,14 @@ class AutopilotRuntime:
         if controller is None or band is None:
             LOGGER.error("[FTX1] Save manual band profile failed: CAT-2 or current band unavailable")
             return False
+        if self._pending_dial_frequency is not None or self._pending_ftx1_band_change is not None or self._pending_ftx1_profile_apply is not None:
+            LOGGER.error("[BAND-DRIVE] Save current band profile refused: band change is pending")
+            return False
         if self.status.transmitting:
             LOGGER.error("[FTX1] Save manual band profile failed: WSJT-X is transmitting")
+            return False
+        if self.pending_tx_audio_attenuation is not None:
+            LOGGER.error("[BAND-DRIVE] Save current band profile refused: TX attenuation is awaiting confirmation")
             return False
         if self.current_tx_audio_attenuation is None:
             if not self.ap1_controls_available or not isinstance(self.control, WsjtxUdpControl):
@@ -836,6 +974,127 @@ class AutopilotRuntime:
             snapshot["ftx1"] = self.ftx1_band_drive.snapshot(current_band, self.current_tx_audio_attenuation)
         return snapshot
 
+    def _forced_band_hop_bands(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                band.strip().lower()
+                for band in self.config.forced_band_hop_bands
+                if isinstance(band, str)
+                and band.strip()
+                and self._band_frequency(band.strip(), "FT8") is not None
+            )
+        )
+
+    def _observe_forced_band_hop_status(self, now: datetime) -> None:
+        if not self.config.forced_band_hopping_enabled or self._pending_dial_frequency is not None:
+            return
+        bands = self._forced_band_hop_bands()
+        if not bands:
+            self._warn_forced_band_hop_configuration()
+            return
+        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+        if current_band in bands and self._forced_band_hop_dwell_band != current_band:
+            self._forced_band_hop_pending_band = None
+            self._start_forced_band_hop_dwell(current_band, now)
+        elif current_band not in bands and self._forced_band_hop_pending_band is None:
+            self._forced_band_hop_pending_band = bands[0]
+            LOGGER.info("[BAND-HOP] Current band is outside the configured sequence; pending %s", bands[0])
+
+    def _run_forced_band_hop(self, now: datetime) -> None:
+        if not self.config.forced_band_hopping_enabled:
+            return
+        bands = self._forced_band_hop_bands()
+        if not bands:
+            self._warn_forced_band_hop_configuration()
+            return
+        if self._forced_band_hop_pending_band is None:
+            started_at = self._forced_band_hop_dwell_started_at
+            current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+            if started_at is None or current_band not in bands:
+                return
+            if now - started_at < timedelta(minutes=self.config.forced_band_hop_interval_minutes):
+                return
+            target = self._next_forced_band_hop_band()
+            if target is None:
+                LOGGER.warning("[BAND-HOP] No alternate configured band is available; restarting dwell")
+                self._start_forced_band_hop_dwell(current_band, now)
+                return
+            self._forced_band_hop_pending_band = target
+            LOGGER.info("[BAND-HOP] Dwell expired on %s", current_band)
+            if self.engine.state.session.state is not QsoState.IDLE or self.finalization.active:
+                LOGGER.info("[BAND-HOP] QSO active, deferring hop to %s", target)
+        target = self._forced_band_hop_pending_band
+        if target is None or not self._forced_band_hop_safe():
+            return
+        frequency = self._band_frequency(target, self.status.mode or "FT8")
+        if frequency is None:
+            LOGGER.warning("[BAND-HOP] No frequency is configured for %s in %s; remaining on the current band", target, self.status.mode or "unknown")
+            self._forced_band_hop_pending_band = None
+            return
+        if self._request_band_change(target, frequency, now, "forced"):
+            self._forced_band_hop_pending_band = None
+
+    def _start_forced_band_hop_dwell(self, band: str, now: datetime) -> None:
+        self._forced_band_hop_dwell_band = band
+        self._forced_band_hop_dwell_started_at = now
+        LOGGER.info(
+            "[BAND-HOP] Started dwell on %s for %g min",
+            band,
+            self.config.forced_band_hop_interval_minutes,
+        )
+
+    def _next_forced_band_hop_band(self) -> str | None:
+        bands = self._forced_band_hop_bands()
+        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+        if current_band not in bands or len(bands) < 2:
+            return None
+        start = bands.index(current_band)
+        for offset in range(1, len(bands)):
+            candidate = bands[(start + offset) % len(bands)]
+            if self._band_frequency(candidate, self.status.mode or "FT8") is not None:
+                return candidate
+        return None
+
+    def _forced_band_hop_safe(self) -> bool:
+        return bool(
+            self.ap1_controls_available
+            and getattr(self.control, "armed", False)
+            and self.status.instance_id
+            and not self.status.transmitting
+            and self.engine.state.session.state is QsoState.IDLE
+            and not self.finalization.active
+            and self._pending_dial_frequency is None
+            and self._pending_ftx1_band_change is None
+            and self._pending_ftx1_profile_apply is None
+        )
+
+    def _warn_forced_band_hop_configuration(self) -> None:
+        if not self._forced_band_hop_config_warning_logged:
+            LOGGER.warning("[BAND-HOP] Forced hopping is enabled but no configured bands are available")
+            self._forced_band_hop_config_warning_logged = True
+
+    def _request_band_change(self, target: str, frequency: int, now: datetime, source: str) -> bool:
+        self.engine.clear_candidates()
+        self.engine.invalidate_pending_context(self.status.instance_id, target, self.status.mode or "unknown")
+        if not self.control.set_dial_frequency(self.status.instance_id, frequency):
+            return False
+        self._pending_dial_frequency = PendingDialFrequency(
+            self.status.instance_id,
+            frequency,
+            target,
+            now + timedelta(seconds=self.config.dial_change_confirmation_timeout_seconds),
+            BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None,
+            source,
+        )
+        self.adaptive_state = AdaptiveState.BAND_CHANGING
+        if source == "forced":
+            LOGGER.info("[BAND-HOP] Requesting %s / %.3f MHz", target, frequency / 1_000_000)
+        else:
+            LOGGER.info("[BAND] current=%s", BandResolver().resolve(self.status.dial_frequency) or "unknown")
+            LOGGER.info("[BAND] next=%s", target)
+            LOGGER.info("[BAND] waiting confirmation")
+        return True
+
     def _run_adaptive(self, now: datetime) -> None:
         if self.adaptive_state is AdaptiveState.PARITY_CHANGE_PENDING:
             if not self.config.adaptive_parity_enabled or not self._adaptive_safe(now):
@@ -863,21 +1122,7 @@ class AutopilotRuntime:
             frequency = self._band_frequency(target, self.status.mode or "")
             if frequency is None:
                 return
-            self.engine.clear_candidates()
-            self.engine.invalidate_pending_context(self.status.instance_id, target, self.status.mode or "unknown")
-            if not self.control.set_dial_frequency(self.status.instance_id, frequency):
-                return
-            self._pending_dial_frequency = PendingDialFrequency(
-                self.status.instance_id,
-                frequency,
-                target,
-                now + timedelta(seconds=self.config.dial_change_confirmation_timeout_seconds),
-                BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None,
-            )
-            self.adaptive_state = AdaptiveState.BAND_CHANGING
-            LOGGER.info("[BAND] current=%s", BandResolver().resolve(self.status.dial_frequency) or "unknown")
-            LOGGER.info("[BAND] next=%s", target)
-            LOGGER.info("[BAND] waiting confirmation")
+            self._request_band_change(target, frequency, now, "adaptive")
 
     def _adaptive_safe(self, now: datetime) -> bool:
         current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None

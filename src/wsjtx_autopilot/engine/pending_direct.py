@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from .models import DecodeEvent
@@ -15,13 +15,14 @@ class PendingDirectCall:
     last_seen: datetime
     repeat_count: int
     band: str
+    waiting_for_refresh: bool = False
 
     def age_seconds(self, now: datetime) -> float:
         return max(0.0, (now - self.last_seen).total_seconds())
 
 
 class PendingDirectCallQueue:
-    def __init__(self, ttl_seconds: float = 120.0) -> None:
+    def __init__(self, ttl_seconds: float = 30.0) -> None:
         self.ttl = timedelta(seconds=max(1.0, ttl_seconds))
         self._entries: dict[str, PendingDirectCall] = {}
 
@@ -48,6 +49,20 @@ class PendingDirectCallQueue:
             )
         else:
             LOGGER.info("[DIRECT] pending refreshed station=%s repeats=%d", station, entry.repeat_count)
+        return entry
+
+    def refresh(self, event: DecodeEvent, now: datetime, band: str) -> bool:
+        if event.parsed.sender.upper() not in self._entries:
+            return False
+        self.offer(event, now, band)
+        return True
+
+    def require_refresh(self, station: str) -> PendingDirectCall | None:
+        entry = self._entries.get(station.upper())
+        if entry is None or entry.waiting_for_refresh:
+            return entry
+        entry = replace(entry, waiting_for_refresh=True)
+        self._entries[entry.station] = entry
         return entry
 
     def entries(self, now: datetime) -> tuple[PendingDirectCall, ...]:
@@ -106,6 +121,7 @@ class PendingDirectCallQueue:
                 "callsign": entry.station,
                 "age_seconds": round(entry.age_seconds(now), 1),
                 "repeat_count": entry.repeat_count,
+                "waiting_for_refresh": entry.waiting_for_refresh,
                 "snr": entry.event.snr,
                 "df": entry.event.original.delta_frequency if entry.event.original is not None else None,
                 "band": entry.band,

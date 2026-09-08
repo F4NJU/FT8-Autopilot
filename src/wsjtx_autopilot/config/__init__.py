@@ -47,7 +47,11 @@ class AppConfig:
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
     minimum_band_dwell_minutes: float = 5.0
     dial_change_confirmation_timeout_seconds: float = 5.0
-    pending_direct_ttl_seconds: float = 120.0
+    forced_band_hopping_enabled: bool = False
+    forced_band_hop_bands: tuple[str, ...] = ()
+    forced_band_hop_interval_minutes: float = 10.0
+    forced_band_hop_settle_seconds: float = 30.0
+    pending_direct_ttl_seconds: float = 30.0
     ftx1_cat2_enabled: bool = False
     ftx1_cat2_confirmed_ftx1: bool = False
     ftx1_cat2_port: str = ""

@@ -9,7 +9,7 @@ from wsjtx_autopilot.config import AppConfig, AppPaths, SettingsStore, UserSetti
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.cq import CqEligibility
-from wsjtx_autopilot.engine.dxcc import CtyDatResolver, UnknownDxccResolver
+from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
 from wsjtx_autopilot.engine.models import EngineEvent, StationProfile
 from wsjtx_autopilot.engine.scoring import CandidateScorer, ScoringPreferences
 from wsjtx_autopilot.runtime import AutopilotRuntime
@@ -36,6 +36,7 @@ class BackendWorker(QObject):
     status_changed = Signal(object)
     adaptive_changed = Signal(object)
     qso_changed = Signal(str, str, str, str, int, int, int, int, str)
+    ftx1_band_profiles_changed = Signal(object)
 
     def __init__(self, settings: UserSettings) -> None:
         super().__init__()
@@ -168,9 +169,13 @@ class BackendWorker(QObject):
             )
             remote_detail = (
                 f"{remote_metadata.country_name} / {remote_metadata.primary_prefix} / {remote_metadata.continent}"
-                if remote_metadata is not None
+                if remote_metadata is not None and remote_metadata.country_name != "unknown"
                 else "-"
             )
+            if remote_metadata is not None and remote_detail != "-":
+                location_detail = self._runtime.working_location_detail(session.remote_callsign, remote_metadata)
+                if location_detail:
+                    remote_detail = f"{remote_detail} / {location_detail}"
             self.qso_changed.emit(
                 session.state.name,
                 session.remote_callsign or "-",
@@ -213,8 +218,10 @@ class BackendWorker(QObject):
         resolver = (
             CtyDatResolver(Path(self._settings.cty_dat_path))
             if self._settings.cty_dat_path
-            else UnknownDxccResolver()
+            else PrefixDxccResolver()
         )
+        if self._settings.cty_dat_path:
+            resolver = FallbackDxccResolver(resolver)
         preferences = ScoringPreferences(
             preferred_continents=set(self._settings.preferred_continents),
             preferred_dxcc=set(self._settings.preferred_dxcc),
@@ -263,6 +270,10 @@ class BackendWorker(QObject):
             auto_hop_band_frequencies=self._settings.auto_hop_band_frequencies,
             minimum_band_dwell_minutes=self._settings.minimum_band_dwell_minutes,
             dial_change_confirmation_timeout_seconds=self._settings.dial_change_confirmation_timeout_seconds,
+            forced_band_hopping_enabled=self._settings.forced_band_hopping_enabled,
+            forced_band_hop_bands=tuple(self._settings.forced_band_hop_bands),
+            forced_band_hop_interval_minutes=self._settings.forced_band_hop_interval_minutes,
+            forced_band_hop_settle_seconds=self._settings.forced_band_hop_settle_seconds,
             pending_direct_ttl_seconds=self._settings.pending_direct_ttl_seconds,
             ftx1_cat2_enabled=self._settings.ftx1_cat2_enabled,
             ftx1_cat2_confirmed_ftx1=self._settings.ftx1_cat2_confirmed_ftx1,
@@ -325,6 +336,7 @@ class BackendWorker(QObject):
     def _persist_ftx1_band_profiles(self, profiles: dict[str, dict[str, int]]) -> None:
         self._settings.ftx1_band_profiles = deepcopy(profiles)
         SettingsStore().save(self._settings)
+        self.ftx1_band_profiles_changed.emit(deepcopy(profiles))
 
     def _on_engine_event(self, event: EngineEvent) -> None:
         if event.kind.name == "CANDIDATE_SELECTED":

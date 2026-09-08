@@ -116,10 +116,11 @@ def armed_adapter(
     return adapter
 
 
-def test_preserves_exact_decode_fields_in_reply() -> None:
+def test_preserves_exact_decode_fields_in_reply(caplog: pytest.LogCaptureFixture) -> None:
     transport = FakeTransport()
     decode = original(schema=3)
     adapter = armed_adapter(transport, decode)
+    caplog.set_level("INFO")
 
     assert adapter.execute(action(decode), NOW) is ActionOutcome.SENT
     reply = parse_datagram(transport.sent[0][0])
@@ -134,6 +135,8 @@ def test_preserves_exact_decode_fields_in_reply() -> None:
     assert reply.mode == decode.mode
     assert reply.message == decode.message
     assert reply.low_confidence == decode.low_confidence
+    assert reply.modifiers == 0
+    assert "Reply payload kind=CQ_REPLY station=OH2ZZ message='CQ OH2ZZ KP20'" in caplog.text
 
 
 def test_qrz_can_send_reply_when_armed() -> None:
@@ -757,7 +760,7 @@ def test_qso_logged_during_waiting_final_tx_blocks_cq_and_queues_direct_call() -
     assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
 
 
-def test_local_terminal_tx_releases_pending_direct_before_cq() -> None:
+def test_stale_pending_direct_waits_for_refresh_before_cq() -> None:
     transport = FakeTransport()
     app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
     app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
@@ -777,10 +780,108 @@ def test_local_terminal_tx_releases_pending_direct_before_cq() -> None:
     app.handle(runtime_status("A6IOK", tx_enabled=False), NOW + timedelta(seconds=9), ENDPOINT)
     assert app.engine.state.session.state is QsoState.IDLE
 
-    action = app.handle(None, NOW + timedelta(seconds=21), ENDPOINT)
+    assert app.handle(None, NOW + timedelta(seconds=21), ENDPOINT) is None
+    pending = app.engine.pending_direct_calls.entries(NOW + timedelta(seconds=21))
+    assert len(pending) == 1
+    assert pending[0].waiting_for_refresh
+
+    action = app.handle(
+        runtime_decode("F4NJU S51DD +01", ENDPOINT, df=1450, decode_second=15),
+        NOW + timedelta(seconds=22),
+        ENDPOINT,
+    )
     assert action is not None
     assert action.station == "S51DD"
-    assert action.reason == "PENDING_DIRECT_CALL"
+    assert action.kind is ActionKind.DIRECT_REPLY
+    reply = parse_datagram(transport.sent[-1][0])
+    assert isinstance(reply, ReplyPacket)
+    assert reply.delta_frequency == 1450
+
+
+def test_direct_finalization_refresh_uses_exact_fresh_reply_payload(caplog: pytest.LogCaptureFixture) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    caplog.set_level("INFO")
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ DK8QH JN49", ENDPOINT, df=900), NOW, ENDPOINT)
+    app.handle(runtime_decode("F4NJU DK8QH R-05", ENDPOINT, df=1000), NOW + timedelta(seconds=1), ENDPOINT)
+    app.handle(runtime_decode("F4NJU DK8QH RR73", ENDPOINT, df=1100), NOW + timedelta(seconds=2), ENDPOINT)
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
+    app.handle(qso_logged("DK8QH"), NOW + timedelta(seconds=3), ENDPOINT)
+    app.handle(runtime_decode("F4NJU OZ2LC -08", ENDPOINT, df=556), NOW + timedelta(seconds=4), ENDPOINT)
+    app.handle(runtime_decode("CQ DL6NDN JO42", ENDPOINT, df=1600), NOW + timedelta(seconds=5), ENDPOINT)
+
+    app.handle(
+        runtime_status("DK8QH", tx_enabled=True, transmitting=True, tx_message="DK8QH F4NJU 73"),
+        NOW + timedelta(seconds=6),
+        ENDPOINT,
+    )
+    app.handle(runtime_status("DK8QH", tx_enabled=False), NOW + timedelta(seconds=9), ENDPOINT)
+    assert app.engine.state.session.state is QsoState.IDLE
+
+    assert app.handle(None, NOW + timedelta(seconds=21), ENDPOINT) is None
+    assert "[DIRECT] WAITING_DIRECT_REFRESH station=OZ2LC" in caplog.text
+    assert app.handle(runtime_decode("CQ DL6NDN JO42", ENDPOINT, df=1601, decode_second=15), NOW + timedelta(seconds=22), ENDPOINT) is None
+
+    action = app.handle(
+        runtime_decode("F4NJU OZ2LC -08", ENDPOINT, df=556, decode_second=15),
+        NOW + timedelta(seconds=23),
+        ENDPOINT,
+    )
+    assert action is not None
+    assert action.station == "OZ2LC"
+    assert action.kind is ActionKind.DIRECT_REPLY
+    reply = parse_datagram(transport.sent[-1][0])
+    assert isinstance(reply, ReplyPacket)
+    assert reply.decode_time == time(12, 0, 15)
+    assert reply.snr == -8
+    assert reply.delta_time == 0.2
+    assert reply.delta_frequency == 556
+    assert reply.mode == "~"
+    assert reply.message == "F4NJU OZ2LC -08"
+    assert not reply.low_confidence
+    assert reply.modifiers == 0
+    assert "Reply payload kind=DIRECT_REPLY station=OZ2LC message='F4NJU OZ2LC -08'" in caplog.text
+
+
+def test_direct_reply_timeout_keeps_direct_priority_until_refresh() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_decode("F4NJU OZ2LC -08", ENDPOINT, df=556), NOW, ENDPOINT)
+    assert app.engine.state.session.state is QsoState.DIRECT_REPLY_SENT
+
+    app.handle(None, NOW + timedelta(seconds=21), ENDPOINT)
+    assert app.engine.state.session.state is QsoState.IDLE
+    pending = app.engine.pending_direct_calls.entries(NOW + timedelta(seconds=21))
+    assert len(pending) == 1
+    assert pending[0].station == "OZ2LC"
+    assert pending[0].waiting_for_refresh
+
+    assert app.handle(runtime_decode("CQ DL6NDN JO42", ENDPOINT, df=1600), NOW + timedelta(seconds=22), ENDPOINT) is None
+    action = app.handle(
+        runtime_decode("F4NJU OZ2LC -08", ENDPOINT, df=556, decode_second=15),
+        NOW + timedelta(seconds=23),
+        ENDPOINT,
+    )
+    assert action is not None and action.station == "OZ2LC"
+
+
+def test_expired_pending_direct_allows_normal_cq_selection() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ DK8QH JN49", ENDPOINT, df=900), NOW, ENDPOINT)
+    app.handle(runtime_decode("F4NJU DK8QH R-05", ENDPOINT, df=1000), NOW + timedelta(seconds=1), ENDPOINT)
+    app.handle(runtime_decode("F4NJU OZ2LC -08", ENDPOINT, df=556), NOW + timedelta(seconds=2), ENDPOINT)
+    assert len(app.engine.pending_direct_calls.entries(NOW + timedelta(seconds=2))) == 1
+
+    app.engine.abort_qso("test completion")
+    assert app.handle(None, NOW + timedelta(seconds=18), ENDPOINT) is None
+    assert app.engine.pending_direct_calls.entries(NOW + timedelta(seconds=33)) == ()
+
+    action = app.handle(runtime_decode("CQ DL6NDN JO42", ENDPOINT, df=1600), NOW + timedelta(seconds=34), ENDPOINT)
+    assert action is not None
+    assert action.station == "DL6NDN"
 
 
 def test_final_tx_timeout_preserves_single_worked_qso_after_qso_logged(tmp_path: Path) -> None:

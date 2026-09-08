@@ -123,6 +123,20 @@ class WsjtxUdpControl:
         )
         LOGGER.info("[CONTROL] send_reply called station=%s", action.station)
         try:
+            modifiers = 0
+            LOGGER.info(
+                "[CONTROL] Reply payload kind=%s station=%s message=%r time=%s snr=%d dt=%.3f df=%d mode=%s low_confidence=%s modifiers=%d",
+                action.kind.name,
+                action.station,
+                decode.message,
+                decode.decode_time.isoformat(),
+                decode.snr,
+                decode.delta_time,
+                decode.delta_frequency,
+                decode.mode,
+                decode.low_confidence,
+                modifiers,
+            )
             datagram = serialize_reply(
                 decode.schema,
                 decode.instance_id,
@@ -133,7 +147,7 @@ class WsjtxUdpControl:
                 decode.mode,
                 decode.message,
                 decode.low_confidence,
-                0,
+                modifiers,
             )
             sent = self._transport.sendto(datagram, decode.source_endpoint)
             LOGGER.info(

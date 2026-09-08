@@ -125,6 +125,18 @@ def test_gui_arm_uses_same_unlimited_control_instance(tmp_path, monkeypatch) -> 
         backend._close_backend()
 
 
+def test_gui_worker_uses_prefix_fallback_for_candidate_and_working_metadata(tmp_path, monkeypatch) -> None:
+    backend = worker(tmp_path, monkeypatch)
+    try:
+        assert backend._scorer is not None
+        metadata = backend._scorer.dxcc_resolver.resolve("LZ1ZF")
+
+        assert metadata.country_name == "Bulgaria"
+        assert metadata.continent == "EU"
+    finally:
+        backend._close_backend()
+
+
 def test_arm_request_reaches_runtime_and_stays_armed_across_wsjtx_packets(tmp_path, monkeypatch, caplog) -> None:
     backend = worker(tmp_path, monkeypatch)
     try:
@@ -408,6 +420,49 @@ def test_ftx1_auto_apply_preferences_default_off_and_round_trip() -> None:
     assert saved.ftx1_auto_apply_band_profiles
 
 
+def test_ftx1_profile_table_has_readable_value_fields() -> None:
+    QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(UserSettings(), ap1_available=True)
+    gain, attenuation = dialog.ftx1_profile_fields["20m"]
+
+    assert dialog.ftx1_profiles_table.minimumWidth() >= 540
+    assert dialog.ftx1_profiles_table.columnWidth(0) == 90
+    assert gain.minimumHeight() >= 30
+    assert attenuation.minimumHeight() >= 30
+    assert gain.placeholderText() == "0-100"
+    assert attenuation.placeholderText() == "0-450"
+
+
+def test_worker_profile_persistence_and_main_window_model_refresh(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    profiles = {"20m": {"usb_mod_gain": 30, "tx_audio_attenuation": 24}}
+    backend = BackendWorker(UserSettings())
+    emitted = []
+    backend.ftx1_band_profiles_changed.connect(emitted.append)
+
+    backend._persist_ftx1_band_profiles(profiles)
+
+    assert SettingsStore().load().ftx1_band_profiles == profiles
+    assert emitted == [profiles]
+
+    application = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0))
+    window = MainWindow(store)
+    application.processEvents()
+    try:
+        window._update_ftx1_band_profiles(profiles)
+        refreshed = SettingsDialog(window._settings, ap1_available=True)
+
+        assert window._settings.ftx1_band_profiles == profiles
+        assert store.load().ftx1_band_profiles == profiles
+        assert refreshed.ftx1_profile_fields["20m"][0].text() == "30"
+        assert refreshed.ftx1_profile_fields["20m"][1].text() == "24"
+    finally:
+        window.close()
+
+
 def test_band_hop_requires_at_least_one_selected_band(monkeypatch) -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(UserSettings(), ap1_available=True)
@@ -495,6 +550,51 @@ def test_main_window_exposes_ftx1_manual_profile_actions(tmp_path, monkeypatch) 
         assert resets == [True]
     finally:
         window.close()
+
+
+def test_main_window_compact_layout_keeps_controls_and_working_status_readable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    application = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0))
+    window = MainWindow(store)
+    application.processEvents()
+    try:
+        assert window.size() == QSize(1120, 700)
+        window.resize(1100, 700)
+        window.show()
+        application.processEvents()
+
+        assert window.minimumSize() == QSize(820, 540)
+        assert [window.activity.horizontalHeaderItem(column).text() for column in range(window.activity.columnCount())] == ["UTC", "SNR", "DF", "MESSAGE"]
+        assert [window.candidates.horizontalHeaderItem(column).text() for column in range(window.candidates.columnCount())] == ["CALL", "SNR", "DXCC", "CONT", "SCORE"]
+        for label in (
+            "RESET ADAPTIVE STRATEGY",
+            "SAVE CURRENT BAND",
+            "DELETE CURRENT BAND PROFILE",
+            "RESET ALL BAND PROFILES",
+        ):
+            button = next(button for button in window.findChildren(type(window.arm_button)) if button.text() == label)
+            assert button.minimumWidth() >= button.sizeHint().width()
+        assert window.activity.width() > 0
+        assert window.candidates.width() > 0
+
+        window._show_qso("QSO_ACTIVE", "LZ1ZF", "Bulgaria / LZ / EU", "REPORT", 0, 10, 0, 2, "")
+        assert window.working_status.text() == "Working LZ1ZF Bulgaria"
+
+        window._show_qso("QSO_ACTIVE", "IU4SQE", "Italy / I / EU / 742 km 128°", "REPORT", 0, 10, 0, 2, "")
+        assert window.working_status.text() == "Working IU4SQE Italy 742 km 128°"
+        window._show_qso("QSO_ACTIVE", "ZZ9ZZ", "unknown / unknown / unknown", "REPORT", 0, 10, 0, 2, "")
+        assert window.working_status.text() == "Working ZZ9ZZ"
+        window._show_qso("IDLE", "-", "-", "-", 0, 10, 0, 2, "")
+        assert window.working_status.text() == "Working -"
+        window.showMaximized()
+        application.processEvents()
+        assert window.isMaximized()
+    finally:
+        window.close()
+        application.processEvents()
         application.processEvents()
 
 
@@ -527,7 +627,7 @@ def test_gui_displays_pending_direct_call_count(tmp_path, monkeypatch) -> None:
         window._handle_engine_event(
             EngineEvent(EngineEventKind.PENDING_DIRECT_ADDED, "S51DD", "Waiting for current QSO to finish")
         )
-        assert window.pending_direct_label.text() == "Pending Direct Calls: 1\nNext: S51DD"
+        assert window.pending_direct_label.text() == "Pending Direct Calls: 1 | Next: S51DD"
 
         window._handle_engine_event(EngineEvent(EngineEventKind.PENDING_DIRECT_REMOVED, "S51DD", "selected"))
         assert window.pending_direct_label.text() == "Pending Direct Calls: 0"

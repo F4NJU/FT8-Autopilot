@@ -20,10 +20,12 @@ reply disables only FTX-1 CAT-2 functions.
 1. Enable `FTX-1 CAT-2` in Preferences and choose the FTX-1 Standard COM port.
 2. Set a value from 0 through 100 for any desired band. An empty field leaves
    USB MOD GAIN unchanged on that band.
-3. During an adaptive band hop, FT8-AutoPilot waits for a WSJT-X Status packet
+3. During an adaptive or forced band hop, FT8-AutoPilot waits for a WSJT-X Status packet
    confirming the requested dial frequency. It then waits for RX, sends the
-   configured gain with `EX010414xxx;`, and reads `EX010414;` to confirm when
-   the radio returns a value.
+   configured gain with `EX010414xxx;`, restores the saved WSJT-X attenuation,
+   and waits for the matching AP1 attenuation state packet before resuming.
+   Forced hopping leaves automatic TX blocked if its destination profile is
+   missing or the attenuation confirmation times out.
 4. Gain writes remain RX-only. No ALC/PO sampling or automatic gain adjustment
    is performed.
 

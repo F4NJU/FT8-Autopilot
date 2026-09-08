@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import replace
 import logging
 from pathlib import Path
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -137,6 +139,10 @@ class SettingsDialog(QDialog):
             automatic_band_hopping_enabled=self.auto_band_hop.isChecked(),
             allowed_auto_hop_bands=[band for band, checkbox in self.auto_band_checkboxes.items() if checkbox.isChecked()],
             minimum_band_dwell_minutes=float(self.band_dwell.value()),
+            forced_band_hopping_enabled=self.forced_band_hop.isChecked(),
+            forced_band_hop_bands=[value.strip().lower() for value in self.forced_band_bands.text().split(",") if value.strip()],
+            forced_band_hop_interval_minutes=float(self.forced_band_interval.value()),
+            forced_band_hop_settle_seconds=float(self.forced_band_settle.value()),
             ftx1_cat2_enabled=self.ftx1_cat2_enabled.isChecked(),
             ftx1_cat2_confirmed_ftx1=self.ftx1_cat2_confirmed_ftx1.isChecked(),
             ftx1_cat2_port=self.ftx1_cat2_port.text(),
@@ -263,6 +269,18 @@ class SettingsDialog(QDialog):
         self.band_dwell.setRange(0, 120)
         self.band_dwell.setSuffix(" minutes")
         self.band_dwell.setValue(int(self._settings.minimum_band_dwell_minutes))
+        self.forced_band_hop = QCheckBox("Forced time-based band hopping")
+        self.forced_band_hop.setChecked(self._settings.forced_band_hopping_enabled)
+        self.forced_band_bands = QLineEdit(", ".join(self._settings.forced_band_hop_bands))
+        self.forced_band_bands.setPlaceholderText("20m, 30m, 40m")
+        self.forced_band_interval = QSpinBox()
+        self.forced_band_interval.setRange(0, 24 * 60)
+        self.forced_band_interval.setSuffix(" minutes")
+        self.forced_band_interval.setValue(int(self._settings.forced_band_hop_interval_minutes))
+        self.forced_band_settle = QSpinBox()
+        self.forced_band_settle.setRange(0, 600)
+        self.forced_band_settle.setSuffix(" seconds")
+        self.forced_band_settle.setValue(int(self._settings.forced_band_hop_settle_seconds))
         self.auto_band_checkboxes = {}
         bands = ("160m", "80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m")
         band_box = QWidget()
@@ -302,7 +320,11 @@ class SettingsDialog(QDialog):
         form.addRow("Parity trial failures", self.parity_trial)
         form.addRow(self.auto_band_hop)
         form.addRow("Minimum band dwell", self.band_dwell)
-        form.addRow("Allowed bands (ordered)", band_box)
+        form.addRow(self.forced_band_hop)
+        form.addRow("Forced band-hop bands (ordered)", self.forced_band_bands)
+        form.addRow("Forced band-hop interval", self.forced_band_interval)
+        form.addRow("Forced band-hop settling", self.forced_band_settle)
+        form.addRow("Adaptive allowed bands (ordered)", band_box)
         form.addRow("Offline cty.dat", _path_picker(self, self.cty_path, "CTY data (*.dat);;All files (*)"))
         form.addRow("WSJT-X ADIF log", _path_picker(self, self.adif_path, "ADIF (*.adi *.adif);;All files (*)"))
         form.addRow(self.sync_adif)
@@ -318,6 +340,9 @@ class SettingsDialog(QDialog):
         if self.auto_band_hop.isChecked() and not any(box.isChecked() for box in self.auto_band_checkboxes.values()):
             QMessageBox.warning(self, "Adaptive operation", "Select at least one allowed band before enabling automatic band hopping.")
             return False
+        if self.forced_band_hop.isChecked() and not self.settings().forced_band_hop_bands:
+            QMessageBox.warning(self, "Forced band hopping", "Enter at least one ordered band before enabling forced band hopping.")
+            return False
         if self.ftx1_cat2_enabled.isChecked() and not self.ftx1_cat2_confirmed_ftx1.isChecked():
             QMessageBox.warning(self, "FTX-1 CAT-2", "Confirm that this port belongs to a Yaesu FTX-1 before enabling CAT-2.")
             return False
@@ -329,7 +354,16 @@ class SettingsDialog(QDialog):
 
     def _update_ap1_controls(self) -> None:
         tooltip = "Requires WSJT-X AutoPilot AP1"
-        for control in (self.adaptive_parity, self.parity_trial, self.auto_band_hop, self.band_dwell):
+        for control in (
+            self.adaptive_parity,
+            self.parity_trial,
+            self.auto_band_hop,
+            self.band_dwell,
+            self.forced_band_hop,
+            self.forced_band_bands,
+            self.forced_band_interval,
+            self.forced_band_settle,
+        ):
             control.setEnabled(self._ap1_available)
             control.setToolTip(tooltip if not self._ap1_available else "")
         for checkbox in self.auto_band_checkboxes.values():
@@ -368,9 +402,18 @@ class SettingsDialog(QDialog):
         profiles_layout.addWidget(self.ftx1_auto_apply_band_profiles)
         profiles_layout.addWidget(QLabel("Leave both values empty to omit a band profile."))
         profiles = QTableWidget(11, 3)
+        self.ftx1_profiles_table = profiles
         profiles.setHorizontalHeaderLabels(["Band", "USB MOD GAIN", "TX audio attenuation"])
         profiles.verticalHeader().hide()
-        profiles.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        profiles.verticalHeader().setDefaultSectionSize(34)
+        header = profiles.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        profiles.setColumnWidth(0, 90)
+        profiles.setColumnWidth(1, 200)
+        profiles.setColumnWidth(2, 220)
+        profiles.setMinimumWidth(540)
         profiles.setMaximumHeight(330)
         self.ftx1_profile_fields = {}
         for row, band in enumerate(("160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m")):
@@ -380,9 +423,13 @@ class SettingsDialog(QDialog):
             gain = QLineEdit()
             gain.setValidator(QIntValidator(0, 100, gain))
             gain.setPlaceholderText("0-100")
+            gain.setMinimumHeight(max(30, gain.sizeHint().height()))
+            gain.setMinimumWidth(180)
             attenuation = QLineEdit()
             attenuation.setValidator(QIntValidator(0, 450, attenuation))
             attenuation.setPlaceholderText("0-450")
+            attenuation.setMinimumHeight(max(30, attenuation.sizeHint().height()))
+            attenuation.setMinimumWidth(200)
             configured = self._settings.ftx1_band_profiles.get(band, {})
             if "usb_mod_gain" in configured:
                 gain.setText(str(configured["usb_mod_gain"]))
@@ -473,10 +520,11 @@ class MainWindow(QMainWindow):
         self._ap1_available = False
         self._candidate_rows: dict[str, int] = {}
         self.setWindowTitle("WSJTX AutoPilot")
-        self.resize(1280, 780)
-        self.setMinimumSize(900, 600)
+        self.resize(1120, 700)
+        self.setMinimumSize(820, 540)
         self._build_ui()
         self._apply_style()
+        self._fit_control_buttons()
         self._thread = QThread(self)
         self._worker = BackendWorker(self._settings)
         self._worker.moveToThread(self._thread)
@@ -497,6 +545,7 @@ class MainWindow(QMainWindow):
         self._worker.status_changed.connect(self._show_status)
         self._worker.adaptive_changed.connect(self._show_adaptive)
         self._worker.qso_changed.connect(self._show_qso)
+        self._worker.ftx1_band_profiles_changed.connect(self._update_ftx1_band_profiles)
         self._worker.error.connect(self._show_error)
         self._worker.stopped.connect(self._thread.quit)
         self._thread.start()
@@ -504,8 +553,8 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
@@ -535,7 +584,11 @@ class MainWindow(QMainWindow):
 
         adaptive = QFrame()
         adaptive.setObjectName("panel")
-        adaptive_layout = QHBoxLayout(adaptive)
+        adaptive_layout = QVBoxLayout(adaptive)
+        adaptive_layout.setContentsMargins(10, 8, 10, 8)
+        adaptive_layout.setSpacing(6)
+        operational_row = QHBoxLayout()
+        operational_row.setSpacing(12)
         self.ap1_status = QLabel("WSJT-X AP1: Not detected")
         self.ap1_status.setObjectName("adaptiveUnavailable")
         self.adaptive_status = QLabel("Adaptive: Normal")
@@ -546,14 +599,13 @@ class MainWindow(QMainWindow):
         self.ftx1_status.setVisible(False)
         reset_adaptive = QPushButton("RESET ADAPTIVE STRATEGY")
         reset_adaptive.clicked.connect(self.reset_adaptive_requested.emit)
-        adaptive_layout.addWidget(self.ap1_status)
-        adaptive_layout.addWidget(self.adaptive_status)
-        adaptive_layout.addWidget(self.tx_period_status)
-        adaptive_layout.addWidget(self.band_status)
-        adaptive_layout.addWidget(self.next_band_status)
-        adaptive_layout.addWidget(self.ftx1_status)
-        adaptive_layout.addStretch()
-        adaptive_layout.addWidget(reset_adaptive)
+        self.ftx1_status.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        operational_row.addWidget(self.ap1_status)
+        operational_row.addWidget(self.adaptive_status)
+        operational_row.addWidget(self.tx_period_status)
+        operational_row.addWidget(self.band_status)
+        operational_row.addWidget(self.next_band_status)
+        operational_row.addWidget(self.ftx1_status, 1)
         self.save_ftx1_current_band_profile_button = QPushButton("SAVE CURRENT BAND")
         self.save_ftx1_current_band_profile_button.clicked.connect(self.save_ftx1_current_band_profile_requested.emit)
         self.save_ftx1_current_band_profile_button.setVisible(False)
@@ -563,40 +615,41 @@ class MainWindow(QMainWindow):
         self.reset_all_ftx1_band_profiles_button = QPushButton("RESET ALL BAND PROFILES")
         self.reset_all_ftx1_band_profiles_button.clicked.connect(self.reset_all_ftx1_band_profiles_requested.emit)
         self.reset_all_ftx1_band_profiles_button.setVisible(False)
-        adaptive_layout.addWidget(self.save_ftx1_current_band_profile_button)
-        adaptive_layout.addWidget(self.delete_ftx1_current_band_profile_button)
-        adaptive_layout.addWidget(self.reset_all_ftx1_band_profiles_button)
+        controls_row = QHBoxLayout()
+        controls_row.addStretch()
+        self._profile_control_buttons = (
+            reset_adaptive,
+            self.save_ftx1_current_band_profile_button,
+            self.delete_ftx1_current_band_profile_button,
+            self.reset_all_ftx1_band_profiles_button,
+        )
+        for button in self._profile_control_buttons:
+            button.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+            controls_row.addWidget(button)
+        adaptive_layout.addLayout(operational_row)
+        adaptive_layout.addLayout(controls_row)
         layout.addWidget(adaptive)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._activity_panel())
         splitter.addWidget(self._candidate_panel())
-        splitter.setSizes([700, 500])
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([660, 440])
         layout.addWidget(splitter, 1)
 
-        qso = QFrame()
-        qso.setObjectName("qsoPanel")
-        qso_layout = QHBoxLayout(qso)
-        qso_layout.addWidget(QLabel("QSO STATE"))
-        self.qso_state = QLabel("IDLE")
-        self.qso_state.setObjectName("qsoState")
-        self.qso_remote = QLabel("REMOTE  -")
-        self.qso_remote_detail = QLabel("-")
-        self.qso_stage = QLabel("STAGE  -")
-        self.qso_progress = QLabel(f"NO PROGRESS  0 / {self._settings.max_no_progress_periods}")
-        self.remote_cq_progress = QLabel(f"REMOTE CQ  0 / {self._settings.max_remote_cq_during_attempt}")
-        self.qso_notice = QLabel("")
+        working = QFrame()
+        working.setObjectName("qsoPanel")
+        qso_layout = QHBoxLayout(working)
+        qso_layout.setContentsMargins(10, 6, 10, 6)
+        qso_layout.addWidget(QLabel("WORKING"))
+        self.working_status = QLabel("Working -")
+        self.working_status.setObjectName("qsoState")
         self.tx_state = QLabel("RX")
-        qso_layout.addWidget(self.qso_state)
-        qso_layout.addWidget(self.qso_remote)
-        qso_layout.addWidget(self.qso_remote_detail)
-        qso_layout.addWidget(self.qso_stage)
-        qso_layout.addWidget(self.qso_progress)
-        qso_layout.addWidget(self.remote_cq_progress)
-        qso_layout.addWidget(self.qso_notice)
+        qso_layout.addWidget(self.working_status)
         qso_layout.addStretch()
         qso_layout.addWidget(self.tx_state)
-        layout.addWidget(qso)
+        layout.addWidget(working)
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
@@ -608,12 +661,16 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         label = QLabel("DECODE ACTIVITY")
         label.setObjectName("panelTitle")
-        self.activity = QTableWidget(0, 7)
-        self.activity.setHorizontalHeaderLabels(["UTC", "SNR", "DF", "MODE", "TARGET", "ACTIVITY", "MESSAGE"])
+        self.activity = QTableWidget(0, 4)
+        self.activity.setHorizontalHeaderLabels(["UTC", "SNR", "DF", "MESSAGE"])
         self.activity.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.activity.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.activity.verticalHeader().hide()
-        self.activity.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        activity_header = self.activity.horizontalHeader()
+        activity_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        activity_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        activity_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        activity_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(label)
         layout.addWidget(self.activity)
         return panel
@@ -626,12 +683,14 @@ class MainWindow(QMainWindow):
         label.setObjectName("panelTitle")
         self.pending_direct_label = QLabel("Pending Direct Calls: 0")
         self._pending_direct_stations: set[str] = set()
-        self.candidates = QTableWidget(0, 9)
-        self.candidates.setHorizontalHeaderLabels(["CALL", "TYPE", "SNR", "DXCC", "CONT", "CQ TARGET", "ACTIVITY", "SCORE", "WHY"])
+        self.candidates = QTableWidget(0, 5)
+        self.candidates.setHorizontalHeaderLabels(["CALL", "SNR", "DXCC", "CONT", "SCORE"])
         self.candidates.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.candidates.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.candidates.verticalHeader().hide()
-        self.candidates.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        candidate_header = self.candidates.horizontalHeader()
+        for column in range(5):
+            candidate_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.candidates.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
         ignore = QAction(f"Ignore for {self._settings.ignore_minutes} minutes", self.candidates)
         ignore.triggered.connect(self._ignore_selected)
@@ -651,9 +710,6 @@ class MainWindow(QMainWindow):
             row.observed_at.strftime("%H:%M:%S"),
             f"{row.snr:+d}",
             str(row.delta_frequency),
-            row.mode,
-            row.cq_target or "-",
-            ", ".join(row.activity_tags) or "-",
             row.message,
         ]
         for column, value in enumerate(values):
@@ -685,17 +741,12 @@ class MainWindow(QMainWindow):
             target = self.candidates.rowCount()
             self.candidates.insertRow(target)
             self._candidate_rows[row.station] = target
-        dxcc = f"{row.country} / {row.dxcc}"
         values = [
             row.station,
-            row.kind,
             f"{row.snr:+d}",
-            dxcc,
+            row.dxcc,
             row.continent,
-            row.cq_target,
-            row.activities,
             str(row.score),
-            row.score_detail,
         ]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
@@ -708,7 +759,7 @@ class MainWindow(QMainWindow):
     def _update_pending_direct_label(self) -> None:
         count = len(self._pending_direct_stations)
         next_station = next(iter(sorted(self._pending_direct_stations)), "-")
-        suffix = f"\nNext: {next_station}" if count else ""
+        suffix = f" | Next: {next_station}" if count else ""
         self.pending_direct_label.setText(f"Pending Direct Calls: {count}{suffix}")
 
     def _show_connection(self, connected: bool) -> None:
@@ -776,9 +827,9 @@ class MainWindow(QMainWindow):
                 else "No profile"
             )
             self.ftx1_status.setText(
-                f"FTX-1 CAT-2: {'Connected' if ftx1.get('connected') else 'Disconnected'} / "
-                f"{ftx1_band or '—'} / Current USB {ftx1.get('current_usb_mod_gain') if ftx1.get('current_usb_mod_gain') is not None else '—'} "
-                f"/ ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} / {profile_text}"
+                f"FTX-1: {'Connected' if ftx1.get('connected') else 'Disconnected'} | "
+                f"USB {ftx1.get('current_usb_mod_gain') if ftx1.get('current_usb_mod_gain') is not None else '—'} | "
+                f"ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} | {profile_text}"
             )
             self.ftx1_status.setVisible(True)
             self.save_ftx1_current_band_profile_button.setVisible(True)
@@ -805,13 +856,15 @@ class MainWindow(QMainWindow):
         remote_cq_maximum: int,
         notice: str,
     ) -> None:
-        self.qso_state.setText(state)
-        self.qso_remote.setText(f"REMOTE  {remote}")
-        self.qso_remote_detail.setText(remote_detail)
-        self.qso_stage.setText(f"STAGE  {stage}")
-        self.qso_progress.setText(f"NO PROGRESS  {count} / {maximum}")
-        self.remote_cq_progress.setText(f"REMOTE CQ  {remote_cq_count} / {remote_cq_maximum}")
-        self.qso_notice.setText(notice)
+        if state == "IDLE" or remote == "-":
+            self.working_status.setText("Working -")
+            return
+        details = remote_detail.split(" / ") if remote_detail and remote_detail != "-" else []
+        country = details[0] if details else ""
+        if country.lower() == "unknown":
+            country = ""
+        location = details[3] if len(details) > 3 else ""
+        self.working_status.setText(f"Working {remote}" + (f" {country}" if country else "") + (f" {location}" if location else ""))
 
     def _toggle_arm(self) -> None:
         LOGGER.info("[GUI] ARM button clicked current_ui_state=%s", self._armed)
@@ -842,6 +895,12 @@ class MainWindow(QMainWindow):
         set_file_log_level(self._settings.logging_level)
         self.apply_settings_requested.emit(self._settings)
         self.statusBar().showMessage("Preferences saved; backend restarted DISARMED", 6000)
+
+    def _update_ftx1_band_profiles(self, profiles: dict[str, dict[str, int]]) -> None:
+        self._settings.ftx1_band_profiles = deepcopy(profiles)
+        self._store.save(self._settings)
+        current_band = self.band_status.text().replace("BAND: ", "")
+        self.statusBar().showMessage(f"Saved {current_band} profile", 5000)
 
     def _selected_station(self) -> str | None:
         row = self.candidates.currentRow()
@@ -878,13 +937,13 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #0b1116; color: #d8e1e8; font-family: 'Segoe UI'; }
-            #appTitle { color: #f2f6f8; font-size: 25px; font-weight: 800; letter-spacing: 3px; }
+            #appTitle { color: #f2f6f8; font-size: 22px; font-weight: 800; letter-spacing: 3px; }
             #subtitle, #panelTitle { color: #6f8798; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
             #panel, #qsoPanel { background: #101921; border: 1px solid #20303b; border-radius: 5px; }
             QTableWidget { background: #0d151b; alternate-background-color: #111d25; border: 0; gridline-color: #1c2a34; }
             QHeaderView::section { background: #14212a; color: #8299a8; border: 0; border-bottom: 1px solid #2b3d48; padding: 7px; font-weight: 700; }
             QTableWidget::item { padding: 5px; }
-            QPushButton { background: #17242d; border: 1px solid #334651; border-radius: 4px; padding: 9px 14px; font-weight: 700; }
+            QPushButton { background: #17242d; border: 1px solid #334651; border-radius: 4px; padding: 7px 11px; font-weight: 700; }
             QPushButton:hover { background: #20323e; }
             #armButton { color: #efbd67; border-color: #8c6936; min-width: 115px; }
             #armButton[armed='true'] { background: #65262a; color: #ffffff; border-color: #df5a60; }
@@ -894,7 +953,7 @@ class MainWindow(QMainWindow):
             #adaptiveAvailable { color: #70dfbd; font-weight: 700; }
             #adaptiveUnavailable { color: #efbd67; font-weight: 700; }
             #infoText { color: #8299a8; padding: 5px; }
-            #qsoState { color: #70dfbd; font-size: 16px; font-weight: 800; padding: 4px 14px; }
+            #qsoState { color: #70dfbd; font-size: 15px; font-weight: 800; padding: 2px 8px; }
             QLineEdit, QSpinBox, QComboBox { background: #111b22; border: 1px solid #30424d; border-radius: 3px; padding: 6px; }
             QGroupBox { border: 1px solid #263640; border-radius: 4px; margin-top: 10px; padding: 8px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; color: #9db0bc; }
@@ -905,6 +964,10 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: #1b2b35; color: #70dfbd; }
             """
         )
+
+    def _fit_control_buttons(self) -> None:
+        for button in self._profile_control_buttons:
+            button.setMinimumWidth(button.sizeHint().width())
 
 
 def _csv_set(value: str) -> set[str]:
