@@ -282,7 +282,11 @@ class AutopilotRuntime:
         if not isinstance(self.control, WsjtxUdpControl):
             LOGGER.error("[RUNTIME] ARM request rejected: control is not WsjtxUdpControl")
             return False
-        if self.config.ftx1_hamlib_enabled and (self.config.ftx1_alc_control_enabled or self.config.ftx1_swr_protection_enabled):
+        if (
+            self.config.ftx1_cat2_enabled
+            and self.config.ftx1_hamlib_enabled
+            and (self.config.ftx1_alc_control_enabled or self.config.ftx1_swr_protection_enabled)
+        ):
             if self.ftx1_band_drive is None or not self.ftx1_band_drive.cat.identify():
                 LOGGER.error("[HAMLIB] ARM rejected: radio source is unavailable")
                 return False

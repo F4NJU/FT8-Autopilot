@@ -78,6 +78,7 @@ def test_gui_worker_opens_identified_ftx1_cat2_from_persisted_settings(tmp_path,
             worked_store_path=str(tmp_path / "worked.sqlite3"),
             ftx1_cat2_enabled=True,
             ftx1_cat2_confirmed_ftx1=True,
+            ftx1_hamlib_enabled=False,
             ftx1_cat2_port="COM6",
             ftx1_cat2_baudrate=4_800,
         )
@@ -572,7 +573,7 @@ def test_main_window_compact_layout_keeps_controls_and_working_status_readable(t
             "RESET ADAPTIVE STRATEGY",
             "SAVE CURRENT BAND",
             "DELETE CURRENT BAND PROFILE",
-            "RESET ALL BAND PROFILES",
+            "RÉINITIALISER APPRENTISSAGE ALC",
         ):
             button = next(button for button in window.findChildren(type(window.arm_button)) if button.text() == label)
             assert button.minimumWidth() >= button.sizeHint().width()
