@@ -26,8 +26,8 @@ reply disables only FTX-1 CAT-2 functions.
    and waits for the matching AP1 attenuation state packet before resuming.
    Forced hopping leaves automatic TX blocked if its destination profile is
    missing or the attenuation confirmation times out.
-4. Gain writes remain RX-only. No ALC/PO sampling or automatic gain adjustment
-   is performed.
+4. USB MOD GAIN writes remain RX-only. Hamlib meter sampling occurs only while
+   WSJT-X reports TX; ALC corrections are applied after return to RX.
 
 Examples:
 
@@ -41,5 +41,16 @@ EX010414025;
 
 Profiles contain only `usb_mod_gain` and `tx_audio_attenuation` for each band.
 Use SAVE CURRENT BAND, DELETE CURRENT BAND PROFILE, RESET ALL BAND PROFILES,
-and AUTO APPLY BAND PROFILES to manage them. The operator chooses all values;
-there is no automatic learning, ALC/PO protection, or TX-time gain adjustment.
+and AUTO APPLY BAND PROFILES to manage them. USB MOD GAIN remains operator-set;
+ALC and SWR are now read directly from Hamlib's FTX-1 backend (model 1051),
+through a local `rigctld` process owned by AutoPilot. WSJT-X status data is not
+used as the meter source.
+
+During a transmission, AutoPilot ignores the first 1.5 seconds, then samples
+Hamlib ALC, SWR, and RF power. At the end of the transmit period it adjusts the
+WSJT-X audio attenuation one small step in either direction to keep ALC inside
+the configured window. Samples without RF power are excluded from ALC learning.
+
+SWR protection remains active during the transmit period. Consecutive readings
+at or above the configured threshold send Halt Tx immediately, disarm AutoPilot,
+and latch the fault until the operator explicitly arms control again.

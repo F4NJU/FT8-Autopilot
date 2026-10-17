@@ -31,6 +31,7 @@ class BackendWorker(QObject):
     error = Signal(str)
     connection_changed = Signal(bool)
     armed_changed = Signal(bool)
+    swr_safety_triggered = Signal(str)
     activity_received = Signal(object)
     engine_event = Signal(object)
     status_changed = Signal(object)
@@ -50,6 +51,7 @@ class BackendWorker(QObject):
         self._last_packet_at: datetime | None = None
         self._connected = False
         self._last_reported_armed = False
+        self._last_swr_safety_notice = ""
 
     @Slot()
     def start(self) -> None:
@@ -106,6 +108,8 @@ class BackendWorker(QObject):
             id(self._listener),
         )
         armed = self._runtime.arm_control()
+        if armed:
+            self._last_swr_safety_notice = ""
         self._last_reported_armed = armed
         self.armed_changed.emit(armed)
 
@@ -161,6 +165,10 @@ class BackendWorker(QObject):
                 self._runtime.handle(packet, now, received.endpoint)
                 if isinstance(packet, (StatusPacket, HeartbeatPacket)):
                     self.status_changed.emit(StatusView.from_status(self._runtime.status))
+            safety_notice = self._runtime.last_qso_notice
+            if safety_notice.startswith("SWR SAFETY") and safety_notice != self._last_swr_safety_notice:
+                self._last_swr_safety_notice = safety_notice
+                self.swr_safety_triggered.emit(safety_notice)
             session = self._runtime.engine.state.session
             remote_metadata = (
                 self._scorer.dxcc_resolver.resolve(session.remote_callsign)
@@ -214,7 +222,7 @@ class BackendWorker(QObject):
         adif_path = self._paths.resolve_adif_path(self._settings.wsjtx_log_path)
         synchronize_adif(adif_path, worked, self._settings.sync_adif_on_startup)
         today = datetime.now(timezone.utc).date()
-        LOGGER.info("[WORKED] loaded %d QSOs for %s UTC", worked.count(today), today.isoformat())
+        worked.bootstrap(today)
         resolver = (
             CtyDatResolver(Path(self._settings.cty_dat_path))
             if self._settings.cty_dat_path
@@ -265,6 +273,7 @@ class BackendWorker(QObject):
             stagnation_max_unique_calls=self._settings.stagnation_max_unique_calls,
             adaptive_parity_enabled=self._settings.adaptive_parity_enabled,
             parity_trial_failed_attempts=self._settings.parity_trial_failed_attempts,
+            adaptive_opportunity_quiet_seconds=self._settings.adaptive_opportunity_quiet_minutes * 60,
             automatic_band_hopping_enabled=self._settings.automatic_band_hopping_enabled,
             allowed_auto_hop_bands=tuple(self._settings.allowed_auto_hop_bands),
             auto_hop_band_frequencies=self._settings.auto_hop_band_frequencies,
@@ -280,7 +289,19 @@ class BackendWorker(QObject):
             ftx1_cat2_port=self._settings.ftx1_cat2_port,
             ftx1_cat2_baudrate=self._settings.ftx1_cat2_baudrate,
             ftx1_cat2_timeout_seconds=self._settings.ftx1_cat2_timeout_seconds,
-            ftx1_auto_apply_band_profiles=self._settings.ftx1_auto_apply_band_profiles,
+            ftx1_hamlib_enabled=self._settings.ftx1_hamlib_enabled,
+            hamlib_rig_model=self._settings.hamlib_rig_model,
+            ftx1_hamlib_rigctld_path=self._settings.ftx1_hamlib_rigctld_path,
+            ftx1_hamlib_tcp_port=self._settings.ftx1_hamlib_tcp_port,
+            ftx1_meter_poll_seconds=self._settings.ftx1_meter_poll_seconds,
+            ftx1_alc_control_enabled=self._settings.ftx1_alc_control_enabled,
+            ftx1_alc_minimum=self._settings.ftx1_alc_minimum,
+            ftx1_alc_maximum=self._settings.ftx1_alc_maximum,
+            ftx1_alc_attenuation_step=self._settings.ftx1_alc_attenuation_step,
+            ftx1_swr_protection_enabled=self._settings.ftx1_swr_protection_enabled,
+            ftx1_swr_limit=self._settings.ftx1_swr_limit,
+            ftx1_swr_trip_samples=self._settings.ftx1_swr_trip_samples,
+            ftx1_auto_apply_band_profiles=self._settings.ftx1_alc_control_enabled,
             ftx1_band_profiles=deepcopy(self._settings.ftx1_band_profiles),
             cty_dat_path=Path(self._settings.cty_dat_path) if self._settings.cty_dat_path else None,
         )
@@ -294,7 +315,7 @@ class BackendWorker(QObject):
             None,
             self._paths.data_dir / "DISARM_AUTOPILOT",
             config.local_callsign,
-            self._settings.direct_reply_patched,
+            False,
             armed=False,
         )
         self._runtime = AutopilotRuntime(

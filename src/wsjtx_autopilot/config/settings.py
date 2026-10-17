@@ -62,6 +62,7 @@ class UserSettings:
     stagnation_max_unique_calls: int = 3
     adaptive_parity_enabled: bool = True
     parity_trial_failed_attempts: int = 6
+    adaptive_opportunity_quiet_minutes: float = 3.0
     automatic_band_hopping_enabled: bool = False
     allowed_auto_hop_bands: list[str] = field(default_factory=list)
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -77,6 +78,18 @@ class UserSettings:
     ftx1_cat2_port: str = ""
     ftx1_cat2_baudrate: int = 38_400
     ftx1_cat2_timeout_seconds: float = 0.25
+    ftx1_hamlib_enabled: bool = True
+    hamlib_rig_model: int = 1051
+    ftx1_hamlib_rigctld_path: str = ""
+    ftx1_hamlib_tcp_port: int = 4533
+    ftx1_meter_poll_seconds: float = 0.5
+    ftx1_alc_control_enabled: bool = True
+    ftx1_alc_minimum: float = 0.23
+    ftx1_alc_maximum: float = 0.30
+    ftx1_alc_attenuation_step: int = 3
+    ftx1_swr_protection_enabled: bool = True
+    ftx1_swr_limit: float = 2.0
+    ftx1_swr_trip_samples: int = 2
     ftx1_auto_apply_band_profiles: bool = False
     ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
     logging_level: str = "normal"
@@ -103,6 +116,7 @@ class UserSettings:
         self.stagnation_min_failed_attempts = max(1, int(self.stagnation_min_failed_attempts))
         self.stagnation_max_unique_calls = max(1, int(self.stagnation_max_unique_calls))
         self.parity_trial_failed_attempts = max(1, int(self.parity_trial_failed_attempts))
+        self.adaptive_opportunity_quiet_minutes = max(1.0, float(self.adaptive_opportunity_quiet_minutes))
         self.allowed_auto_hop_bands = [value.strip().lower() for value in self.allowed_auto_hop_bands if value.strip()]
         self.auto_hop_band_frequencies = {
             str(band).strip().lower(): {
@@ -125,19 +139,30 @@ class UserSettings:
         self.ftx1_cat2_port = self.ftx1_cat2_port.strip()
         self.ftx1_cat2_baudrate = max(1_200, min(115_200, int(self.ftx1_cat2_baudrate)))
         self.ftx1_cat2_timeout_seconds = max(0.05, min(5.0, float(self.ftx1_cat2_timeout_seconds)))
+        self.ftx1_hamlib_enabled = self.ftx1_hamlib_enabled is True
+        self.hamlib_rig_model = max(1, int(self.hamlib_rig_model))
+        self.ftx1_hamlib_rigctld_path = self.ftx1_hamlib_rigctld_path.strip()
+        self.ftx1_hamlib_tcp_port = max(1_024, min(65_535, int(self.ftx1_hamlib_tcp_port)))
+        self.ftx1_meter_poll_seconds = max(0.2, min(5.0, float(self.ftx1_meter_poll_seconds)))
+        self.ftx1_alc_control_enabled = self.ftx1_alc_control_enabled is True
+        self.ftx1_alc_minimum = max(0.0, min(1.0, float(self.ftx1_alc_minimum)))
+        self.ftx1_alc_maximum = max(self.ftx1_alc_minimum, min(1.0, float(self.ftx1_alc_maximum)))
+        if abs(self.ftx1_alc_minimum - 0.02) < 0.001 and abs(self.ftx1_alc_maximum - 0.08) < 0.001:
+            self.ftx1_alc_minimum = 0.23
+            self.ftx1_alc_maximum = 0.30
+        self.ftx1_alc_attenuation_step = max(1, min(50, int(self.ftx1_alc_attenuation_step)))
+        self.ftx1_swr_protection_enabled = self.ftx1_swr_protection_enabled is True
+        self.ftx1_swr_limit = max(1.1, min(5.0, float(self.ftx1_swr_limit)))
+        self.ftx1_swr_trip_samples = max(1, min(10, int(self.ftx1_swr_trip_samples)))
         self.ftx1_auto_apply_band_profiles = self.ftx1_auto_apply_band_profiles is True
         raw_band_profiles = self.ftx1_band_profiles if isinstance(self.ftx1_band_profiles, dict) else {}
         self.ftx1_band_profiles = {
             str(band).strip().lower(): {
-                "usb_mod_gain": values["usb_mod_gain"],
                 "tx_audio_attenuation": values["tx_audio_attenuation"],
             }
             for band, values in raw_band_profiles.items()
             if str(band).strip().lower() in {"160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"}
             and isinstance(values, dict)
-            and isinstance(values.get("usb_mod_gain"), int)
-            and not isinstance(values.get("usb_mod_gain"), bool)
-            and 0 <= values["usb_mod_gain"] <= 100
             and isinstance(values.get("tx_audio_attenuation"), int)
             and not isinstance(values.get("tx_audio_attenuation"), bool)
             and 0 <= values["tx_audio_attenuation"] <= 450

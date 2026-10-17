@@ -22,7 +22,7 @@ class FTX1BandDriveProfile:
     tx_audio_attenuation: int
 
     def to_settings(self) -> dict[str, int]:
-        return {"usb_mod_gain": self.usb_mod_gain, "tx_audio_attenuation": self.tx_audio_attenuation}
+        return {"tx_audio_attenuation": self.tx_audio_attenuation}
 
 
 class FTX1Serial(Protocol):
@@ -78,18 +78,8 @@ class FTX1CatController:
         return False
 
     def set_usb_mod_gain(self, gain: int) -> bool:
-        if not self.identify() or not self._write(self.usb_mod_gain_command(gain)):
-            return False
-        response = self._query("EX010414;")
-        observed = self._parse_meter_value(response, "EX010414") if response is not None else None
-        if observed is None:
-            LOGGER.warning("[FTX1] USB MOD GAIN sent but CAT-2 confirmation unavailable")
-            return True
-        if observed != gain:
-            LOGGER.error("[FTX1] USB MOD GAIN update failed: expected=%d observed=%d", gain, observed)
-            return False
-        LOGGER.info("[FTX1] USB MOD GAIN confirmed: %d", gain)
-        return True
+        LOGGER.error("[FTX1] USB MOD GAIN write blocked by policy requested=%d", gain)
+        return False
 
     def read_usb_mod_gain(self) -> int | None:
         if not self.identify():
@@ -187,7 +177,7 @@ class FTX1CatController:
 
 
 class FTX1BandDriveController:
-    """Applies explicit user-saved USB gain and WSJT-X attenuation pairs by band."""
+    """Applies user-saved WSJT-X attenuation by band without changing USB MOD GAIN."""
 
     def __init__(
         self,
@@ -211,14 +201,13 @@ class FTX1BandDriveController:
         if self._is_transmitting():
             LOGGER.error("[FTX1] Save manual band profile failed: radio is transmitting")
             return False
-        gain = self.cat.read_usb_mod_gain()
-        if gain is None:
-            LOGGER.error("[FTX1] Save manual band profile failed: current USB MOD GAIN unavailable")
-            return False
-        self.current_usb_mod_gain = gain
+        # Preserve the legacy field for settings compatibility only.  The
+        # application deliberately neither reads nor writes USB MOD GAIN.
+        existing = self.profiles.get(band.lower())
+        gain = existing.usb_mod_gain if existing is not None else 0
         self.save_profile(band, gain, attenuation)
         LOGGER.info("[BAND-DRIVE] Saved current band profile: %s", band.lower())
-        LOGGER.info("[BAND-DRIVE] USB MOD GAIN=%d, TX attenuation=%d", gain, attenuation)
+        LOGGER.info("[BAND-DRIVE] TX attenuation=%d; USB MOD GAIN left untouched", attenuation)
         return True
 
     def save_profile(self, band: str, gain: int, attenuation: int) -> None:
@@ -235,15 +224,11 @@ class FTX1BandDriveController:
         if self._is_transmitting():
             LOGGER.warning("[FTX1] Manual band profile deferred: radio is transmitting")
             return False
-        if not self.cat.set_usb_mod_gain(profile.usb_mod_gain):
-            LOGGER.error("[FTX1] Manual band profile apply failed: USB MOD GAIN")
-            return False
-        self.current_usb_mod_gain = profile.usb_mod_gain
         if force_attenuation or current_attenuation != profile.tx_audio_attenuation:
             if self._set_tx_audio_attenuation is None or not self._set_tx_audio_attenuation(profile.tx_audio_attenuation):
                 LOGGER.error("[FTX1] Manual band profile apply failed: WSJT-X attenuation")
                 return False
-        LOGGER.info("[FTX1] Loaded manual band profile %s USB_GAIN=%d ATT=%d", profile.band, profile.usb_mod_gain, profile.tx_audio_attenuation)
+        LOGGER.info("[FTX1] Loaded band profile %s ATT=%d; USB MOD GAIN left untouched", profile.band, profile.tx_audio_attenuation)
         return True
 
     def delete_profile(self, band: str) -> bool:
@@ -252,6 +237,17 @@ class FTX1BandDriveController:
         self._notify()
         LOGGER.info("[FTX1] Deleted manual band profile %s", band.lower())
         return True
+
+    def update_profile_attenuation(self, band: str, attenuation: int) -> None:
+        """Create or update the automatic ALC attenuation learned for a band."""
+        normalized = band.lower()
+        profile = self.profiles.get(normalized)
+        if profile is not None and profile.tx_audio_attenuation == attenuation:
+            return
+        legacy_gain = profile.usb_mod_gain if profile is not None else 0
+        self.profiles[normalized] = self._validate_profile(normalized, legacy_gain, attenuation)
+        self._notify()
+        LOGGER.info("[FTX1] Saved ALC-learned attenuation band=%s ATT=%d", normalized, attenuation)
 
     def reset_profiles(self) -> None:
         if self.profiles:
@@ -264,9 +260,9 @@ class FTX1BandDriveController:
         return {
             "connected": self.cat.is_ready,
             "band": current_band,
-            "current_usb_mod_gain": self.current_usb_mod_gain,
+            "current_usb_mod_gain": None,
             "current_tx_audio_attenuation": current_attenuation,
-            "saved_usb_mod_gain": profile.usb_mod_gain if profile else None,
+            "saved_usb_mod_gain": None,
             "saved_tx_audio_attenuation": profile.tx_audio_attenuation if profile else None,
             "profile_count": len(self.profiles),
         }
@@ -287,7 +283,11 @@ class FTX1BandDriveController:
             if not isinstance(value, dict):
                 continue
             try:
-                profiles[band.lower()] = cls._validate_profile(band, value["usb_mod_gain"], value["tx_audio_attenuation"])
+                profiles[band.lower()] = cls._validate_profile(
+                    band,
+                    value.get("usb_mod_gain", 0),
+                    value["tx_audio_attenuation"],
+                )
             except (KeyError, TypeError, ValueError):
                 continue
         return profiles

@@ -22,6 +22,27 @@ def _normalize_callsign_token(value: str) -> str | None:
 def parse_ft8_message(text: str) -> ParsedMessage | None:
     """Parse unambiguous common FT8 exchanges; return None for free text."""
     raw = " ".join(text.upper().split())
+    # Standard dual messages can finish one QSO and address another station
+    # in the same transmission: "F6BQX RR73; F4NJU <ES0RY> -16". Accept only
+    # this strict RR73 form and retain the complete raw message so WSJT-X can
+    # locate the exact decoded line when it receives the Reply command.
+    dual = re.fullmatch(r"([A-Z0-9/]+) RR73; (.+)", raw)
+    if dual is not None:
+        second = parse_ft8_message(dual.group(2))
+        if second is None or second.kind not in {
+            MessageKind.DIRECTED,
+            MessageKind.REPORT,
+            MessageKind.R_REPORT,
+        }:
+            return None
+        return ParsedMessage(
+            raw,
+            second.kind,
+            second.sender,
+            second.addressee,
+            report=second.report,
+            grid=second.grid,
+        )
     parts = raw.split()
     if not parts:
         return None

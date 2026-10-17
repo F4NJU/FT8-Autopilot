@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -48,6 +50,7 @@ from wsjtx_autopilot.logging_setup import (
     export_diagnostic,
     set_file_log_level,
 )
+from wsjtx_autopilot.hamlib import list_supported_radios
 
 from .viewmodels import ActivityRow, CandidateRow, StatusView
 from .worker import BackendWorker
@@ -71,7 +74,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._priority_tab(), "Priority")
         safety_tab = self._safety_tab()
         self.tabs.addTab(safety_tab, "Safety & Data")
-        self.tabs.addTab(self._ftx1_tab(), "FTX-1 CAT-2")
+        self.tabs.addTab(self._ftx1_tab(), "Radio / Hamlib")
         self.tabs.addTab(self._diagnostic_tab(), "Diagnostic")
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -108,8 +111,8 @@ class SettingsDialog(QDialog):
             preferred_continents=_csv_set(self.continents.text()),
             preferred_dxcc=_csv_set(self.dxcc.text()),
             direct_call_policy=DirectCallPolicy(self.direct_policy.currentData()),
-            allow_direct_call_dupes=self.direct_dupes.isChecked(),
-            allow_dupes=self.allow_dupes.isChecked(),
+            allow_direct_call_dupes=self.dupe_policy.currentData() == "direct",
+            allow_dupes=self.dupe_policy.currentData() == "all",
             minimum_snr=minimum_snr,
             favor_strong_signals=self.strong_signals.isChecked(),
             pota_policy=ActivityPolicy(self.pota_policy.currentData()),
@@ -121,7 +124,7 @@ class SettingsDialog(QDialog):
             cty_dat_path=self.cty_path.text().strip() or None,
             wsjtx_log_path=self.adif_path.text().strip() or None,
             sync_adif_on_startup=self.sync_adif.isChecked(),
-            direct_reply_patched=self.direct_patched.isChecked(),
+            direct_reply_patched=False,
             max_no_progress_periods=self.max_no_progress.value(),
             stalled_qso_cooldown_seconds=float(self.stalled_cooldown.value()),
             remote_busy_cooldown_seconds=float(self.remote_busy_cooldown.value()),
@@ -136,6 +139,7 @@ class SettingsDialog(QDialog):
             stagnation_max_unique_calls=self.stagnation_unique.value(),
             adaptive_parity_enabled=self.adaptive_parity.isChecked(),
             parity_trial_failed_attempts=self.parity_trial.value(),
+            adaptive_opportunity_quiet_minutes=float(self.opportunity_quiet.value()),
             automatic_band_hopping_enabled=self.auto_band_hop.isChecked(),
             allowed_auto_hop_bands=[band for band, checkbox in self.auto_band_checkboxes.items() if checkbox.isChecked()],
             minimum_band_dwell_minutes=float(self.band_dwell.value()),
@@ -144,19 +148,24 @@ class SettingsDialog(QDialog):
             forced_band_hop_interval_minutes=float(self.forced_band_interval.value()),
             forced_band_hop_settle_seconds=float(self.forced_band_settle.value()),
             ftx1_cat2_enabled=self.ftx1_cat2_enabled.isChecked(),
-            ftx1_cat2_confirmed_ftx1=self.ftx1_cat2_confirmed_ftx1.isChecked(),
+            ftx1_cat2_confirmed_ftx1=False,
             ftx1_cat2_port=self.ftx1_cat2_port.text(),
             ftx1_cat2_baudrate=self.ftx1_cat2_baudrate.value(),
             ftx1_cat2_timeout_seconds=self.ftx1_cat2_timeout.value() / 1000,
-            ftx1_auto_apply_band_profiles=self.ftx1_auto_apply_band_profiles.isChecked(),
-            ftx1_band_profiles={
-                band: {
-                    "usb_mod_gain": int(gain.text()),
-                    "tx_audio_attenuation": int(attenuation.text()),
-                }
-                for band, (gain, attenuation) in self.ftx1_profile_fields.items()
-                if gain.text() and attenuation.text()
-            },
+            ftx1_hamlib_enabled=True,
+            hamlib_rig_model=int(self.hamlib_radio.currentData() or self._settings.hamlib_rig_model),
+            ftx1_hamlib_rigctld_path=self.ftx1_hamlib_path.text(),
+            ftx1_hamlib_tcp_port=self.ftx1_hamlib_tcp_port.value(),
+            ftx1_meter_poll_seconds=self.ftx1_meter_poll.value(),
+            ftx1_alc_control_enabled=self.ftx1_alc_control.isChecked(),
+            ftx1_alc_minimum=self.ftx1_alc_min.value(),
+            ftx1_alc_maximum=self.ftx1_alc_max.value(),
+            ftx1_alc_attenuation_step=self.ftx1_alc_step.value(),
+            ftx1_swr_protection_enabled=self.ftx1_swr_protection.isChecked(),
+            ftx1_swr_limit=self.ftx1_swr_limit.value(),
+            ftx1_swr_trip_samples=self.ftx1_swr_samples.value(),
+            ftx1_auto_apply_band_profiles=self.ftx1_alc_control.isChecked(),
+            ftx1_band_profiles=self._settings.ftx1_band_profiles,
             logging_level=self.logging_level.currentData(),
         )
 
@@ -208,12 +217,12 @@ class SettingsDialog(QDialog):
     def _safety_tab(self) -> QWidget:
         widget = QWidget()
         form = QFormLayout(widget)
-        self.allow_dupes = QCheckBox("Allow Worked Today duplicates")
-        self.allow_dupes.setChecked(self._settings.allow_dupes)
-        self.direct_dupes = QCheckBox("Allow duplicates only for direct callers")
-        self.direct_dupes.setChecked(self._settings.allow_direct_call_dupes)
-        self.direct_patched = QCheckBox("WSJT-X build supports AutoPilot Direct Reply")
-        self.direct_patched.setChecked(self._settings.direct_reply_patched)
+        self.dupe_policy = QComboBox()
+        self.dupe_policy.addItem("Jamais", "never")
+        self.dupe_policy.addItem("Seulement si la station m'appelle", "direct")
+        self.dupe_policy.addItem("Toujours", "all")
+        selected_dupe_policy = "all" if self._settings.allow_dupes else "direct" if self._settings.allow_direct_call_dupes else "never"
+        self.dupe_policy.setCurrentIndex(max(0, self.dupe_policy.findData(selected_dupe_policy)))
         self.blacklist = QLineEdit(", ".join(sorted(self._settings.blacklist)))
         self.ignore_minutes = QSpinBox()
         self.ignore_minutes.setRange(1, 24 * 60)
@@ -258,18 +267,22 @@ class SettingsDialog(QDialog):
         self.stagnation_unique = QSpinBox()
         self.stagnation_unique.setRange(1, 20)
         self.stagnation_unique.setValue(self._settings.stagnation_max_unique_calls)
-        self.adaptive_parity = QCheckBox("Flip TX First/Second")
+        self.adaptive_parity = QCheckBox("Essayer l'autre cycle TX avant de changer de bande")
         self.adaptive_parity.setChecked(self._settings.adaptive_parity_enabled)
         self.parity_trial = QSpinBox()
         self.parity_trial.setRange(1, 50)
         self.parity_trial.setValue(self._settings.parity_trial_failed_attempts)
-        self.auto_band_hop = QCheckBox("Automatic band hopping")
+        self.opportunity_quiet = QSpinBox()
+        self.opportunity_quiet.setRange(1, 60)
+        self.opportunity_quiet.setSuffix(" minutes")
+        self.opportunity_quiet.setValue(int(self._settings.adaptive_opportunity_quiet_minutes))
+        self.auto_band_hop = QCheckBox("Changement adaptatif : bande épuisée")
         self.auto_band_hop.setChecked(self._settings.automatic_band_hopping_enabled)
         self.band_dwell = QSpinBox()
         self.band_dwell.setRange(0, 120)
         self.band_dwell.setSuffix(" minutes")
         self.band_dwell.setValue(int(self._settings.minimum_band_dwell_minutes))
-        self.forced_band_hop = QCheckBox("Forced time-based band hopping")
+        self.forced_band_hop = QCheckBox("Rotation programmée des bandes")
         self.forced_band_hop.setChecked(self._settings.forced_band_hopping_enabled)
         self.forced_band_bands = QLineEdit(", ".join(self._settings.forced_band_hop_bands))
         self.forced_band_bands.setPlaceholderText("20m, 30m, 40m")
@@ -299,32 +312,21 @@ class SettingsDialog(QDialog):
         self.adif_path = QLineEdit(self._settings.wsjtx_log_path or str(default_adif))
         self.sync_adif = QCheckBox("Synchronize ADIF at startup")
         self.sync_adif.setChecked(self._settings.sync_adif_on_startup)
-        form.addRow(self.allow_dupes)
-        form.addRow(self.direct_dupes)
-        form.addRow(self.direct_patched)
+        form.addRow("Doublons déjà contactés aujourd'hui", self.dupe_policy)
         form.addRow("Blacklist", self.blacklist)
         form.addRow("Temporary ignore (minutes)", self.ignore_minutes)
         form.addRow("Max periods without progress", self.max_no_progress)
-        form.addRow("Stalled QSO cooldown", self.stalled_cooldown)
-        form.addRow("Remote busy cooldown", self.remote_busy_cooldown)
-        form.addRow("Remote CQ attempt limit", self.max_remote_cq)
-        form.addRow("Remote returned-to-CQ cooldown", self.remote_cq_cooldown)
-        form.addRow("Finalization hold", self.finalization_hold)
-        form.addRow("Final TX timeout", self.final_tx_timeout)
         form.addRow("Maximum final 73 retries", self.max_final_retries)
         form.addRow(self.adaptive_enabled)
-        form.addRow("Adaptive attempt window", self.stagnation_window)
-        form.addRow("Adaptive failed attempts", self.stagnation_failed)
-        form.addRow("Adaptive max repeated calls", self.stagnation_unique)
+        form.addRow("No new station before switching", self.opportunity_quiet)
         form.addRow(self.adaptive_parity)
-        form.addRow("Parity trial failures", self.parity_trial)
         form.addRow(self.auto_band_hop)
         form.addRow("Minimum band dwell", self.band_dwell)
         form.addRow(self.forced_band_hop)
-        form.addRow("Forced band-hop bands (ordered)", self.forced_band_bands)
-        form.addRow("Forced band-hop interval", self.forced_band_interval)
-        form.addRow("Forced band-hop settling", self.forced_band_settle)
-        form.addRow("Adaptive allowed bands (ordered)", band_box)
+        form.addRow("Bandes de la rotation programmée", self.forced_band_bands)
+        form.addRow("Intervalle de rotation", self.forced_band_interval)
+        form.addRow("Stabilisation après changement", self.forced_band_settle)
+        form.addRow("Bandes autorisées en adaptatif", band_box)
         form.addRow("Offline cty.dat", _path_picker(self, self.cty_path, "CTY data (*.dat);;All files (*)"))
         form.addRow("WSJT-X ADIF log", _path_picker(self, self.adif_path, "ADIF (*.adi *.adif);;All files (*)"))
         form.addRow(self.sync_adif)
@@ -343,20 +345,24 @@ class SettingsDialog(QDialog):
         if self.forced_band_hop.isChecked() and not self.settings().forced_band_hop_bands:
             QMessageBox.warning(self, "Forced band hopping", "Enter at least one ordered band before enabling forced band hopping.")
             return False
-        if self.ftx1_cat2_enabled.isChecked() and not self.ftx1_cat2_confirmed_ftx1.isChecked():
+        if self.ftx1_cat2_enabled.isChecked() and not self.ftx1_hamlib_enabled.isChecked() and not self.ftx1_cat2_confirmed_ftx1.isChecked():
             QMessageBox.warning(self, "FTX-1 CAT-2", "Confirm that this port belongs to a Yaesu FTX-1 before enabling CAT-2.")
             return False
         if self.ftx1_cat2_enabled.isChecked() and not self.ftx1_cat2_port.text().strip():
             QMessageBox.warning(self, "FTX-1 CAT-2", "Specify the FTX-1 Standard COM / CAT-2 port.")
+            return False
+        if self.ftx1_alc_min.value() > self.ftx1_alc_max.value():
+            QMessageBox.warning(self, "Hamlib ALC", "Minimum ALC must not exceed maximum ALC.")
             return False
         self.settings_applied.emit(self.settings())
         return True
 
     def _update_ap1_controls(self) -> None:
         tooltip = "Requires WSJT-X AutoPilot AP1"
+        self.adaptive_parity.setEnabled(self._ap1_available)
+        self.adaptive_parity.setToolTip(tooltip if not self._ap1_available else "")
         for control in (
-            self.adaptive_parity,
-            self.parity_trial,
+            self.opportunity_quiet,
             self.auto_band_hop,
             self.band_dwell,
             self.forced_band_hop,
@@ -364,19 +370,40 @@ class SettingsDialog(QDialog):
             self.forced_band_interval,
             self.forced_band_settle,
         ):
-            control.setEnabled(self._ap1_available)
-            control.setToolTip(tooltip if not self._ap1_available else "")
+            control.setEnabled(True)
+            control.setToolTip("")
         for checkbox in self.auto_band_checkboxes.values():
-            checkbox.setEnabled(self._ap1_available)
-            checkbox.setToolTip(tooltip if not self._ap1_available else "")
+            checkbox.setEnabled(True)
+            checkbox.setToolTip("")
 
     def _ftx1_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        cat_group = QGroupBox("FTX-1 CAT-2")
+        cat_group = QGroupBox("Radio CAT via Hamlib")
         cat_form = QFormLayout(cat_group)
-        self.ftx1_cat2_enabled = QCheckBox("Enable FTX-1 CAT-2 (Standard COM only)")
+        self.ftx1_cat2_enabled = QCheckBox("Activer le contrôle radio Hamlib")
         self.ftx1_cat2_enabled.setChecked(self._settings.ftx1_cat2_enabled)
+        self.hamlib_radio = QComboBox()
+        self.hamlib_radio.setEditable(True)
+        self.hamlib_radio.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.hamlib_radio.setMaxVisibleItems(20)
+        self.hamlib_radio.lineEdit().setPlaceholderText("Rechercher une marque ou un modèle")
+        selected_index = -1
+        for model_number, manufacturer, model_name in list_supported_radios(self._settings.ftx1_hamlib_rigctld_path):
+            self.hamlib_radio.addItem(f"{manufacturer} {model_name} (Hamlib {model_number})", model_number)
+            if model_number == self._settings.hamlib_rig_model:
+                selected_index = self.hamlib_radio.count() - 1
+        if selected_index < 0:
+            self.hamlib_radio.insertItem(
+                0,
+                f"Modèle Hamlib {self._settings.hamlib_rig_model}",
+                self._settings.hamlib_rig_model,
+            )
+            selected_index = 0
+        self.hamlib_radio.setCurrentIndex(selected_index)
+        if self.hamlib_radio.completer() is not None:
+            self.hamlib_radio.completer().setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            self.hamlib_radio.completer().setFilterMode(Qt.MatchFlag.MatchContains)
         self.ftx1_cat2_port = QLineEdit(self._settings.ftx1_cat2_port)
         self.ftx1_cat2_port.setPlaceholderText("COM5")
         self.ftx1_cat2_baudrate = QSpinBox()
@@ -387,32 +414,80 @@ class SettingsDialog(QDialog):
         self.ftx1_cat2_timeout.setSuffix(" ms")
         self.ftx1_cat2_timeout.setValue(round(self._settings.ftx1_cat2_timeout_seconds * 1000))
         cat_form.addRow(self.ftx1_cat2_enabled)
-        cat_form.addRow("Standard COM / CAT-2 port", self.ftx1_cat2_port)
+        cat_form.addRow("Poste", self.hamlib_radio)
+        cat_form.addRow("Port CAT", self.ftx1_cat2_port)
         cat_form.addRow("Baud rate", self.ftx1_cat2_baudrate)
         cat_form.addRow("CAT timeout", self.ftx1_cat2_timeout)
         layout.addWidget(cat_group)
 
-        self.ftx1_cat2_confirmed_ftx1 = QCheckBox("I confirm this CAT-2 port belongs to a Yaesu FTX-1")
+        hamlib_group = QGroupBox("Hamlib meters and protection")
+        hamlib_form = QFormLayout(hamlib_group)
+        self.ftx1_hamlib_enabled = QCheckBox()
+        self.ftx1_hamlib_enabled.setChecked(True)
+        self.ftx1_hamlib_path = QLineEdit(self._settings.ftx1_hamlib_rigctld_path)
+        self.ftx1_hamlib_path.setPlaceholderText("Automatic detection (Hamlib 4.7.1)")
+        self.ftx1_hamlib_tcp_port = QSpinBox()
+        self.ftx1_hamlib_tcp_port.setRange(1_024, 65_535)
+        self.ftx1_hamlib_tcp_port.setValue(self._settings.ftx1_hamlib_tcp_port)
+        self.ftx1_meter_poll = QDoubleSpinBox()
+        self.ftx1_meter_poll.setRange(0.2, 5.0)
+        self.ftx1_meter_poll.setDecimals(1)
+        self.ftx1_meter_poll.setSingleStep(0.1)
+        self.ftx1_meter_poll.setSuffix(" s")
+        self.ftx1_meter_poll.setValue(self._settings.ftx1_meter_poll_seconds)
+
+        self.ftx1_alc_control = QCheckBox("Automatic bidirectional ALC control")
+        self.ftx1_alc_control.setChecked(self._settings.ftx1_alc_control_enabled)
+        self.ftx1_alc_min = QDoubleSpinBox()
+        self.ftx1_alc_min.setRange(0.0, 1.0)
+        self.ftx1_alc_min.setDecimals(2)
+        self.ftx1_alc_min.setSingleStep(0.01)
+        self.ftx1_alc_min.setValue(self._settings.ftx1_alc_minimum)
+        self.ftx1_alc_max = QDoubleSpinBox()
+        self.ftx1_alc_max.setRange(0.0, 1.0)
+        self.ftx1_alc_max.setDecimals(2)
+        self.ftx1_alc_max.setSingleStep(0.01)
+        self.ftx1_alc_max.setValue(self._settings.ftx1_alc_maximum)
+        self.ftx1_alc_step = QSpinBox()
+        self.ftx1_alc_step.setRange(1, 50)
+        self.ftx1_alc_step.setValue(self._settings.ftx1_alc_attenuation_step)
+        hamlib_form.addRow(self.ftx1_alc_control)
+
+        self.ftx1_swr_protection = QCheckBox("SWR safety: Halt TX and disarm")
+        self.ftx1_swr_protection.setChecked(self._settings.ftx1_swr_protection_enabled)
+        self.ftx1_swr_limit = QDoubleSpinBox()
+        self.ftx1_swr_limit.setRange(1.1, 5.0)
+        self.ftx1_swr_limit.setDecimals(1)
+        self.ftx1_swr_limit.setSingleStep(0.1)
+        self.ftx1_swr_limit.setValue(self._settings.ftx1_swr_limit)
+        self.ftx1_swr_samples = QSpinBox()
+        self.ftx1_swr_samples.setRange(1, 10)
+        self.ftx1_swr_samples.setValue(self._settings.ftx1_swr_trip_samples)
+        hamlib_form.addRow(self.ftx1_swr_protection)
+        hamlib_form.addRow("SWR trip threshold", self.ftx1_swr_limit)
+        hamlib_form.addRow(QLabel("Les délais, intervalles et seuils internes sont gérés automatiquement."))
+        layout.addWidget(hamlib_group)
+
+        self.ftx1_cat2_confirmed_ftx1 = QCheckBox("Mode CAT direct ancien : je confirme que le poste est un FTX-1")
         self.ftx1_cat2_confirmed_ftx1.setChecked(self._settings.ftx1_cat2_confirmed_ftx1)
-        cat_form.addRow(self.ftx1_cat2_confirmed_ftx1)
+        self.ftx1_cat2_confirmed_ftx1.setVisible(False)
         profiles_group = QGroupBox("FTX-1 Band Drive")
         profiles_layout = QVBoxLayout(profiles_group)
         self.ftx1_auto_apply_band_profiles = QCheckBox("Auto Apply profiles after a band change")
         self.ftx1_auto_apply_band_profiles.setChecked(self._settings.ftx1_auto_apply_band_profiles)
         profiles_layout.addWidget(self.ftx1_auto_apply_band_profiles)
-        profiles_layout.addWidget(QLabel("Leave both values empty to omit a band profile."))
-        profiles = QTableWidget(11, 3)
+        profiles_layout.addWidget(QLabel("USB MOD GAIN reste manuel sur le poste. Laisser vide pour omettre la bande."))
+        profiles = QTableWidget(11, 2)
         self.ftx1_profiles_table = profiles
-        profiles.setHorizontalHeaderLabels(["Band", "USB MOD GAIN", "TX audio attenuation"])
+        profiles.setHorizontalHeaderLabels(["Band", "TX audio attenuation"])
         profiles.verticalHeader().hide()
         profiles.verticalHeader().setDefaultSectionSize(34)
         header = profiles.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         profiles.setColumnWidth(0, 90)
-        profiles.setColumnWidth(1, 200)
-        profiles.setColumnWidth(2, 220)
+        profiles.setColumnWidth(1, 300)
         profiles.setMinimumWidth(540)
         profiles.setMaximumHeight(330)
         self.ftx1_profile_fields = {}
@@ -420,48 +495,57 @@ class SettingsDialog(QDialog):
             band_item = QTableWidgetItem(band)
             band_item.setFlags(band_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             profiles.setItem(row, 0, band_item)
-            gain = QLineEdit()
-            gain.setValidator(QIntValidator(0, 100, gain))
-            gain.setPlaceholderText("0-100")
-            gain.setMinimumHeight(max(30, gain.sizeHint().height()))
-            gain.setMinimumWidth(180)
             attenuation = QLineEdit()
             attenuation.setValidator(QIntValidator(0, 450, attenuation))
             attenuation.setPlaceholderText("0-450")
             attenuation.setMinimumHeight(max(30, attenuation.sizeHint().height()))
             attenuation.setMinimumWidth(200)
             configured = self._settings.ftx1_band_profiles.get(band, {})
-            if "usb_mod_gain" in configured:
-                gain.setText(str(configured["usb_mod_gain"]))
             if "tx_audio_attenuation" in configured:
                 attenuation.setText(str(configured["tx_audio_attenuation"]))
-            profiles.setCellWidget(row, 1, gain)
-            profiles.setCellWidget(row, 2, attenuation)
-            self.ftx1_profile_fields[band] = (gain, attenuation)
+            profiles.setCellWidget(row, 1, attenuation)
+            self.ftx1_profile_fields[band] = attenuation
         profiles_layout.addWidget(profiles)
         layout.addWidget(profiles_group)
-        note = QLabel("FTX-1 only. CAT-2 uses no RTS/DTR PTT.")
+        profiles_group.setVisible(False)
+        note = QLabel("Hamlib assure la compatibilité radio. Aucun réglage USB MOD GAIN n'est modifié.")
         note.setWordWrap(True)
         layout.addWidget(note)
         layout.addStretch()
         self.ftx1_cat2_enabled.toggled.connect(self._update_ftx1_controls)
         self.ftx1_cat2_confirmed_ftx1.toggled.connect(self._update_ftx1_controls)
+        self.ftx1_hamlib_enabled.toggled.connect(self._update_ftx1_controls)
         self._update_ftx1_controls()
         return widget
 
     def _update_ftx1_controls(self) -> None:
         enabled = self.ftx1_cat2_enabled.isChecked()
-        confirmed = enabled and self.ftx1_cat2_confirmed_ftx1.isChecked()
-        self.ftx1_cat2_confirmed_ftx1.setEnabled(enabled)
+        hamlib_enabled = enabled and self.ftx1_hamlib_enabled.isChecked()
+        confirmed = enabled and (hamlib_enabled or self.ftx1_cat2_confirmed_ftx1.isChecked())
+        self.ftx1_cat2_confirmed_ftx1.setEnabled(enabled and not hamlib_enabled)
         for control in (
             self.ftx1_cat2_port,
+            self.hamlib_radio,
             self.ftx1_cat2_baudrate,
             self.ftx1_cat2_timeout,
         ):
             control.setEnabled(enabled)
+        self.ftx1_hamlib_enabled.setEnabled(enabled)
+        for control in (
+            self.ftx1_hamlib_path,
+            self.ftx1_hamlib_tcp_port,
+            self.ftx1_meter_poll,
+            self.ftx1_alc_control,
+            self.ftx1_alc_min,
+            self.ftx1_alc_max,
+            self.ftx1_alc_step,
+            self.ftx1_swr_protection,
+            self.ftx1_swr_limit,
+            self.ftx1_swr_samples,
+        ):
+            control.setEnabled(hamlib_enabled)
         self.ftx1_auto_apply_band_profiles.setEnabled(confirmed)
-        for gain, attenuation in self.ftx1_profile_fields.values():
-            gain.setEnabled(confirmed)
+        for attenuation in self.ftx1_profile_fields.values():
             attenuation.setEnabled(confirmed)
 
     def _diagnostic_tab(self) -> QWidget:
@@ -540,6 +624,7 @@ class MainWindow(QMainWindow):
         self.reset_all_ftx1_band_profiles_requested.connect(self._worker.reset_all_ftx1_band_profiles)
         self._worker.connection_changed.connect(self._show_connection)
         self._worker.armed_changed.connect(self._show_armed)
+        self._worker.swr_safety_triggered.connect(self._show_swr_safety_notification)
         self._worker.activity_received.connect(self._add_activity)
         self._worker.engine_event.connect(self._handle_engine_event)
         self._worker.status_changed.connect(self._show_status)
@@ -572,12 +657,16 @@ class MainWindow(QMainWindow):
         self.mode = QLabel("-")
         settings_button = QPushButton("PREFERENCES")
         settings_button.clicked.connect(self._edit_settings)
+        self.antenna_indicator = QLabel("●  OK")
+        self.antenna_indicator.setObjectName("antennaSafety")
+        self.antenna_indicator.setProperty("level", "ok")
         self.arm_button = QPushButton("ARM CONTROL")
         self.arm_button.setObjectName("armButton")
         self.arm_button.clicked.connect(self._toggle_arm)
         header.addWidget(self.connection)
         header.addWidget(self.frequency)
         header.addWidget(self.mode)
+        header.addWidget(self.antenna_indicator)
         header.addWidget(settings_button)
         header.addWidget(self.arm_button)
         layout.addLayout(header)
@@ -612,7 +701,7 @@ class MainWindow(QMainWindow):
         self.delete_ftx1_current_band_profile_button = QPushButton("DELETE CURRENT BAND PROFILE")
         self.delete_ftx1_current_band_profile_button.clicked.connect(self.delete_ftx1_current_band_profile_requested.emit)
         self.delete_ftx1_current_band_profile_button.setVisible(False)
-        self.reset_all_ftx1_band_profiles_button = QPushButton("RESET ALL BAND PROFILES")
+        self.reset_all_ftx1_band_profiles_button = QPushButton("RÉINITIALISER APPRENTISSAGE ALC")
         self.reset_all_ftx1_band_profiles_button.clicked.connect(self.reset_all_ftx1_band_profiles_requested.emit)
         self.reset_all_ftx1_band_profiles_button.setVisible(False)
         controls_row = QHBoxLayout()
@@ -629,6 +718,20 @@ class MainWindow(QMainWindow):
         adaptive_layout.addLayout(operational_row)
         adaptive_layout.addLayout(controls_row)
         layout.addWidget(adaptive)
+
+        antenna_panel = QFrame()
+        antenna_panel.setObjectName("panel")
+        antenna_layout = QVBoxLayout(antenna_panel)
+        antenna_layout.setContentsMargins(10, 6, 10, 6)
+        antenna_title = QLabel("SÉCURITÉ ANTENNE")
+        antenna_title.setObjectName("panelTitle")
+        self.antenna_log = QPlainTextEdit()
+        self.antenna_log.setReadOnly(True)
+        self.antenna_log.setMaximumHeight(82)
+        self.antenna_log.setPlaceholderText("Aucun incident SWR pendant cette session.")
+        antenna_layout.addWidget(antenna_title)
+        antenna_layout.addWidget(self.antenna_log)
+        layout.addWidget(antenna_panel)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._activity_panel())
@@ -779,6 +882,15 @@ class MainWindow(QMainWindow):
         LOGGER.info("[GUI] ARM state update armed=%s", armed)
         LOGGER.info("[GUI] control state backend_armed=%s ui_armed=%s", armed, self._armed)
 
+    def _show_swr_safety_notification(self, message: str) -> None:
+        QMessageBox.critical(
+            self,
+            "Protection SWR — AutoPilot désarmé",
+            "AutoPilot a arrêté l’émission et s’est désarmé.\n\n"
+            f"{message}\n\n"
+            "Vérifiez l’antenne et l’accord avant de réarmer.",
+        )
+
     def _show_status(self, status: StatusView) -> None:
         self.frequency.setText(status.frequency)
         self.mode.setText(status.mode)
@@ -816,28 +928,57 @@ class MainWindow(QMainWindow):
             self.tx_period_status.setText(f"TX period: {text}" + (" (Auto)" if requested is not None else ""))
         self.band_status.setText(f"Band: {current_band}")
         self.next_band_status.setText(f"Next adaptive band: {snapshot.get('next_band') or '—'}")
+        antenna = snapshot.get("antenna_safety")
+        if isinstance(antenna, dict):
+            level = str(antenna.get("level") or "ok")
+            labels = {
+                "ok": "●  OK",
+                "warning": "⚠  SWR CORRIGÉ",
+                "fault": "▲  !  ARRÊT SWR",
+            }
+            if antenna.get("recovering"):
+                labels["warning"] = "⚠  ACCORD EN COURS"
+            excluded = tuple(antenna.get("excluded_bands") or ())
+            suffix = f"  ({', '.join(excluded)} exclue{'s' if len(excluded) > 1 else ''})" if excluded else ""
+            self.antenna_indicator.setText(labels.get(level, labels["ok"]) + suffix)
+            self.antenna_indicator.setProperty("level", level)
+            self.antenna_indicator.style().unpolish(self.antenna_indicator)
+            self.antenna_indicator.style().polish(self.antenna_indicator)
+            events = tuple(antenna.get("events") or ())
+            rendered = "\n".join(events[-6:])
+            if self.antenna_log.toPlainText() != rendered:
+                self.antenna_log.setPlainText(rendered)
+                self.antenna_log.verticalScrollBar().setValue(self.antenna_log.verticalScrollBar().maximum())
         ftx1 = snapshot.get("ftx1")
         if isinstance(ftx1, dict):
             ftx1_band = ftx1.get("band") or current_band
-            saved_usb = ftx1.get("saved_usb_mod_gain")
+            radio_model = str(ftx1.get("radio_model") or "Radio")
             saved_att = ftx1.get("saved_tx_audio_attenuation")
+            po = ftx1.get("power_watts")
+            requested_po = ftx1.get("requested_power_watts")
+            power_text = (
+                f"PO {float(po):.1f}/{float(requested_po):.0f} W | "
+                if po is not None and requested_po is not None
+                else f"PO {float(po):.1f} W | " if po is not None else ""
+            )
             profile_text = (
-                f"Saved USB {saved_usb} / ATT {saved_att}"
-                if saved_usb is not None and saved_att is not None
+                f"ATT mémorisée {saved_att}"
+                if saved_att is not None
                 else "No profile"
             )
             self.ftx1_status.setText(
-                f"FTX-1: {'Connected' if ftx1.get('connected') else 'Disconnected'} | "
-                f"USB {ftx1.get('current_usb_mod_gain') if ftx1.get('current_usb_mod_gain') is not None else '—'} | "
+                f"{radio_model}: {'Connectée' if ftx1.get('connected') else 'Déconnectée'} | "
+                f"ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} | "
+                f"{power_text}ALC {float(ftx1['alc']):.2f} / SWR {float(ftx1['swr']):.1f} | {profile_text}"
+                if ftx1.get("alc") is not None and ftx1.get("swr") is not None
+                else
+                f"{radio_model}: {'Connectée' if ftx1.get('connected') else 'Déconnectée'} | "
                 f"ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} | {profile_text}"
             )
             self.ftx1_status.setVisible(True)
-            self.save_ftx1_current_band_profile_button.setVisible(True)
-            self.delete_ftx1_current_band_profile_button.setVisible(True)
+            self.save_ftx1_current_band_profile_button.setVisible(False)
+            self.delete_ftx1_current_band_profile_button.setVisible(False)
             self.reset_all_ftx1_band_profiles_button.setVisible(True)
-            controls_enabled = bool(ftx1.get("connected")) and current_band != "—"
-            self.save_ftx1_current_band_profile_button.setEnabled(controls_enabled)
-            self.delete_ftx1_current_band_profile_button.setEnabled(controls_enabled)
         else:
             self.ftx1_status.setVisible(False)
             self.save_ftx1_current_band_profile_button.setVisible(False)
@@ -954,6 +1095,11 @@ class MainWindow(QMainWindow):
             #adaptiveUnavailable { color: #efbd67; font-weight: 700; }
             #infoText { color: #8299a8; padding: 5px; }
             #qsoState { color: #70dfbd; font-size: 15px; font-weight: 800; padding: 2px 8px; }
+            #antennaSafety { border-radius: 12px; padding: 6px 10px; font-weight: 900; }
+            #antennaSafety[level='ok'] { background: #173b63; color: #8dccff; border: 1px solid #3479b9; }
+            #antennaSafety[level='warning'] { background: #59420f; color: #ffd76a; border: 1px solid #b78718; }
+            #antennaSafety[level='fault'] { background: #671e24; color: #ffffff; border: 1px solid #e34f5b; }
+            QPlainTextEdit { background: #0d151b; border: 1px solid #20303b; color: #c8d2d9; padding: 4px; }
             QLineEdit, QSpinBox, QComboBox { background: #111b22; border: 1px solid #30424d; border-radius: 3px; padding: 6px; }
             QGroupBox { border: 1px solid #263640; border-radius: 4px; margin-top: 10px; padding: 8px; font-weight: 700; }
             QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; color: #9db0bc; }

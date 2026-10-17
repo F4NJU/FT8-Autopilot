@@ -64,6 +64,18 @@ class WorkedTodayService:
     def count(self, qso_date: date) -> int:
         return self.store.count_for_date(qso_date)
 
+    def bootstrap(self, qso_date: date) -> tuple[int, int]:
+        """Build the current-day index from all persisted QSO rows before RX starts."""
+        self._load_date(qso_date)
+        qso_count = self.store.count_for_date(qso_date)
+        LOGGER.info(
+            "[WORKED] bootstrap date=%s qsos=%d unique_call_band=%d source=database",
+            qso_date.isoformat(),
+            qso_count,
+            len(self._keys),
+        )
+        return qso_count, len(self._keys)
+
     def refresh(self) -> None:
         self._cache_date = None
         self._keys.clear()

@@ -45,6 +45,13 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Qt's Windows build imports the unsuffixed ICU API provided by Windows.
+# A foreign ICU build found on PATH (for example Poppler's versioned ICU)
+# exports different symbols and makes QtWidgets fail with "procedure not found".
+a.binaries = [
+    binary for binary in a.binaries
+    if Path(binary[0]).name.lower() not in {"icuuc.dll", "icudt78.dll"}
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(

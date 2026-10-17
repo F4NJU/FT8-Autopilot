@@ -111,6 +111,8 @@ def test_nine_locator_repeats_do_not_abort_but_tenth_stalls(caplog) -> None:
     assert any(isinstance(parse_datagram(data), HaltTxPacket) for data, _ in transport.sent)
     assert app.control.actions_used == 1
     assert app.control.armed  # type: ignore[attr-defined]
+    assert app.stagnation.failed_attempts == 1
+    assert app.stagnation.snapshot()[0]["outcome"] == "STALLED"
     assert "state CALLING_STATION -> ABORTED reason=QSO stalled" in caplog.text
     assert "state ABORTED -> IDLE reason=session reset" in caplog.text
 

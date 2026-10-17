@@ -213,7 +213,7 @@ def main() -> None:
     LOGGER.info("[PATHS] database=%s", config.worked_store_path)
     _synchronize_wsjtx_log(config, worked_service, paths)
     today = datetime.now(timezone.utc).date()
-    LOGGER.info("[WORKED] loaded %d QSOs for UTC date %s", worked_service.count(today), today.isoformat())
+    worked_service.bootstrap(today)
     LOGGER.info("[WORKED] duplicate policy: same callsign + same band + same UTC day%s", " (override enabled)" if config.allow_dupes else "")
     try:
         if args.replay is not None:

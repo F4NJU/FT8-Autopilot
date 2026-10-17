@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, auto
 
 
@@ -91,3 +91,81 @@ class StagnationTracker:
             self.failed_attempts >= self.minimum_failed
             and self.unique_calls <= self.maximum_unique_calls
         )
+
+
+class BandOpportunityTracker:
+    """Track distinct, currently useful CQ stations on one band and TX cycle."""
+
+    def __init__(self, observation_seconds: float = 600.0) -> None:
+        self.observation = timedelta(seconds=max(1.0, observation_seconds))
+        self.band: str | None = None
+        self.mode: str | None = None
+        self.started_at: datetime | None = None
+        self.last_viable_at: datetime | None = None
+        self.heard: dict[str, datetime] = {}
+        self.worked: set[str] = set()
+        self.unavailable_until: dict[str, datetime] = {}
+
+    def reset(self, band: str | None, mode: str | None, now: datetime) -> None:
+        self.band = band
+        self.mode = mode
+        self.started_at = now
+        self.last_viable_at = None
+        self.heard.clear()
+        self.worked.clear()
+        self.unavailable_until.clear()
+
+    def ensure_context(self, band: str | None, mode: str | None, now: datetime) -> None:
+        if self.started_at is None or band != self.band or mode != self.mode:
+            self.reset(band, mode, now)
+
+    def is_unavailable(self, callsign: str, now: datetime) -> bool:
+        return self.unavailable_until.get(callsign.upper(), now) > now
+
+    def observe(self, callsign: str, now: datetime, *, worked: bool = False) -> None:
+        station = callsign.upper()
+        self._prune(now)
+        self.heard[station] = now
+        if worked:
+            self.worked.add(station)
+        elif station not in self.worked and not self.is_unavailable(station, now):
+            self.last_viable_at = now
+
+    def mark_worked(self, callsign: str) -> None:
+        self.worked.add(callsign.upper())
+
+    def mark_unavailable(self, callsign: str, now: datetime, seconds: float) -> None:
+        station = callsign.upper()
+        self.unavailable_until[station] = now + timedelta(seconds=max(0.0, seconds))
+
+    def exhausted(self, now: datetime) -> bool:
+        self._prune(now)
+        return len(self.heard) >= 2 and all(
+            station in self.worked or self.is_unavailable(station, now)
+            for station in self.heard
+        )
+
+    def quiet(self, now: datetime, seconds: float) -> bool:
+        anchor = self.last_viable_at or self.started_at
+        return anchor is not None and now - anchor >= timedelta(seconds=max(1.0, seconds))
+
+    def snapshot(self, now: datetime) -> dict[str, object]:
+        self._prune(now)
+        available = [
+            station for station in self.heard
+            if station not in self.worked and not self.is_unavailable(station, now)
+        ]
+        return {
+            "heard": len(self.heard),
+            "worked": sum(station in self.worked for station in self.heard),
+            "unreachable": sum(self.is_unavailable(station, now) for station in self.heard),
+            "available": available,
+            "last_viable_at": self.last_viable_at.isoformat() if self.last_viable_at else None,
+        }
+
+    def _prune(self, now: datetime) -> None:
+        cutoff = now - self.observation
+        self.heard = {station: seen for station, seen in self.heard.items() if seen >= cutoff}
+        self.unavailable_until = {
+            station: until for station, until in self.unavailable_until.items() if until > now
+        }

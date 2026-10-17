@@ -13,6 +13,7 @@ from wsjtx_autopilot.worked.adif import detect_wsjtx_log, import_adif
 from wsjtx_autopilot.worked.bands import BandResolver
 from wsjtx_autopilot.worked.service import WorkedTodayService
 from wsjtx_autopilot.worked.store import WorkedQsoStore
+from wsjtx_autopilot.worked.sync import synchronize_adif
 from wsjtx_autopilot.wsjtx.models import DecodePacket, PacketHeader, QsoLoggedPacket, StatusPacket
 
 TODAY = date(2026, 8, 24)
@@ -232,6 +233,98 @@ def test_store_persists_across_restart(tmp_path: Path) -> None:
         record(store)
     with WorkedQsoStore(path) as reopened:
         assert WorkedTodayService(reopened).check("YO6LM", 14_074_000, NOW).duplicate
+
+
+def test_restart_bootstrap_blocks_real_sq100pkp_30m_regression(tmp_path: Path) -> None:
+    path = tmp_path / "worked.sqlite3"
+    with WorkedQsoStore(path) as first_process:
+        assert first_process.record(TODAY, "SQ100PKP", "30m", "FT8", 10_136_000, NOW, "WSJTX_QSOLOGGED")
+
+    with WorkedQsoStore(path) as restarted_store:
+        service = WorkedTodayService(restarted_store)
+        assert service.bootstrap(TODAY) == (1, 1)
+        control = SpyControl()
+        app = AutopilotRuntime(
+            replace(AppConfig(), candidate_collection_seconds=0),
+            control=control,
+            worked_service=service,
+        )
+        app.handle(status(10_136_000), NOW, ENDPOINT)
+
+        action = app.handle(decode("CQ SQ100PKP"), NOW + timedelta(hours=3), ENDPOINT)
+
+        assert action is None
+        assert control.sent == []
+
+
+def test_existing_adif_record_bootstraps_even_when_import_adds_nothing(tmp_path: Path, caplog) -> None:
+    caplog.set_level("INFO")
+    adif = tmp_path / "wsjtx_log.adi"
+    adif.write_text(
+        "<CALL:8>SQ100PKP<QSO_DATE:8>20260824<BAND:3>30m<MODE:3>FT8<EOR>\n",
+        encoding="ascii",
+    )
+    with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
+        first = synchronize_adif(adif, WorkedTodayService(store))
+        assert first is not None and first.records_added == 1
+
+        restarted = WorkedTodayService(store)
+        second = synchronize_adif(adif, restarted)
+        assert second is not None
+        assert second.records_seen == 1
+        assert second.records_added == 0
+        assert second.records_existing == 1
+
+        assert restarted.bootstrap(TODAY) == (1, 1)
+        assert restarted.check("SQ100PKP", 10_136_000, NOW).duplicate
+        assert "[WORKED] bootstrap date=2026-08-24 qsos=1 unique_call_band=1 source=database" in caplog.text
+
+
+def test_bootstrap_keeps_same_call_available_on_another_band(tmp_path: Path) -> None:
+    with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
+        assert store.record(TODAY, "SQ100PKP", "30m", "FT8", 10_136_000, NOW, "test")
+        service = WorkedTodayService(store)
+        service.bootstrap(TODAY)
+
+        assert not service.check("SQ100PKP", 14_074_000, NOW).duplicate
+
+
+def test_bootstrap_does_not_load_previous_utc_date(tmp_path: Path) -> None:
+    with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
+        assert store.record(TODAY - timedelta(days=1), "SQ100PKP", "30m", "FT8", 10_136_000, NOW, "test")
+        service = WorkedTodayService(store)
+
+        assert service.bootstrap(TODAY) == (0, 0)
+        assert not service.check("SQ100PKP", 10_136_000, NOW).duplicate
+
+
+def test_live_qso_logged_then_restart_rebuilds_same_worked_key(tmp_path: Path) -> None:
+    path = tmp_path / "worked.sqlite3"
+    with WorkedQsoStore(path) as store:
+        live_service = WorkedTodayService(store)
+        assert live_service.record_qso_logged(logged("SQ100PKP", 10_136_000))
+        assert live_service.check("SQ100PKP", 10_136_000, NOW).duplicate
+
+    with WorkedQsoStore(path) as restarted_store:
+        restarted_service = WorkedTodayService(restarted_store)
+        restarted_service.bootstrap(TODAY)
+
+        assert restarted_service.check("SQ100PKP", 10_136_000, NOW).duplicate
+
+
+def test_adif_missing_band_uses_frequency_for_30m_bootstrap(tmp_path: Path) -> None:
+    adif = tmp_path / "wsjtx_log.adi"
+    adif.write_text(
+        "<CALL:8>SQ100PKP<QSO_DATE:8>20260824<FREQ:6>10.136<MODE:3>FT8<EOR>\n",
+        encoding="ascii",
+    )
+    with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
+        service = WorkedTodayService(store)
+        result = synchronize_adif(adif, service)
+        assert result is not None and result.records_added == 1
+        service.bootstrap(TODAY)
+
+        assert service.check("SQ100PKP", 10_136_000, NOW).duplicate
 
 
 def test_adif_import_is_idempotent_and_derives_band_from_frequency(tmp_path: Path) -> None:

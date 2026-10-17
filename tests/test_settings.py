@@ -3,6 +3,15 @@ import json
 from wsjtx_autopilot.config import ActivityPolicy, DirectCallPolicy, SettingsStore, UserSettings
 
 
+def test_legacy_alc_target_is_migrated_to_power_correlated_reference() -> None:
+    settings = UserSettings(ftx1_alc_minimum=0.02, ftx1_alc_maximum=0.08)
+
+    settings.normalize()
+
+    assert settings.ftx1_alc_minimum == 0.23
+    assert settings.ftx1_alc_maximum == 0.30
+
+
 def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     path = tmp_path / "settings.json"
     store = SettingsStore(path)
@@ -68,7 +77,8 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     assert loaded.ftx1_cat2_baudrate == 38_400
     assert loaded.ftx1_cat2_timeout_seconds == 0.4
     assert loaded.ftx1_auto_apply_band_profiles
-    assert loaded.ftx1_band_profiles == {"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}, "40m": {"usb_mod_gain": 32, "tx_audio_attenuation": 145}}
+    assert loaded.ftx1_band_profiles == {"20m": {"tx_audio_attenuation": 118}, "40m": {"tx_audio_attenuation": 145}}
+    assert "usb_mod_gain" not in payload["ftx1_band_profiles"]["20m"]
     assert "armed" not in payload
 
 
@@ -126,4 +136,4 @@ def test_ftx1_profiles_ignore_legacy_learning_data(tmp_path) -> None:
     store.path.write_text('{"ftx1_auto_drive_enabled": true, "ftx1_drive_calibrations": {"20m/50": {"usb_mod_gain": 36}}, "ftx1_band_profiles": {"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}}}', encoding="utf-8")
     loaded = store.load()
 
-    assert loaded.ftx1_band_profiles == {"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}}
+    assert loaded.ftx1_band_profiles == {"20m": {"tx_audio_attenuation": 118}}

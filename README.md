@@ -24,13 +24,19 @@ WSJT-X UDP message.
 
 - CQ and addressed direct callers are selected using freshness, confidence,
   duplicate, blacklist, DXCC, continent, activity, and signal rules.
+- A fresh direct caller has priority over an unanswered queued CQ when it is
+  safe to switch. It never preempts a progressed QSO, an active transmission,
+  or terminal-message finalization.
 - A selected station receives a standard UDP Reply. WSJT-X alone manages TX
   audio DF and Hold Tx Freq behavior.
 - Autopilot does not scan for a free TX slot, set TX DF, lock TX DF, restore TX
   DF, or disarm because TX DF changes.
 - QSO lifecycle, terminal-message retries, pending direct callers, and safety
   checks remain active.
-- Adaptive band hopping can request a new dial frequency after a safe RX transition.
+- Adaptive hopping tracks the useful station pool on the current band instead
+  of relying on a fixed failure counter. It can try the other TX cycle first,
+  then request a new dial frequency after a safe RX transition when the useful
+  pool is exhausted.
 - Optional forced time-based hopping cycles the configured ordered bands only
   while idle, confirms each AP1 frequency change from WSJT-X Status, and
   pauses new calls while the new band settles.
@@ -72,24 +78,31 @@ The GUI stores settings as JSON using the existing naming convention:
 `auto_hop_band_frequencies` and the standard FT8 frequency map with adaptive
 hopping, but does not inherit adaptive hopping's band list. Forced hopping
 defaults to disabled, a 10-minute dwell, and a 30-second post-confirmation
-settle period. For TX safety, each forced-hop destination needs a saved FTX-1
-band-drive profile and `ftx1_auto_apply_band_profiles=true`: the profile's USB
-MOD GAIN is applied, then its WSJT-X attenuation is explicitly confirmed by an
+settle period. Frequency changes are sent through Hamlib. When automatic drive
+profiles are enabled, the destination's WSJT-X attenuation is explicitly confirmed by an
 AP1 type-23 state packet before settling begins. A missing or unconfirmed
 destination profile leaves automatic TX blocked while RX continues.
 
-## FTX-1 CAT-2
+## Radio control through Hamlib
 
-These features are FTX-1-specific. CAT-2 is opt-in and uses only the FTX-1
-Standard COM/CAT-2 port. It never uses the WSJT-X CAT port or sends PTT.
-Per-band manual profiles retain:
+Radio control is opt-in. Select the Hamlib model number, CAT port and baud rate.
+Frequency, PTT safety, ALC, SWR, RF power and tuner commands use Hamlib whenever
+the selected backend exposes them. The radio is identified at startup when its
+CAT protocol supports identification; otherwise the selected Hamlib model is
+used as the compatibility boundary. Per-band profiles retain only the effective
+WSJT-X audio attenuation; the legacy `usb_mod_gain` JSON field is ignored and
+kept only for settings compatibility.
 
-- `usb_mod_gain`
 - `tx_audio_attenuation`
 
 Use SAVE CURRENT BAND, DELETE CURRENT BAND PROFILE, RESET ALL BAND PROFILES,
-and AUTO APPLY BAND PROFILES to manage profiles. There is no automatic drive
-learning, ALC/PO measurement, plateau search, backoff, or TX-time drive change.
+and AUTO APPLY BAND PROFILES to manage profiles. AutoPilot never reads or writes
+USB MOD GAIN. Hamlib reads ALC, SWR and RF power when supported. AutoPilot corrects audio
+attenuation in both directions after each measured TX period. Consecutive SWR
+readings over the configured limit immediately halt TX, disarm AutoPilot, and
+raise the red antenna-safety alert. Automatic tuner recovery and automatic band
+exclusion are currently disabled; a safety trip never starts a TUNE command or
+changes band.
 See [docs/FTX1_CAT2.md](docs/FTX1_CAT2.md).
 
 ## Known limitations
@@ -102,6 +115,9 @@ See [docs/FTX1_CAT2.md](docs/FTX1_CAT2.md).
   locator received in WSJT-X Status.
 - AutoPilot does not select a free TX slot or set, lock, or restore TX DF;
   WSJT-X remains responsible for those controls.
+- Meter availability and units depend on the selected radio and Hamlib backend.
+  ALC regulation and SWR protection should only be enabled after validating the
+  reported values on the connected station.
 
 ## Build and test
 

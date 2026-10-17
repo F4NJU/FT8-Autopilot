@@ -319,8 +319,16 @@ class WsjtxUdpControl:
         continuation_allowed = (
             self._max_actions is not None and self._actions_used >= self._max_actions
         )
-        if (not self._armed and not continuation_allowed) or not self._direct_reply_patched:
-            LOGGER.warning("[FINALIZE] retry rejected armed=%s direct_patch=%s", self._armed, self._direct_reply_patched)
+        session = self._sessions.get(decode.instance_id)
+        direct_reply_available = bool(
+            self._direct_reply_patched or (session is not None and session.ap1_controls_available)
+        )
+        if (not self._armed and not continuation_allowed) or not direct_reply_available:
+            LOGGER.warning(
+                "[FINALIZE] retry rejected armed=%s ap1_available=%s",
+                self._armed,
+                bool(session is not None and session.ap1_controls_available),
+            )
             return False
         if not decode.is_new or decode.low_confidence or decode.off_air or decode.source_endpoint is None:
             LOGGER.warning("[FINALIZE] retry rejected unsafe Decode")
@@ -333,7 +341,6 @@ class WsjtxUdpControl:
         ):
             LOGGER.warning("[FINALIZE] retry rejected non-terminal Decode message=%s", decode.message)
             return False
-        session = self._sessions.get(decode.instance_id)
         key = self._decode_key(decode)
         if (
             session is None
@@ -388,19 +395,22 @@ class WsjtxUdpControl:
         parsed = parse_ft8_message(decode.message)
         if parsed is None:
             return "ambiguous source Decode"
+        session = self._sessions.get(decode.instance_id)
         if action.kind is ActionKind.CQ_REPLY:
             if parsed.kind not in {MessageKind.CQ, MessageKind.QRZ}:
                 return "CQ Reply is restricted to CQ/QRZ Decodes"
         else:
-            if not self._direct_reply_patched:
-                return "connected WSJT-X is not declared Direct Reply patched"
+            if not (
+                self._direct_reply_patched
+                or (session is not None and session.ap1_controls_available)
+            ):
+                return "connected WSJT-X does not advertise AP1 Direct Reply support"
             if parsed.kind in {MessageKind.CQ, MessageKind.QRZ} or not parsed.is_addressed_to(self._local_callsign):
                 return "Direct Reply requires a Decode addressed to the local callsign"
         if parsed.sender != action.station:
             return "selected station does not match source Decode"
         if decode.schema not in SUPPORTED_SCHEMAS:
             return "unsupported schema"
-        session = self._sessions.get(decode.instance_id)
         if session is None:
             return "unknown WSJT-X instance"
         if session.schema != decode.schema:

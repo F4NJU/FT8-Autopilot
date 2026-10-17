@@ -9,7 +9,7 @@ from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, IntendedAction
 from wsjtx_autopilot.engine.state import QsoState
-from wsjtx_autopilot.runtime import AutopilotRuntime
+from wsjtx_autopilot.runtime import AutopilotRuntime, PendingDialFrequency
 from wsjtx_autopilot.wsjtx.models import DecodePacket, PacketHeader, StatusPacket
 from wsjtx_autopilot.wsjtx.protocol import MAGIC, parse_datagram
 
@@ -26,7 +26,7 @@ class CollectingControl(DryRunControl):
         return self.outcome
 
 
-def status(dx_call: str = "CX6TU", tx_enabled: bool = False) -> StatusPacket:
+def status(dx_call: str = "CX6TU", tx_enabled: bool = False, tr_period: int = 15) -> StatusPacket:
     return StatusPacket(
         PacketHeader(2, 1, "WSJT-X"),
         14_074_000,
@@ -47,7 +47,7 @@ def status(dx_call: str = "CX6TU", tx_enabled: bool = False) -> StatusPacket:
         False,
         0,
         0xFFFFFFFF,
-        15,
+        tr_period,
         "Default",
         "",
     )
@@ -89,6 +89,37 @@ def runtime(
     )
     control = CollectingControl(outcome)
     return AutopilotRuntime(config, control=control), control
+
+
+def test_status_tr_period_milliseconds_are_normalized_to_seconds() -> None:
+    app, _ = runtime()
+
+    app.handle(status(tr_period=15_000), NOW)
+
+    assert app.status.period == 15
+
+
+def test_adaptive_band_change_with_millisecond_period_resumes_after_one_ft8_cycle() -> None:
+    app, control = runtime()
+    app.handle(status(tr_period=15_000), NOW)
+    confirmed_at = NOW + timedelta(seconds=1)
+    app._pending_dial_frequency = PendingDialFrequency(
+        "WSJT-X",
+        7_074_000,
+        "40m",
+        confirmed_at + timedelta(seconds=5),
+        "20m",
+    )
+
+    app.handle(replace(status(tr_period=15_000), dial_frequency=7_074_000), confirmed_at)
+    app.handle(decode("CQ OH2ZZ KP20", -3, 1460), confirmed_at + timedelta(seconds=1))
+
+    assert app._band_resume_at == confirmed_at + timedelta(seconds=15)
+    assert app.handle(None, confirmed_at + timedelta(seconds=14)) is None
+    action = app.handle(None, confirmed_at + timedelta(seconds=15))
+    assert action is not None
+    assert action.station == "OH2ZZ"
+    assert [item.station for item in control.actions] == ["OH2ZZ"]
 
 
 def test_status_dx_call_does_not_block_idle_autocall(caplog: object) -> None:

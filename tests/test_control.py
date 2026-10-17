@@ -9,7 +9,7 @@ from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.adaptive import AdaptiveState, AttemptOutcome
-from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, DecodeEvent, IntendedAction, OriginalDecode
+from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, CooldownKind, DecodeEvent, IntendedAction, OriginalDecode
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.main import build_control
@@ -44,6 +44,21 @@ class FakeTransport:
             raise OSError("simulated send failure")
         self.sent.append((data, endpoint))
         return len(data)
+
+
+def test_rearm_clears_stale_swr_safety_notice() -> None:
+    control = WsjtxUdpControl(FakeTransport(), 15, None)
+    config = replace(
+        AppConfig(),
+        ftx1_hamlib_enabled=False,
+        ftx1_alc_control_enabled=False,
+        ftx1_swr_protection_enabled=False,
+    )
+    app = AutopilotRuntime(config, control=control)
+    app.last_qso_notice = "SWR SAFETY 2.50 - AutoPilot disarmed"
+
+    assert app.arm_control()
+    assert app.last_qso_notice == ""
 
 
 def original(
@@ -170,6 +185,27 @@ def test_patched_mode_sends_exact_direct_reply() -> None:
     reply = parse_datagram(transport.sent[0][0])
     assert isinstance(reply, ReplyPacket)
     assert reply.message == "F4NJU ON4ABC -08"
+
+
+def test_ap1_heartbeat_automatically_enables_direct_reply() -> None:
+    transport = FakeTransport()
+    decode = original("F4NJU ON4ABC -08", schema=3)
+    adapter = WsjtxUdpControl(
+        transport,
+        stale_seconds=15,
+        max_actions=2,
+        local_callsign="F4NJU",
+        direct_reply_patched=False,
+    )
+    adapter.observe(
+        HeartbeatPacket(PacketHeader(3, 1, "WSJT-X"), 3, "3.2.0", "260818-AP1"),
+        ENDPOINT,
+    )
+    adapter.observe(packet(decode), ENDPOINT)
+
+    outcome = adapter.execute(action(decode, ActionKind.DIRECT_REPLY, "ON4ABC"), NOW)
+
+    assert outcome is ActionOutcome.SENT
 
 
 def test_patched_mode_rejects_direct_reply_addressed_elsewhere() -> None:
@@ -310,7 +346,8 @@ def test_ap1_controls_are_rejected_without_ap1_heartbeat() -> None:
 
 def test_adaptive_parity_flip_requires_ap1_and_safe_idle() -> None:
     transport = FakeTransport()
-    app = AutopilotRuntime(AppConfig(candidate_collection_seconds=0), control=WsjtxUdpControl(transport, 15, 3))
+    config = replace(AppConfig(), candidate_collection_seconds=0, adaptive_opportunity_quiet_seconds=5)
+    app = AutopilotRuntime(config, control=WsjtxUdpControl(transport, 15, 3))
     app.handle(HeartbeatPacket(PacketHeader(3, 0, "WSJT-X"), 3, "3.2.0", "260818-AP1"), NOW, ENDPOINT)
     app.handle(runtime_status("", schema=3, tx_enabled=True, transmitting=True), NOW, ENDPOINT)
     app.current_tx_first = True
@@ -318,7 +355,7 @@ def test_adaptive_parity_flip_requires_ap1_and_safe_idle() -> None:
         app.note_adaptive_failure("DL1ABC", AttemptOutcome.NO_RESPONSE, NOW + timedelta(seconds=index))
 
     app.handle(None, NOW + timedelta(seconds=7), ENDPOINT)
-    assert app.adaptive_state is AdaptiveState.PARITY_CHANGE_PENDING
+    assert app.adaptive_state is AdaptiveState.NORMAL  # TX active; failure count is not the trigger.
     assert len(transport.sent) == 2  # Initial AP1 query plus retry while state is unavailable.
 
     app.handle(runtime_status("", schema=3, tx_enabled=False), NOW + timedelta(seconds=8), ENDPOINT)
@@ -354,6 +391,79 @@ def test_adaptive_band_hop_requires_status_confirmation() -> None:
         ENDPOINT,
     )
     assert app.adaptive_state is AdaptiveState.BAND_TRIAL
+
+
+def test_band_trial_can_request_another_hop_when_no_viable_cq_appears() -> None:
+    transport = FakeTransport()
+    config = replace(
+        AppConfig(),
+        candidate_collection_seconds=0,
+        automatic_band_hopping_enabled=True,
+        allowed_auto_hop_bands=("20m", "17m"),
+        minimum_band_dwell_minutes=0,
+        adaptive_parity_enabled=False,
+        adaptive_opportunity_quiet_seconds=10,
+    )
+    app = AutopilotRuntime(config, control=WsjtxUdpControl(transport, 15, 3))
+    app.handle(HeartbeatPacket(PacketHeader(3, 0, "WSJT-X"), 3, "3.2.0", "260818-AP1"), NOW, ENDPOINT)
+    app.handle(runtime_status("", schema=3, tx_enabled=False), NOW, ENDPOINT)
+    app.adaptive_state = AdaptiveState.BAND_HOP_PENDING
+    app.handle(None, NOW + timedelta(seconds=1), ENDPOINT)
+    app.handle(
+        runtime_status("", schema=3, frequency=18_100_000, tx_enabled=False),
+        NOW + timedelta(seconds=2),
+        ENDPOINT,
+    )
+    assert app.adaptive_state is AdaptiveState.BAND_TRIAL
+    assert app.stagnation.failed_attempts == 0
+
+    app.handle(None, NOW + timedelta(seconds=20), ENDPOINT)
+    command = parse_datagram(transport.sent[-1][0])
+    assert isinstance(command, SetDialFrequencyPacket)
+    assert command.frequency_hz == 14_074_000
+
+
+def test_worked_and_unreachable_cqs_exhaust_current_band_without_failure_threshold() -> None:
+    transport = FakeTransport()
+    config = replace(
+        AppConfig(),
+        adaptive_parity_enabled=False,
+        automatic_band_hopping_enabled=True,
+        allowed_auto_hop_bands=("20m", "17m"),
+        minimum_band_dwell_minutes=0,
+    )
+    app = AutopilotRuntime(config, control=WsjtxUdpControl(transport, 15, 3))
+    app.handle(HeartbeatPacket(PacketHeader(3, 0, "WSJT-X"), 3, "3.2.0", "260818-AP1"), NOW, ENDPOINT)
+    app.handle(runtime_status("", schema=3, tx_enabled=False), NOW, ENDPOINT)
+    app.opportunities.observe("DL1ABC", NOW, worked=True)
+    app.opportunities.observe("XQ3SK", NOW)
+    app.note_adaptive_failure("XQ3SK", AttemptOutcome.NO_RESPONSE, NOW + timedelta(seconds=1))
+
+    assert app.stagnation.failed_attempts == 1
+    app.handle(None, NOW + timedelta(seconds=2), ENDPOINT)
+    command = parse_datagram(transport.sent[-1][0])
+    assert isinstance(command, SetDialFrequencyPacket)
+    assert command.frequency_hz == 18_100_000
+
+
+def test_inactive_unanswered_qso_counts_once_for_stagnation() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ OH2ZZ KP20", ENDPOINT), NOW, ENDPOINT)
+    app.handle(
+        runtime_status("OH2ZZ", tx_enabled=True, transmitting=True, tx_message="OH2ZZ F4NJU -08"),
+        NOW + timedelta(seconds=1),
+        ENDPOINT,
+    )
+    assert app.engine.state.session.reply_confirmed
+
+    app.handle(runtime_status("", tx_enabled=False), NOW + timedelta(seconds=122), ENDPOINT)
+    assert app.engine.state.session.state is QsoState.IDLE
+    assert app.stagnation.failed_attempts == 1
+    assert app.stagnation.snapshot()[0]["outcome"] == "NO_RESPONSE"
+    app.handle(None, NOW + timedelta(seconds=123), ENDPOINT)
+    assert app.stagnation.failed_attempts == 1
 
 
 def test_kill_switch_file_disarms_adapter(tmp_path: Path) -> None:
@@ -400,12 +510,13 @@ def runtime_decode(
     off_air: bool = False,
     df: int = 1460,
     decode_second: int = 0,
+    snr: int = -8,
 ) -> DecodePacket:
     return DecodePacket(
         PacketHeader(schema, 2, "WSJT-X"),
         is_new,
         time(12, 0, decode_second),
-        -8,
+        snr,
         0.2,
         df,
         "~",
@@ -424,6 +535,7 @@ def runtime_status(
     transmitting: bool = False,
     tx_message: str = "",
     tx_df: int = 900,
+    tx_watchdog: bool = False,
 ) -> StatusPacket:
     return StatusPacket(
         PacketHeader(schema, 1, "WSJT-X"),
@@ -440,7 +552,7 @@ def runtime_status(
         "F4NJU",
         "JN18",
         "",
-        False,
+        tx_watchdog,
         "",
         False,
         0,
@@ -479,21 +591,52 @@ def control_runtime(
     max_actions: int = 2,
     *,
     direct_reply_patched: bool = False,
+    stale_seconds: float | None = None,
 ) -> AutopilotRuntime:
     config = replace(
         AppConfig(),
         candidate_collection_seconds=0,
         max_initiation_attempts=max_actions,
         wsjtx_direct_reply_patched=direct_reply_patched,
+        **({"stale_decode_seconds": stale_seconds} if stale_seconds is not None else {}),
     )
     control = WsjtxUdpControl(
         transport,
-        15,
+        config.stale_decode_seconds,
         max_actions,
         local_callsign="F4NJU",
         direct_reply_patched=direct_reply_patched,
     )
     return AutopilotRuntime(config, control=control)
+
+
+def waiting_final_tx(app: AutopilotRuntime, station: str = "RC9WC") -> None:
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode(f"CQ {station} NO15", ENDPOINT), NOW, ENDPOINT)
+    app.handle(runtime_decode(f"F4NJU {station} -08", ENDPOINT, decode_second=1), NOW + timedelta(seconds=1), ENDPOINT)
+    app.handle(runtime_decode(f"F4NJU {station} RR73", ENDPOINT, decode_second=2), NOW + timedelta(seconds=2), ENDPOINT)
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
+
+
+def complete_waiting_qso(app: AutopilotRuntime, station: str = "RC9WC", *, at: datetime) -> IntendedAction | None:
+    assert app.handle(
+        runtime_status(station, tx_enabled=True, transmitting=True, tx_message=f"{station} F4NJU 73"),
+        at,
+        ENDPOINT,
+    ) is None
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
+    assert app.finalization.state is not None
+    assert app.finalization.state.tx_confirmed
+    assert not app.finalization.state.tx_completed
+    assert app.handle(qso_logged(station), at + timedelta(seconds=1), ENDPOINT) is None
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
+    assert app.handle(
+        runtime_status(station, tx_enabled=False),
+        at + timedelta(seconds=14),
+        ENDPOINT,
+    ) is None
+    assert app.engine.state.session.state is QsoState.IDLE
+    return app.handle(None, at + timedelta(seconds=15), ENDPOINT)
 
 
 def test_armed_cq_send_success_engages_qso_and_blocks_another() -> None:
@@ -731,12 +874,113 @@ def test_terminal_decodes_only_complete_the_matching_local_qso() -> None:
         NOW + timedelta(seconds=11),
         ENDPOINT,
     )
-    assert app.engine.state.session.state is QsoState.COMPLETE
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
+    assert app.finalization.state is not None
+    assert app.finalization.state.tx_confirmed
+    assert not app.finalization.state.tx_completed
     app.handle(runtime_status("OH2ZZ", tx_enabled=False), NOW + timedelta(seconds=13), ENDPOINT)
 
     assert app.engine.state.session.state is QsoState.IDLE
     assert app.engine.state.session.remote_callsign is None
     assert app.control.actions_used == 1
+
+
+def test_normal_qso_completion_rescans_queued_cq_once(caplog: pytest.LogCaptureFixture) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, stale_seconds=60)
+    caplog.set_level("INFO")
+    waiting_final_tx(app)
+    sent_before = len(transport.sent)
+
+    assert app.handle(runtime_decode("CQ RY6F LN05", ENDPOINT, df=1200), NOW + timedelta(seconds=3), ENDPOINT) is None
+    assert len(transport.sent) == sent_before
+
+    action = complete_waiting_qso(app, at=NOW + timedelta(seconds=4))
+
+    assert action is not None and action.station == "RY6F"
+    assert action.kind is ActionKind.CQ_REPLY
+    assert len(transport.sent) == sent_before + 1
+    assert app.engine.state.session.state is QsoState.CALLING_STATION
+    assert "[ENGINE] QSO complete; rescanning queued candidates count=1" in caplog.text
+    assert "[ENGINE] post-QSO candidate selected station=RY6F" in caplog.text
+
+
+def test_post_qso_rescan_selects_highest_scored_queued_candidate() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, stale_seconds=60)
+    waiting_final_tx(app)
+    app.handle(runtime_decode("CQ A6AAA LL75", ENDPOINT, df=1200, snr=-20), NOW + timedelta(seconds=3), ENDPOINT)
+    app.handle(runtime_decode("CQ B7BBB OL63", ENDPOINT, df=1201, snr=10), NOW + timedelta(seconds=4), ENDPOINT)
+
+    action = complete_waiting_qso(app, at=NOW + timedelta(seconds=5))
+
+    assert action is not None and action.station == "B7BBB"
+    assert action.kind is ActionKind.CQ_REPLY
+    assert len(transport.sent) == 2
+
+
+def test_post_qso_rescan_rejects_stale_queued_candidate() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, stale_seconds=5)
+    waiting_final_tx(app)
+    app.handle(runtime_decode("CQ RY6F LN05", ENDPOINT, df=1200), NOW + timedelta(seconds=3), ENDPOINT)
+
+    action = complete_waiting_qso(app, at=NOW + timedelta(seconds=10))
+
+    assert action is None
+    assert len(transport.sent) == 1
+    assert app.engine.state.session.state is QsoState.IDLE
+
+
+def test_post_qso_rescan_rejects_candidate_that_enters_cooldown() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, stale_seconds=60)
+    waiting_final_tx(app)
+    app.handle(runtime_decode("CQ RY6F LN05", ENDPOINT, df=1200), NOW + timedelta(seconds=3), ENDPOINT)
+    app.engine._set_station_cooldown(
+        "RY6F",
+        NOW + timedelta(seconds=3),
+        60,
+        CooldownKind.STATION_RETRY,
+        "test cooldown",
+    )
+
+    action = complete_waiting_qso(app, at=NOW + timedelta(seconds=4))
+
+    assert action is None
+    assert len(transport.sent) == 1
+    assert app.engine.state.session.state is QsoState.IDLE
+
+
+def test_post_qso_rescan_does_not_duplicate_action_when_direct_call_arrives() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True, stale_seconds=60)
+    waiting_final_tx(app)
+    app.handle(runtime_decode("CQ RY6F LN05", ENDPOINT, df=1200), NOW + timedelta(seconds=3), ENDPOINT)
+
+    action = complete_waiting_qso(app, at=NOW + timedelta(seconds=4))
+    racing_action = app.handle(
+        runtime_decode("F4NJU OZ2LC -10", ENDPOINT, df=1300, decode_second=5),
+        NOW + timedelta(seconds=20),
+        ENDPOINT,
+    )
+
+    assert action is not None and action.station == "RY6F"
+    assert racing_action is None
+    assert len(transport.sent) == 2
+    assert app.engine.state.session.remote_callsign == "RY6F"
+
+
+def test_normal_qso_completion_without_queued_candidates_is_unchanged() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3)
+    waiting_final_tx(app)
+
+    action = complete_waiting_qso(app, at=NOW + timedelta(seconds=3))
+
+    assert action is None
+    assert len(transport.sent) == 1
+    assert app.engine.state.session.state is QsoState.IDLE
 
 
 def test_qso_logged_during_waiting_final_tx_blocks_cq_and_queues_direct_call() -> None:
@@ -776,7 +1020,7 @@ def test_stale_pending_direct_waits_for_refresh_before_cq() -> None:
         NOW + timedelta(seconds=6),
         ENDPOINT,
     )
-    assert app.engine.state.session.state is QsoState.COMPLETE
+    assert app.engine.state.session.state is QsoState.WAITING_FINAL_TX
     app.handle(runtime_status("A6IOK", tx_enabled=False), NOW + timedelta(seconds=9), ENDPOINT)
     assert app.engine.state.session.state is QsoState.IDLE
 
@@ -918,6 +1162,27 @@ def test_qso_timeout_ignores_persistent_dx_call_and_returns_idle() -> None:
 
     assert app.engine.state.session.state is QsoState.IDLE
     assert app.engine.state.session.remote_callsign is None
+
+
+def test_wsjtx_runaway_watchdog_aborts_immediately_and_uses_waiting_candidate(caplog: pytest.LogCaptureFixture) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3)
+    app.handle(runtime_decode("CQ OH2ZZ KP20", ENDPOINT), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ R3KLE KO91", ENDPOINT, df=1202), NOW + timedelta(seconds=1), ENDPOINT)
+
+    action = app.handle(
+        runtime_status("OH2ZZ", tx_enabled=False, tx_watchdog=True),
+        NOW + timedelta(seconds=2),
+        ENDPOINT,
+    )
+
+    assert action is not None
+    assert action.station == "R3KLE"
+    assert app.engine.state.session.remote_callsign == "R3KLE"
+    cooldown = app.engine.cooldown_for("OH2ZZ", NOW + timedelta(seconds=2))
+    assert cooldown is not None
+    assert cooldown.kind is CooldownKind.STALLED_QSO
+    assert "WSJT-X Runaway TX watchdog remote=OH2ZZ" in caplog.text
 
 
 def test_direct_reply_uses_same_qso_logged_completion_cycle() -> None:
@@ -1183,6 +1448,82 @@ def start_finalization(app: AutopilotRuntime) -> None:
         ENDPOINT,
     )
     assert app.finalization.state is not None and app.finalization.state.tx_confirmed
+    assert not app.finalization.state.tx_completed
+    app.handle(
+        runtime_status("UI6O", tx_enabled=False),
+        NOW + timedelta(seconds=3, milliseconds=500),
+        ENDPOINT,
+    )
+    assert app.finalization.state is not None and app.finalization.state.tx_completed
+
+
+def test_qso_logged_cannot_replace_final_73_while_it_is_transmitting() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, stale_seconds=60)
+    waiting_final_tx(app, "DL5WP")
+    app.handle(runtime_decode("CQ F1IQH JN27", ENDPOINT, df=1079), NOW + timedelta(seconds=3), ENDPOINT)
+    sent_before = len(transport.sent)
+
+    assert app.handle(
+        runtime_status("DL5WP", tx_enabled=True, transmitting=True, tx_message="DL5WP F4NJU 73", tx_df=795),
+        NOW + timedelta(seconds=4),
+        ENDPOINT,
+    ) is None
+    assert app.handle(qso_logged("DL5WP"), NOW + timedelta(seconds=5), ENDPOINT) is None
+    assert app.handle(
+        runtime_status("DL5WP", tx_enabled=False, transmitting=True, tx_message="DL5WP F4NJU 73", tx_df=795),
+        NOW + timedelta(seconds=10),
+        ENDPOINT,
+    ) is None
+    assert len(transport.sent) == sent_before
+    assert app.engine.state.session.remote_callsign == "DL5WP"
+
+    assert app.handle(
+        runtime_status("DL5WP", tx_enabled=False, transmitting=False, tx_df=795),
+        NOW + timedelta(seconds=18),
+        ENDPOINT,
+    ) is None
+    assert len(transport.sent) == sent_before
+
+    action = app.handle(None, NOW + timedelta(seconds=19), ENDPOINT)
+    assert action is not None and action.station == "F1IQH"
+    assert len(transport.sent) == sent_before + 1
+
+
+def test_qso_logged_during_rr73_tx_cannot_start_queued_cq() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, stale_seconds=60)
+    app.handle(runtime_decode("CQ SQ4FXT KO03", ENDPOINT, df=754), NOW, ENDPOINT)
+    app.handle(
+        runtime_decode("F4NJU SQ4FXT R-13", ENDPOINT, df=754, decode_second=1),
+        NOW + timedelta(seconds=1), ENDPOINT,
+    )
+    app.handle(runtime_decode("CQ R5DT KO94", ENDPOINT, df=1307), NOW + timedelta(seconds=2), ENDPOINT)
+    sent_before = len(transport.sent)
+    app.handle(
+        runtime_status(
+            "SQ4FXT",
+            tx_enabled=False,
+            transmitting=True,
+            tx_message="SQ4FXT F4NJU RR73",
+            tx_df=754,
+        ),
+        NOW + timedelta(seconds=3), ENDPOINT,
+    )
+
+    assert app.handle(qso_logged("SQ4FXT"), NOW + timedelta(seconds=4), ENDPOINT) is None
+    assert len(transport.sent) == sent_before
+    assert app.engine.state.session.remote_callsign == "SQ4FXT"
+    assert app.finalization.state is not None and app.finalization.state.qso_logged
+
+    assert app.handle(
+        runtime_status("SQ4FXT", tx_enabled=False, transmitting=False, tx_df=754),
+        NOW + timedelta(seconds=15), ENDPOINT,
+    ) is None
+    assert len(transport.sent) == sent_before
+
+    action = app.handle(None, NOW + timedelta(seconds=31), ENDPOINT)
+    assert action is not None and action.station == "R5DT"
 
 
 def test_terminal_exchange_creates_finalization_and_qso_logged_preserves_it() -> None:
@@ -1255,6 +1596,125 @@ def test_pending_direct_after_active_qso_beats_cq_and_replies_with_latest_decode
     assert reply.message == "F4NJU S51DD +01"
 
     assert app.handle(runtime_decode("CQ SP9MOC JO90", ENDPOINT, df=1600), NOW + timedelta(seconds=5), ENDPOINT) is None
+
+
+def test_direct_caller_preempts_unanswered_cq_attempt_before_transmission() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ R3RRC/P KO88", ENDPOINT, df=2191), NOW, ENDPOINT)
+    app.handle(
+        runtime_status("R3RRC/P", tx_enabled=True, transmitting=False, tx_message="R3RRC/P F4NJU -08"),
+        NOW + timedelta(seconds=1), ENDPOINT,
+    )
+
+    action = app.handle(
+        runtime_decode("F4NJU F6HRP +00", ENDPOINT, df=569, decode_second=2, snr=9),
+        NOW + timedelta(seconds=2), ENDPOINT,
+    )
+
+    assert action is not None and action.station == "F6HRP"
+    assert action.kind is ActionKind.DIRECT_REPLY
+    assert [type(parse_datagram(data)).__name__ for data, _ in transport.sent] == [
+        "ReplyPacket", "HaltTxPacket", "ReplyPacket",
+    ]
+    assert app.engine.state.session.remote_callsign == "F6HRP"
+    assert app.engine.pending_direct_calls.entries(NOW + timedelta(seconds=2)) == ()
+
+
+def test_dual_rr73_direct_caller_preempts_unanswered_cq_attempt() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ 9A4ZM JN86", ENDPOINT, df=2536), NOW, ENDPOINT)
+    app.handle(
+        runtime_status("9A4ZM", tx_enabled=True, transmitting=False, tx_message="9A4ZM F4NJU JN29"),
+        NOW + timedelta(seconds=1), ENDPOINT,
+    )
+
+    action = app.handle(
+        runtime_decode(
+            "F6BQX RR73; F4NJU <ES0RY> -16",
+            ENDPOINT,
+            df=460,
+            decode_second=2,
+            snr=-11,
+        ),
+        NOW + timedelta(seconds=2), ENDPOINT,
+    )
+
+    assert action is not None and action.station == "ES0RY"
+    assert action.kind is ActionKind.DIRECT_REPLY
+    assert [type(parse_datagram(data)).__name__ for data, _ in transport.sent] == [
+        "ReplyPacket", "HaltTxPacket", "ReplyPacket",
+    ]
+    reply = parse_datagram(transport.sent[-1][0])
+    assert isinstance(reply, ReplyPacket)
+    assert reply.message == "F6BQX RR73; F4NJU <ES0RY> -16"
+    assert app.engine.state.session.remote_callsign == "ES0RY"
+
+
+def test_direct_caller_does_not_interrupt_current_transmission() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ R3RRC/P KO88", ENDPOINT, df=2191), NOW, ENDPOINT)
+    app.handle(
+        runtime_status("R3RRC/P", tx_enabled=True, transmitting=True, tx_message="R3RRC/P F4NJU -08"),
+        NOW + timedelta(seconds=1), ENDPOINT,
+    )
+
+    assert app.handle(
+        runtime_decode("F4NJU F6HRP +00", ENDPOINT, df=569, decode_second=2),
+        NOW + timedelta(seconds=2), ENDPOINT,
+    ) is None
+    assert len(transport.sent) == 1
+    assert app.engine.state.session.remote_callsign == "R3RRC/P"
+    assert len(app.engine.pending_direct_calls.entries(NOW + timedelta(seconds=2))) == 1
+
+
+def test_failed_halt_keeps_old_attempt_and_disarms_before_direct_reply() -> None:
+    class HaltFailingTransport(FakeTransport):
+        def sendto(self, data: bytes, endpoint: tuple[str, int]) -> int:
+            if isinstance(parse_datagram(data), HaltTxPacket):
+                raise OSError("simulated HaltTx failure")
+            return super().sendto(data, endpoint)
+
+    transport = HaltFailingTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ R3RRC/P KO88", ENDPOINT, df=2191), NOW, ENDPOINT)
+    app.handle(
+        runtime_status("R3RRC/P", tx_enabled=True, transmitting=False, tx_message="R3RRC/P F4NJU -08"),
+        NOW + timedelta(seconds=1), ENDPOINT,
+    )
+
+    assert app.handle(
+        runtime_decode("F4NJU F6HRP +00", ENDPOINT, df=569, decode_second=2),
+        NOW + timedelta(seconds=2), ENDPOINT,
+    ) is None
+    assert not app.control.armed
+    assert app.engine.state.session.remote_callsign == "R3RRC/P"
+    assert len(transport.sent) == 1
+
+
+def test_direct_caller_does_not_preempt_after_remote_has_replied() -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3, direct_reply_patched=True)
+    app.handle(runtime_status("", tx_enabled=False), NOW, ENDPOINT)
+    app.handle(runtime_decode("CQ R3RRC/P KO88", ENDPOINT, df=2191), NOW, ENDPOINT)
+    app.handle(
+        runtime_decode("F4NJU R3RRC/P -10", ENDPOINT, df=2191, decode_second=1),
+        NOW + timedelta(seconds=1), ENDPOINT,
+    )
+    assert app.engine.state.session.state is QsoState.QSO_ACTIVE
+
+    assert app.handle(
+        runtime_decode("F4NJU F6HRP +00", ENDPOINT, df=569, decode_second=2),
+        NOW + timedelta(seconds=2), ENDPOINT,
+    ) is None
+    assert len(transport.sent) == 1
+    assert app.engine.state.session.remote_callsign == "R3RRC/P"
 
 
 def test_finalization_hold_queues_direct_then_selects_it_before_cq() -> None:

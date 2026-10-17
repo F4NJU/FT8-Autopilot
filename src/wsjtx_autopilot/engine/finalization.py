@@ -22,6 +22,7 @@ class FinalizationState:
     last_terminal_period: tuple[object, ...]
     retry_count: int = 0
     tx_confirmed: bool = False
+    tx_completed: bool = False
     qso_logged: bool = False
 
 
@@ -68,12 +69,55 @@ class FinalizationTracker:
         LOGGER.info("[FINALIZE] waiting local TX timeout_periods=%d", self.final_tx_timeout_periods)
         return True
 
-    def confirm_final_tx(self, now: datetime) -> None:
+    def begin_final_tx(self, now: datetime) -> None:
         if self.state is None or self.state.tx_confirmed:
             return
         self.state.tx_confirmed = True
         self.state.deadline = now + timedelta(seconds=self.state.period_seconds * self.hold_periods)
         LOGGER.info("[FINALIZE] local terminal TX observed message=73 remote=%s", self.state.remote_callsign)
+
+    def begin_qso_logged_hold(
+        self,
+        remote_callsign: str,
+        instance_id: str | None,
+        mode: str,
+        frequency: int | None,
+        period_seconds: int,
+        now: datetime,
+    ) -> bool:
+        """Hold candidate selection when QSOLogged arrives during the final TX.
+
+        WSJT-X can emit QSOLogged as a local RR73 transmission starts, before a
+        terminal Decode has created the normal finalization state.  Treat the
+        live transmission as confirmed final traffic and wait for it to end.
+        """
+        if self.state is not None:
+            return False
+        period = max(1, period_seconds)
+        self.state = FinalizationState(
+            remote_callsign=remote_callsign,
+            instance_id=instance_id,
+            mode=mode,
+            frequency=frequency,
+            last_terminal_kind=MessageKind.RR73,
+            source_decode=None,
+            deadline=now + timedelta(seconds=period * self.hold_periods),
+            period_seconds=period,
+            started_at=now,
+            last_terminal_period=(instance_id, now, mode),
+            tx_confirmed=True,
+            qso_logged=True,
+        )
+        LOGGER.info(
+            "[FINALIZE] QSOLogged during local TX remote=%s; holding until TX completes",
+            remote_callsign,
+        )
+        return True
+
+    def confirm_final_tx(self) -> None:
+        if self.state is None or not self.state.tx_confirmed or self.state.tx_completed:
+            return
+        self.state.tx_completed = True
         LOGGER.info("[FINALIZE] final TX complete remote=%s", self.state.remote_callsign)
 
     def matches_retry(self, event: DecodeEvent) -> bool:
@@ -115,6 +159,8 @@ class FinalizationTracker:
     def record_retry(self, event: DecodeEvent, now: datetime) -> int:
         assert self.state is not None
         self.state.retry_count += 1
+        self.state.tx_confirmed = False
+        self.state.tx_completed = False
         self.state.last_terminal_kind = event.parsed.kind
         self.state.source_decode = event.original
         self.state.last_terminal_period = _period_key(event)
@@ -144,10 +190,12 @@ class FinalizationTracker:
         if self.state.instance_id is not None and self.state.instance_id != instance_id:
             return False
         self.state.qso_logged = True
-        return not self.state.tx_confirmed
+        return not self.state.tx_completed
 
     def expire(self, now: datetime) -> bool:
         if self.state is None or now < self.state.deadline:
+            return False
+        if self.state.tx_confirmed and not self.state.tx_completed:
             return False
         self.close("grace period expired")
         return True

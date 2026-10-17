@@ -81,3 +81,18 @@ def test_parses_exchange_tokens(text: str, kind: MessageKind) -> None:
 )
 def test_rejects_free_text_and_ambiguous_lines(text: str) -> None:
     assert parse_ft8_message(text) is None
+
+
+def test_parse_dual_rr73_direct_report() -> None:
+    message = parse_ft8_message("F6BQX RR73; F4NJU <ES0RY> -16")
+
+    assert message is not None
+    assert message.raw == "F6BQX RR73; F4NJU <ES0RY> -16"
+    assert message.kind is MessageKind.REPORT
+    assert message.sender == "ES0RY"
+    assert message.addressee == "F4NJU"
+    assert message.report == -16
+
+
+def test_parse_rejects_ambiguous_semicolon_text() -> None:
+    assert parse_ft8_message("HELLO; F4NJU ES0RY -16") is None

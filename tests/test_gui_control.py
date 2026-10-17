@@ -2,7 +2,7 @@ import socket
 from datetime import datetime, time, timedelta, timezone
 
 from PySide6.QtCore import QSize
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox, QScrollArea
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QMessageBox, QScrollArea
 
 from wsjtx_autopilot.config import SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
@@ -381,62 +381,61 @@ def test_adaptive_controls_require_ap1_and_preserve_band_order() -> None:
 
     assert list(dialog.auto_band_checkboxes) == ["160m", "80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
     assert dialog.auto_band_checkboxes["40m"].isChecked()
-    assert not dialog.auto_band_hop.isEnabled()
-    assert dialog.auto_band_hop.toolTip() == "Requires WSJT-X AutoPilot AP1"
+    assert dialog.auto_band_hop.isEnabled()
+    assert dialog.auto_band_hop.toolTip() == ""
     assert dialog.settings().allowed_auto_hop_bands == ["40m", "20m"]
 
 
-def test_ftx1_cat2_preferences_store_manual_band_profiles() -> None:
+def test_radio_preferences_use_hamlib_and_preserve_learned_profiles(monkeypatch) -> None:
     QApplication.instance() or QApplication([])
-    dialog = SettingsDialog(UserSettings(), ap1_available=True)
+    monkeypatch.setattr(
+        "wsjtx_autopilot.gui.main_window.list_supported_radios",
+        lambda _path="": [(3073, "Icom", "IC-7300"), (1051, "Yaesu", "FTX-1")],
+    )
+    profiles = {"20m": {"tx_audio_attenuation": 118}}
+    dialog = SettingsDialog(UserSettings(ftx1_band_profiles=profiles), ap1_available=True)
 
     assert not dialog.ftx1_cat2_port.isEnabled()
+    assert dialog.hamlib_radio.currentData() == 1051
+    dialog.hamlib_radio.setCurrentIndex(dialog.hamlib_radio.findData(3073))
     dialog.ftx1_cat2_enabled.setChecked(True)
-    dialog.ftx1_cat2_confirmed_ftx1.setChecked(True)
     dialog.ftx1_cat2_port.setText("COM5")
     dialog.ftx1_cat2_baudrate.setValue(38_400)
-    dialog.ftx1_auto_apply_band_profiles.setChecked(True)
-    dialog.ftx1_profile_fields["20m"][0].setText("35")
-    dialog.ftx1_profile_fields["20m"][1].setText("118")
+    dialog.ftx1_alc_control.setChecked(True)
     saved = dialog.settings()
 
     assert saved.ftx1_cat2_enabled
-    assert saved.ftx1_cat2_confirmed_ftx1
+    assert not saved.ftx1_cat2_confirmed_ftx1
+    assert saved.ftx1_hamlib_enabled
+    assert saved.hamlib_rig_model == 3073
     assert saved.ftx1_cat2_port == "COM5"
     assert saved.ftx1_auto_apply_band_profiles
-    assert saved.ftx1_band_profiles == {"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}}
+    assert saved.ftx1_band_profiles == profiles
 
 
-def test_ftx1_auto_apply_preferences_default_off_and_round_trip() -> None:
+def test_profile_auto_apply_follows_alc_control() -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(UserSettings(), ap1_available=True)
 
-    assert not dialog.ftx1_auto_apply_band_profiles.isChecked()
-    dialog.ftx1_cat2_enabled.setChecked(True)
-    dialog.ftx1_cat2_confirmed_ftx1.setChecked(True)
-    dialog.ftx1_auto_apply_band_profiles.setChecked(True)
+    assert dialog.ftx1_alc_control.isChecked()
+    dialog.ftx1_alc_control.setChecked(False)
+    assert not dialog.settings().ftx1_auto_apply_band_profiles
+    dialog.ftx1_alc_control.setChecked(True)
     saved = dialog.settings()
 
     assert saved.ftx1_auto_apply_band_profiles
 
 
-def test_ftx1_profile_table_has_readable_value_fields() -> None:
+def test_manual_profile_table_is_hidden() -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(UserSettings(), ap1_available=True)
-    gain, attenuation = dialog.ftx1_profile_fields["20m"]
-
-    assert dialog.ftx1_profiles_table.minimumWidth() >= 540
-    assert dialog.ftx1_profiles_table.columnWidth(0) == 90
-    assert gain.minimumHeight() >= 30
-    assert attenuation.minimumHeight() >= 30
-    assert gain.placeholderText() == "0-100"
-    assert attenuation.placeholderText() == "0-450"
+    assert not dialog.ftx1_profiles_table.isVisible()
 
 
 def test_worker_profile_persistence_and_main_window_model_refresh(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
-    profiles = {"20m": {"usb_mod_gain": 30, "tx_audio_attenuation": 24}}
+    profiles = {"20m": {"tx_audio_attenuation": 24}}
     backend = BackendWorker(UserSettings())
     emitted = []
     backend.ftx1_band_profiles_changed.connect(emitted.append)
@@ -457,8 +456,7 @@ def test_worker_profile_persistence_and_main_window_model_refresh(tmp_path, monk
 
         assert window._settings.ftx1_band_profiles == profiles
         assert store.load().ftx1_band_profiles == profiles
-        assert refreshed.ftx1_profile_fields["20m"][0].text() == "30"
-        assert refreshed.ftx1_profile_fields["20m"][1].text() == "24"
+        assert refreshed.ftx1_profile_fields["20m"].text() == "24"
     finally:
         window.close()
 
@@ -513,7 +511,7 @@ def test_main_window_displays_adaptive_state_and_emits_reset(tmp_path, monkeypat
         application.processEvents()
 
 
-def test_main_window_exposes_ftx1_manual_profile_actions(tmp_path, monkeypatch) -> None:
+def test_main_window_only_exposes_alc_learning_reset(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: None)
@@ -542,11 +540,12 @@ def test_main_window_exposes_ftx1_manual_profile_actions(tmp_path, monkeypatch) 
             }
         )
         assert not window.ftx1_status.isHidden()
-        window.save_ftx1_current_band_profile_button.click()
-        window.delete_ftx1_current_band_profile_button.click()
+        assert window.save_ftx1_current_band_profile_button.isHidden()
+        assert window.delete_ftx1_current_band_profile_button.isHidden()
+        assert not window.reset_all_ftx1_band_profiles_button.isHidden()
         window.reset_all_ftx1_band_profiles_button.click()
-        assert saves == [True]
-        assert deletes == [True]
+        assert saves == []
+        assert deletes == []
         assert resets == [True]
     finally:
         window.close()
@@ -634,3 +633,17 @@ def test_gui_displays_pending_direct_call_count(tmp_path, monkeypatch) -> None:
     finally:
         window.close()
         application.processEvents()
+
+
+def test_swr_safety_disarm_shows_explicit_notification(monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    messages: list[tuple[object, ...]] = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: messages.append(args))
+
+    MainWindow._show_swr_safety_notification(window, "SWR SAFETY 2.50 - AutoPilot disarmed")
+
+    assert len(messages) == 1
+    assert messages[0][1] == "Protection SWR — AutoPilot désarmé"
+    assert "arrêté l’émission" in messages[0][2]
+    assert "SWR SAFETY 2.50" in messages[0][2]

@@ -42,6 +42,7 @@ class AppConfig:
     stagnation_max_unique_calls: int = 3
     adaptive_parity_enabled: bool = True
     parity_trial_failed_attempts: int = 6
+    adaptive_opportunity_quiet_seconds: float = 180.0
     automatic_band_hopping_enabled: bool = False
     allowed_auto_hop_bands: tuple[str, ...] = ()
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -57,6 +58,18 @@ class AppConfig:
     ftx1_cat2_port: str = ""
     ftx1_cat2_baudrate: int = 38_400
     ftx1_cat2_timeout_seconds: float = 0.25
+    ftx1_hamlib_enabled: bool = True
+    hamlib_rig_model: int = 1051
+    ftx1_hamlib_rigctld_path: str = ""
+    ftx1_hamlib_tcp_port: int = 4533
+    ftx1_meter_poll_seconds: float = 0.5
+    ftx1_alc_control_enabled: bool = True
+    ftx1_alc_minimum: float = 0.23
+    ftx1_alc_maximum: float = 0.30
+    ftx1_alc_attenuation_step: int = 3
+    ftx1_swr_protection_enabled: bool = True
+    ftx1_swr_limit: float = 2.0
+    ftx1_swr_trip_samples: int = 2
     ftx1_auto_apply_band_profiles: bool = False
     ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
     cty_dat_path: Path | None = None
