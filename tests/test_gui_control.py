@@ -104,7 +104,7 @@ def test_gui_worker_opens_identified_ftx1_cat2_from_persisted_settings(tmp_path,
         assert serial.writes == [b"ID;"]
         assert "CAT-2 config enabled=True port=COM6 baud=4800" in caplog.text
         assert "FTX-1 identified" in caplog.text
-        assert "CAT-2 ready" in caplog.text
+        assert "control ready source=direct FTX-1" in caplog.text
     finally:
         backend._close_backend()
 

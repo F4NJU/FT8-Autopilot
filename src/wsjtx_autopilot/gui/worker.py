@@ -315,7 +315,7 @@ class BackendWorker(QObject):
             None,
             self._paths.data_dir / "DISARM_AUTOPILOT",
             config.local_callsign,
-            False,
+            config.wsjtx_direct_reply_patched,
             armed=False,
         )
         self._runtime = AutopilotRuntime(
