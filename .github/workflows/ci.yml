@@ -11,6 +11,8 @@ permissions:
 jobs:
   tests:
     runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
 
     steps:
       - name: Checkout
