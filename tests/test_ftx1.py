@@ -464,6 +464,45 @@ def test_hamlib_swr_trip_halts_tx_and_disarms_without_automatic_tune() -> None:
     assert any(parse_datagram(data).header.packet_type == 8 for data, _ in transport.sent)
 
 
+def test_hamlib_ptt_timeout_is_not_fatal_when_wsjtx_is_already_in_rx() -> None:
+    cat = FakeHamlibCat()
+    cat.stop_transmit = lambda: False  # type: ignore[method-assign]
+    cat.read_ptt = lambda: None  # type: ignore[method-assign]
+    transport = FakeTransport()
+    control = WsjtxUdpControl(transport, 15, None, armed=True)
+    runtime = AutopilotRuntime(
+        AppConfig(),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000, transmitting=False), NOW, ENDPOINT)
+    transport.sent.clear()
+
+    assert runtime._halt_tx("WSJT-X", "remote engaged another station")
+    assert control.armed
+    assert parse_datagram(transport.sent[-1][0]).header.packet_type == 8
+
+
+def test_transient_hamlib_identification_timeout_does_not_block_arm() -> None:
+    cat = FakeHamlibCat()
+    cat.identify = lambda: False  # type: ignore[attr-defined]
+    transport = FakeTransport()
+    control = WsjtxUdpControl(transport, 15, None, armed=False)
+    runtime = AutopilotRuntime(
+        AppConfig(
+            ftx1_hamlib_enabled=True,
+            ftx1_alc_control_enabled=True,
+            ftx1_swr_protection_enabled=True,
+        ),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+
+    assert runtime.arm_control()
+    assert control.armed
+
+
 class FakeTuneCat(FakeCat):
     def __init__(self, powers: list[float], swrs: list[float]) -> None:
         super().__init__(35, alc=0.05, swr=swrs[0], power=powers[0])

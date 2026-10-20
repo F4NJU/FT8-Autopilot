@@ -1,144 +1,102 @@
-# FT8-AutoPilot
+# WSJTX AutoPilot
 
-FT8-AutoPilot is an experimental Windows companion for WSJT-X. It selects
-eligible FT8/FT4 CQ or direct callers, sends the standard WSJT-X UDP Reply,
-and tracks the QSO lifecycle. The station operator remains responsible for all
-transmissions and regulatory compliance.
+WSJTX AutoPilot est un assistant Windows pour les QSO FT8/FT4 avec WSJT-X.
+Il choisit une station, répond aux appels directs, suit le déroulement du QSO
+et peut changer automatiquement de cycle TX ou de bande lorsque la bande
+actuelle n'offre plus de contact intéressant.
 
-## Setup
+L'opérateur reste responsable de la station, des émissions et du respect de
+la réglementation.
 
-Install the GUI and test dependencies, start WSJT-X with its UDP server
-enabled, then start the AutoPilot GUI:
+**Statut : `v0.1.0-wip.1` — première préversion officielle, encore en cours
+de validation sur le terrain.**
 
-```powershell
-python -m pip install -e ".[gui,test,build]"
-wsjtx-autopilot-gui
-```
+## Installation
 
-Configure the local callsign and WSJT-X UDP port in Preferences. Direct-call
-Reply, AP1 controls, and automatic band hopping require the compatible custom
-WSJT-X/AP1 integration described below. Ordinary CQ Reply uses the standard
-WSJT-X UDP message.
-
-## Generic AutoPilot features
-
-- CQ and addressed direct callers are selected using freshness, confidence,
-  duplicate, blacklist, DXCC, continent, activity, and signal rules.
-- A fresh direct caller has priority over an unanswered queued CQ when it is
-  safe to switch. It never preempts a progressed QSO, an active transmission,
-  or terminal-message finalization.
-- A selected station receives a standard UDP Reply. WSJT-X alone manages TX
-  audio DF and Hold Tx Freq behavior.
-- Autopilot does not scan for a free TX slot, set TX DF, lock TX DF, restore TX
-  DF, or disarm because TX DF changes.
-- QSO lifecycle, terminal-message retries, pending direct callers, and safety
-  checks remain active.
-- Adaptive hopping tracks the useful station pool on the current band instead
-  of relying on a fixed failure counter. It can try the other TX cycle first,
-  then request a new dial frequency after a safe RX transition when the useful
-  pool is exhausted.
-- Optional forced time-based hopping cycles the configured ordered bands only
-  while idle, confirms each AP1 frequency change from WSJT-X Status, and
-  pauses new calls while the new band settles.
-- The compact GUI shows decode activity, candidate ranking, adaptive state,
-  and the current `Working <CALL> <COUNTRY>` status.
-
-## AP1 controls
-
-The companion WSJT-X AP1 fork reserves type 18 and keeps these wire IDs:
-
-| Type | AP1 message |
-| ---: | --- |
-| 18 | retired/reserved |
-| 19 | SetTxPeriod |
-| 20 | SetDialFrequency |
-| 21 | SetTxAudioAttenuation |
-| 22 | QueryTxAudioAttenuation |
-| 23 | TxAudioAttenuationState |
-
-SetTxPeriod supports adaptive TX period selection. SetDialFrequency supports
-band hopping. Types 21 through 23 maintain the WSJT-X TX attenuation state.
-Direct-call Reply support requires the AP1 WSJT-X fork; ordinary CQ Reply uses
-the standard WSJT-X UDP message.
-
-## Forced band hopping
-
-The GUI stores settings as JSON using the existing naming convention:
-
-```json
-{
-  "forced_band_hopping_enabled": true,
-  "forced_band_hop_bands": ["20m", "30m", "40m"],
-  "forced_band_hop_interval_minutes": 10,
-  "forced_band_hop_settle_seconds": 30
-}
-```
-
-`forced_band_hop_bands` controls the sequence. It shares
-`auto_hop_band_frequencies` and the standard FT8 frequency map with adaptive
-hopping, but does not inherit adaptive hopping's band list. Forced hopping
-defaults to disabled, a 10-minute dwell, and a 30-second post-confirmation
-settle period. Frequency changes are sent through Hamlib. When automatic drive
-profiles are enabled, the destination's WSJT-X attenuation is explicitly confirmed by an
-AP1 type-23 state packet before settling begins. A missing or unconfirmed
-destination profile leaves automatic TX blocked while RX continues.
-
-## Radio control through Hamlib
-
-Radio control is opt-in. Select the Hamlib model number, CAT port and baud rate.
-Frequency, PTT safety, ALC, SWR, RF power and tuner commands use Hamlib whenever
-the selected backend exposes them. The radio is identified at startup when its
-CAT protocol supports identification; otherwise the selected Hamlib model is
-used as the compatibility boundary. Per-band profiles retain only the effective
-WSJT-X audio attenuation; the legacy `usb_mod_gain` JSON field is ignored and
-kept only for settings compatibility.
-
-- `tx_audio_attenuation`
-
-Use SAVE CURRENT BAND, DELETE CURRENT BAND PROFILE, RESET ALL BAND PROFILES,
-and AUTO APPLY BAND PROFILES to manage profiles. AutoPilot never reads or writes
-USB MOD GAIN. Hamlib reads ALC, SWR and RF power when supported. AutoPilot corrects audio
-attenuation in both directions after each measured TX period. Consecutive SWR
-readings over the configured limit immediately halt TX, disarm AutoPilot, and
-raise the red antenna-safety alert. Automatic tuner recovery and automatic band
-exclusion are currently disabled; a safety trip never starts a TUNE command or
-changes band.
-See [docs/FTX1_CAT2.md](docs/FTX1_CAT2.md).
-
-## Known limitations
-
-- The bundled offline DXCC resolver covers common prefixes and special entities
-  needed by the current UI, but it is not a complete CTY database. An optional
-  configured CTY.DAT file takes precedence when available.
-- Country reference distance and bearing are approximate. Exact values require
-  a valid Maidenhead locator decoded from FT8 traffic and the local station
-  locator received in WSJT-X Status.
-- AutoPilot does not select a free TX slot or set, lock, or restore TX DF;
-  WSJT-X remains responsible for those controls.
-- Meter availability and units depend on the selected radio and Hamlib backend.
-  ALC regulation and SWR protection should only be enabled after validating the
-  reported values on the connected station.
-
-## Build and test
-
-```powershell
-python -m compileall -q src tests
-python -m pytest -q
-pyinstaller -y packaging/wsjtx-autopilot.spec
-```
-
-The packaged application is written to:
+La version prête à utiliser se trouve ici :
 
 ```text
 dist\WSJTX-AutoPilot\WSJTX-AutoPilot.exe
 ```
 
-## User data
+AutoPilot doit être lancé en même temps que la version AP1 de WSJT-X.
 
-Application settings, the QSO database, and logs live below the Windows AppData
-locations selected by `AppPaths`. They are not stored in this repository and
-are not included in builds or commits.
+## Configuration obligatoire dans WSJT-X
 
-## License
+Dans les paramètres de WSJT-X :
+
+1. Dans **Reporting**, régler le serveur UDP sur `127.0.0.1` et le port sur
+   `2237`.
+2. Toujours dans **Reporting**, cocher **Accept UDP requests**.
+3. Dans **General**, cocher **Double-click on call sets Tx enable**.
+
+Ces deux cases sont indispensables. Si elles ne sont pas cochées, AutoPilot
+peut recevoir et afficher les décodages, mais WSJT-X peut refuser la réponse ou
+ne pas activer l'émission. C'était notamment la cause du problème où une station
+était sélectionnée sans qu'aucune transmission ne démarre.
+
+Le port UDP configuré dans AutoPilot doit être identique à celui de WSJT-X.
+
+## Première utilisation
+
+1. Lancer WSJT-X et vérifier que la réception FT8 fonctionne.
+2. Lancer `WSJTX-AutoPilot.exe`.
+3. Ouvrir **Preferences** et renseigner l'indicatif, le port UDP, la radio et
+   les bandes autorisées.
+4. Vérifier que **WSJT-X AP1: Available** apparaît.
+5. Cliquer sur **ARM** pour autoriser AutoPilot à répondre.
+
+AutoPilot démarre désarmé. Il ne transmet rien tant que **ARM** n'a pas été
+activé.
+
+## Fonctions principales
+
+- sélection automatique des CQ et des stations qui appellent directement ;
+- priorité aux appels directs sans interrompre un QSO déjà engagé ;
+- suivi du QSO jusqu'au message final ;
+- filtrage des doublons, blacklist et priorités DXCC/continent ;
+- changement automatique de cycle TX puis de bande quand les contacts viables
+  sont épuisés ;
+- lecture et commande de la radio par Hamlib ;
+- régulation ALC et protection SWR lorsqu'elles sont compatibles avec la radio ;
+- affichage Discord, par exemple `FT8 - 40m` et `Working EA7CTA`.
+
+La protection SWR coupe immédiatement l'émission et désarme AutoPilot. La
+tentative d'accord automatique et l'exclusion automatique d'une bande sont
+actuellement désactivées.
+
+## En cas de problème
+
+Si AutoPilot voit les stations mais ne répond pas :
+
+- vérifier **Accept UDP requests** ;
+- vérifier **Double-click on call sets Tx enable** ;
+- vérifier que WSJT-X et AutoPilot utilisent bien le même port UDP (`2237` par
+  défaut) ;
+- vérifier que **WSJT-X AP1: Available** est affiché ;
+- vérifier qu'AutoPilot est armé ;
+- vérifier qu'aucune alerte SWR ou erreur CAT/Hamlib n'est active.
+
+Les journaux sont enregistrés dans :
+
+```text
+%LOCALAPPDATA%\FT8-AutoPilot\logs
+```
+
+Les réglages sont enregistrés dans :
+
+```text
+%APPDATA%\WSJTX-AutoPilot\settings.json
+```
+
+## Développement
+
+```powershell
+python -m pip install -e ".[gui,test,build]"
+python -m pytest -q
+pyinstaller -y packaging/wsjtx-autopilot.spec
+```
+
+## Licence
 
 GPL-3.0-or-later

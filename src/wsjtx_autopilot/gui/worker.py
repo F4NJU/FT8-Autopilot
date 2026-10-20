@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from wsjtx_autopilot.config import AppConfig, AppPaths, SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
+from wsjtx_autopilot.discord_presence import DiscordPresencePublisher
 from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.cq import CqEligibility
 from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
@@ -16,6 +17,7 @@ from wsjtx_autopilot.runtime import AutopilotRuntime
 from wsjtx_autopilot.wsjtx.listener import UdpListener
 from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, StatusPacket
 from wsjtx_autopilot.worked.service import WorkedTodayService
+from wsjtx_autopilot.worked.bands import BandResolver
 from wsjtx_autopilot.worked.sync import synchronize_adif
 from wsjtx_autopilot.worked.store import WorkedQsoStore
 
@@ -52,6 +54,7 @@ class BackendWorker(QObject):
         self._connected = False
         self._last_reported_armed = False
         self._last_swr_safety_notice = ""
+        self._discord_presence: DiscordPresencePublisher | None = None
 
     @Slot()
     def start(self) -> None:
@@ -195,6 +198,18 @@ class BackendWorker(QObject):
                 self._runtime.config.max_remote_cq_during_attempt,
                 self._runtime.last_qso_notice,
             )
+            if self._discord_presence is not None:
+                band = (
+                    BandResolver().resolve(self._runtime.status.dial_frequency)
+                    if self._runtime.status.dial_frequency
+                    else None
+                )
+                self._discord_presence.publish(
+                    self._runtime.status.mode,
+                    band,
+                    session.remote_callsign,
+                    self._connected,
+                )
             self.adaptive_changed.emit(self._runtime.adaptive_snapshot())
             control = self._runtime.control
             backend_armed = isinstance(control, WsjtxUdpControl) and control.armed
@@ -215,6 +230,10 @@ class BackendWorker(QObject):
 
     def _open_backend(self) -> None:
         self._settings.normalize()
+        self._discord_presence = DiscordPresencePublisher(
+            self._settings.discord_presence_enabled,
+            self._settings.discord_application_id,
+        )
         store_path = self._paths.database_path
         LOGGER.info("[PATHS] database=%s", store_path)
         self._store = WorkedQsoStore(store_path)
@@ -342,6 +361,9 @@ class BackendWorker(QObject):
         self.adaptive_changed.emit(self._runtime.adaptive_snapshot())
 
     def _close_backend(self) -> None:
+        if self._discord_presence is not None:
+            self._discord_presence.close()
+        self._discord_presence = None
         if self._runtime is not None and self._runtime.ftx1_band_drive is not None:
             self._runtime.ftx1_band_drive.close()
         if self._listener is not None:

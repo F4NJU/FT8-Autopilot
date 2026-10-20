@@ -43,6 +43,7 @@ _SWR_TUNE_RF_START_TIMEOUT = timedelta(seconds=3)
 _SWR_TUNE_POLL_INTERVAL = timedelta(seconds=0.5)
 _SWR_TUNE_MIN_SAMPLES = 2
 _SWR_RX_CONFIRM_TIMEOUT = timedelta(seconds=5)
+_WATCHDOG_HALT_CONFIRM_TIMEOUT = timedelta(seconds=2)
 # Automatic tuner/band recovery is intentionally parked for now.  Keep the
 # implementation below so it can be revisited without reintroducing it into
 # the live safety path.
@@ -85,6 +86,20 @@ class PendingDialFrequency:
     deadline: datetime
     previous_band: str | None
     source: str = "adaptive"
+
+
+@dataclass(frozen=True, slots=True)
+class HaltTxResult:
+    radio_ok: bool
+    wsjtx_ok: bool
+    observed_ptt: bool | None = None
+
+
+@dataclass(slots=True)
+class PendingWatchdogHalt:
+    instance_id: str
+    remote: str
+    deadline: datetime
 
 
 @dataclass(slots=True)
@@ -160,6 +175,7 @@ class AutopilotRuntime:
         self.last_hamlib_requested_power_watts: float | None = None
         self.last_qso_notice = ""
         self._watchdog_halt_failed = False
+        self._pending_watchdog_halt: PendingWatchdogHalt | None = None
         self.finalization = FinalizationTracker(
             config.finalization_hold_periods,
             config.max_final_retries,
@@ -287,15 +303,32 @@ class AutopilotRuntime:
             and self.config.ftx1_hamlib_enabled
             and (self.config.ftx1_alc_control_enabled or self.config.ftx1_swr_protection_enabled)
         ):
-            if self.ftx1_band_drive is None or not self.ftx1_band_drive.cat.identify():
-                LOGGER.error("[HAMLIB] ARM rejected: radio source is unavailable")
-                return False
+            radio_ready = bool(
+                self.ftx1_band_drive is not None
+                and self.ftx1_band_drive.cat.identify()
+            )
+            if not radio_ready:
+                # A transient CAT timeout must not lock the whole WSJT-X
+                # automation in DISARM. Meter reads retry Hamlib while TX is
+                # active; SWR protection can therefore recover as soon as the
+                # radio answers again.
+                LOGGER.warning(
+                    "[HAMLIB] radio source unavailable during ARM; continuing armed with CAT monitoring pending"
+                )
         if self._hamlib_swr_fault_latched:
             LOGGER.info("[HAMLIB] SWR safety latch reset by explicit ARM request")
             self._hamlib_swr_fault_latched = False
             self._hamlib_high_swr_samples = 0
+            self.antenna_safety_level = "ok"
+            self._swr_recovery = None
+            self._antenna_event(
+                self._last_runtime_at or datetime.now(timezone.utc),
+                "Protection SWR réarmée par l'opérateur",
+            )
         armed = self.control.arm()
         if armed:
+            self._pending_watchdog_halt = None
+            self._watchdog_halt_failed = False
             if self.last_qso_notice.startswith("SWR SAFETY"):
                 self.last_qso_notice = ""
             band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
@@ -314,14 +347,16 @@ class AutopilotRuntime:
             "exception": "none",
         }
 
-    def _halt_tx(self, instance_id: str | None, reason: str) -> bool:
-        """Drop hardware PTT through Hamlib, then cancel WSJT-X's TX scheduler."""
+    def _request_halt_tx(self, instance_id: str | None, reason: str) -> HaltTxResult:
+        """Request hardware PTT OFF and cancel WSJT-X's TX scheduler."""
         if isinstance(self.control, DryRunControl):
-            return self.control.halt_tx(instance_id, reason)
+            wsjtx_ok = self.control.halt_tx(instance_id, reason)
+            return HaltTxResult(True, wsjtx_ok, False)
         cat = self.ftx1_band_drive.cat if self.ftx1_band_drive is not None else None
         stop_transmit = getattr(cat, "stop_transmit", None)
         read_ptt = getattr(cat, "read_ptt", None)
         radio_ok = True
+        observed_ptt: bool | None = None
         if callable(stop_transmit):
             radio_ok = bool(stop_transmit())
             observed_ptt = read_ptt() if radio_ok and callable(read_ptt) else None
@@ -334,7 +369,18 @@ class AutopilotRuntime:
                 observed_ptt,
             )
         wsjtx_ok = self.control.halt_tx(instance_id, reason)
-        return radio_ok and wsjtx_ok
+        return HaltTxResult(radio_ok, wsjtx_ok, observed_ptt)
+
+    def _halt_tx(self, instance_id: str | None, reason: str) -> bool:
+        """Drop hardware PTT through Hamlib, then cancel WSJT-X's TX scheduler."""
+        result = self._request_halt_tx(instance_id, reason)
+        if not result.radio_ok and result.wsjtx_ok and not self.status.transmitting:
+            LOGGER.warning(
+                "[HAMLIB] PTT OFF confirmation unavailable, but WSJT-X is already in RX; "
+                "continuing without disarming"
+            )
+            return True
+        return result.radio_ok and result.wsjtx_ok
 
     def handle(
         self,
@@ -473,6 +519,8 @@ class AutopilotRuntime:
             elif self.engine.complete_qso(packet.dx_call, packet.header.instance_id, "QSOLogged received"):
                 self._log_ready_for_next_qso()
 
+        self._poll_watchdog_halt_confirmation(now)
+
         remote_before_expiry = self.engine.state.session.remote_callsign
         if self.engine.state.expire_direct_reply(
             now,
@@ -509,10 +557,16 @@ class AutopilotRuntime:
         self._query_tx_audio_attenuation_if_needed(self._attenuation_query_instance_id, now)
         self._complete_pending_ftx1_band_change(now)
         self._run_forced_band_hop(now)
-        if self._pending_dial_frequency is None and self._pending_ftx1_band_change is None and self._pending_ftx1_profile_apply is None:
+        if (
+            self._pending_watchdog_halt is None
+            and self._pending_dial_frequency is None
+            and self._pending_ftx1_band_change is None
+            and self._pending_ftx1_profile_apply is None
+        ):
             self._run_adaptive(now)
         if (
-            self._pending_dial_frequency is not None
+            self._pending_watchdog_halt is not None
+            or self._pending_dial_frequency is not None
             or self._pending_ftx1_band_change is not None
             or self._pending_ftx1_profile_apply is not None
             or self.pending_tx_audio_attenuation is not None
@@ -1632,6 +1686,19 @@ class AutopilotRuntime:
     def adaptive_snapshot(self) -> dict[str, object]:
         current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
         observed_at = self._last_runtime_at or datetime.now(timezone.utc)
+        opportunities = self.opportunities.snapshot(observed_at)
+        quiet_threshold = max(1.0, float(self.config.adaptive_opportunity_quiet_seconds))
+        quiet_anchor = self.opportunities.last_viable_at or self.opportunities.started_at
+        quiet_elapsed = max(0.0, (observed_at - quiet_anchor).total_seconds()) if quiet_anchor is not None else 0.0
+        opportunities.update(
+            {
+                "viable_count": len(opportunities["available"]),
+                "quiet_elapsed_seconds": min(quiet_threshold, quiet_elapsed),
+                "quiet_threshold_seconds": quiet_threshold,
+                "quiet_remaining_seconds": max(0.0, quiet_threshold - quiet_elapsed),
+                "exhausted": self.opportunities.exhausted(observed_at),
+            }
+        )
         snapshot = {
             "ap1_available": self.ap1_controls_available,
             "state": self.adaptive_state.name,
@@ -1640,7 +1707,7 @@ class AutopilotRuntime:
             "current_band": current_band,
             "next_band": self._next_auto_hop_band(),
             "band_changing_to": self._pending_dial_frequency.band if self._pending_dial_frequency else None,
-            "opportunities": self.opportunities.snapshot(observed_at),
+            "opportunities": opportunities,
             "antenna_safety": {
                 "level": self.antenna_safety_level,
                 "events": tuple(self.antenna_safety_events),
@@ -1758,6 +1825,7 @@ class AutopilotRuntime:
             and not self.status.transmitting
             and self.engine.state.session.state is QsoState.IDLE
             and not self.finalization.active
+            and self._pending_watchdog_halt is None
             and self._pending_dial_frequency is None
             and self._pending_ftx1_band_change is None
             and self._pending_ftx1_profile_apply is None
@@ -1869,6 +1937,7 @@ class AutopilotRuntime:
             and not self.status.transmitting
             and self.engine.state.session.state is QsoState.IDLE
             and not self.finalization.active
+            and self._pending_watchdog_halt is None
             and self._pending_dial_frequency is None
             and self.pending_tx_audio_attenuation is None
             and not has_pending_direct
@@ -1994,6 +2063,8 @@ class AutopilotRuntime:
         """Release an active QSO as soon as WSJT-X reports its TX watchdog."""
         if not packet.tx_watchdog:
             return
+        if self._pending_watchdog_halt is not None:
+            return
         session = self.engine.state.session
         if session.state is QsoState.IDLE:
             return
@@ -2005,8 +2076,25 @@ class AutopilotRuntime:
             stage,
         )
         if packet.transmitting or packet.tx_enabled:
-            halted = self._halt_tx(packet.header.instance_id, "WSJT-X Runaway TX watchdog")
-            if not halted and not isinstance(self.control, DryRunControl):
+            halt_result = self._request_halt_tx(packet.header.instance_id, "WSJT-X Runaway TX watchdog")
+            halted = halt_result.radio_ok and halt_result.wsjtx_ok
+            if not halted and halt_result.wsjtx_ok and not packet.transmitting:
+                halted = True
+                LOGGER.warning(
+                    "[WATCHDOG] Hamlib PTT OFF confirmation unavailable, but WSJT-X is already in RX"
+                )
+            elif not halted and halt_result.wsjtx_ok and not isinstance(self.control, DryRunControl):
+                self._pending_watchdog_halt = PendingWatchdogHalt(
+                    packet.header.instance_id,
+                    remote,
+                    now + _WATCHDOG_HALT_CONFIRM_TIMEOUT,
+                )
+                LOGGER.warning(
+                    "[WATCHDOG] HaltTx sent; waiting %.1f s for WSJT-X RX confirmation remote=%s",
+                    _WATCHDOG_HALT_CONFIRM_TIMEOUT.total_seconds(),
+                    remote or "unknown",
+                )
+            elif not halted and not isinstance(self.control, DryRunControl):
                 self._disarm_control("halt_tx_failed_wsjtx_watchdog", "AutopilotRuntime._handle_wsjtx_tx_watchdog")
                 self._watchdog_halt_failed = True
                 self.last_qso_notice = f"SAFETY FAULT - HaltTx failed ({remote})"
@@ -2026,6 +2114,29 @@ class AutopilotRuntime:
             self.note_adaptive_failure(remote, outcome, now)
             self.last_qso_notice = f"QSO abandoned - WSJT-X TX watchdog ({remote})"
             self._log_ready_for_next_qso()
+
+    def _poll_watchdog_halt_confirmation(self, now: datetime) -> None:
+        pending = self._pending_watchdog_halt
+        if pending is None:
+            return
+        if not self.status.transmitting:
+            self._pending_watchdog_halt = None
+            self._watchdog_halt_failed = False
+            LOGGER.warning(
+                "[WATCHDOG] WSJT-X RX confirmed after HaltTx; AutoPilot remains armed remote=%s",
+                pending.remote or "unknown",
+            )
+            return
+        if now < pending.deadline:
+            return
+        self._pending_watchdog_halt = None
+        self._disarm_control("halt_tx_unconfirmed_wsjtx_watchdog", "AutopilotRuntime._poll_watchdog_halt_confirmation")
+        self._watchdog_halt_failed = True
+        self.last_qso_notice = f"SAFETY FAULT - TX still active after HaltTx ({pending.remote})"
+        LOGGER.critical(
+            "[WATCHDOG] WSJT-X still transmitting after HaltTx confirmation timeout; AutoPilot disarmed remote=%s",
+            pending.remote or "unknown",
+        )
 
     def _log_ready_for_next_qso(self) -> None:
         maximum = self.control.max_actions

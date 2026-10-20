@@ -92,6 +92,8 @@ class UserSettings:
     ftx1_swr_trip_samples: int = 2
     ftx1_auto_apply_band_profiles: bool = False
     ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
+    discord_presence_enabled: bool = True
+    discord_application_id: str = "1561768680193400902"
     logging_level: str = "normal"
 
     def normalize(self) -> None:
@@ -99,6 +101,9 @@ class UserSettings:
         self.preferred_continents = {value.strip().upper() for value in self.preferred_continents if value.strip()}
         self.preferred_dxcc = {value.strip().upper() for value in self.preferred_dxcc if value.strip()}
         self.blacklist = {value.strip().upper() for value in self.blacklist if value.strip()}
+        self.discord_application_id = "".join(character for character in str(self.discord_application_id) if character.isdigit())
+        if not self.discord_application_id:
+            self.discord_presence_enabled = False
         self.max_actions = max(1, int(self.max_actions))
         self.ignore_minutes = max(1, int(self.ignore_minutes))
         self.max_no_progress_periods = max(1, int(self.max_no_progress_periods))

@@ -13,7 +13,7 @@ from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, CooldownKin
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.main import build_control
-from wsjtx_autopilot.runtime import AutopilotRuntime
+from wsjtx_autopilot.runtime import AutopilotRuntime, HaltTxResult
 from wsjtx_autopilot.wsjtx.models import (
     ClearPacket,
     DecodePacket,
@@ -56,9 +56,13 @@ def test_rearm_clears_stale_swr_safety_notice() -> None:
     )
     app = AutopilotRuntime(config, control=control)
     app.last_qso_notice = "SWR SAFETY 2.50 - AutoPilot disarmed"
+    app.antenna_safety_level = "fault"
+    app._hamlib_swr_fault_latched = True
 
     assert app.arm_control()
     assert app.last_qso_notice == ""
+    assert app.antenna_safety_level == "ok"
+    assert app.antenna_safety_events[-1].endswith("Protection SWR réarmée par l'opérateur")
 
 
 def original(
@@ -444,6 +448,22 @@ def test_worked_and_unreachable_cqs_exhaust_current_band_without_failure_thresho
     command = parse_datagram(transport.sent[-1][0])
     assert isinstance(command, SetDialFrequencyPacket)
     assert command.frequency_hz == 18_100_000
+
+
+def test_adaptive_snapshot_exposes_viable_count_and_quiet_countdown() -> None:
+    app = control_runtime(FakeTransport())
+    app.config = replace(app.config, adaptive_opportunity_quiet_seconds=180)
+    app.opportunities.reset("20m", "FT8", NOW)
+    app.opportunities.observe("XQ3SK", NOW + timedelta(seconds=10))
+    app._last_runtime_at = NOW + timedelta(seconds=70)
+
+    opportunities = app.adaptive_snapshot()["opportunities"]
+
+    assert opportunities["viable_count"] == 1
+    assert opportunities["quiet_elapsed_seconds"] == 60
+    assert opportunities["quiet_threshold_seconds"] == 180
+    assert opportunities["quiet_remaining_seconds"] == 120
+    assert opportunities["exhausted"] is False
 
 
 def test_inactive_unanswered_qso_counts_once_for_stagnation() -> None:
@@ -1183,6 +1203,65 @@ def test_wsjtx_runaway_watchdog_aborts_immediately_and_uses_waiting_candidate(ca
     assert cooldown is not None
     assert cooldown.kind is CooldownKind.STALLED_QSO
     assert "WSJT-X Runaway TX watchdog remote=OH2ZZ" in caplog.text
+
+
+def test_wsjtx_watchdog_waits_for_rx_confirmation_before_disarming(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3)
+    app.handle(runtime_decode("CQ OH2ZZ KP20", ENDPOINT), NOW, ENDPOINT)
+    monkeypatch.setattr(app, "_request_halt_tx", lambda *_args: HaltTxResult(False, True, None))
+
+    action = app.handle(
+        runtime_status(
+            "OH2ZZ",
+            tx_enabled=True,
+            transmitting=True,
+            tx_message="OH2ZZ F4NJU -08",
+            tx_watchdog=True,
+        ),
+        NOW + timedelta(seconds=1),
+        ENDPOINT,
+    )
+
+    assert action is None
+    assert app.control.armed
+    assert app.engine.state.session.state is QsoState.IDLE
+    assert app._pending_watchdog_halt is not None
+
+    app.handle(
+        runtime_status("", tx_enabled=False, transmitting=False),
+        NOW + timedelta(seconds=1, milliseconds=100),
+        ENDPOINT,
+    )
+
+    assert app.control.armed
+    assert app._pending_watchdog_halt is None
+    assert not app._watchdog_halt_failed
+
+
+def test_wsjtx_watchdog_disarms_if_tx_remains_active_after_confirmation_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3)
+    app.handle(runtime_decode("CQ OH2ZZ KP20", ENDPOINT), NOW, ENDPOINT)
+    monkeypatch.setattr(app, "_request_halt_tx", lambda *_args: HaltTxResult(False, True, None))
+    app.handle(
+        runtime_status(
+            "OH2ZZ",
+            tx_enabled=True,
+            transmitting=True,
+            tx_message="OH2ZZ F4NJU -08",
+            tx_watchdog=True,
+        ),
+        NOW + timedelta(seconds=1),
+        ENDPOINT,
+    )
+
+    app.handle(None, NOW + timedelta(seconds=3, milliseconds=100), ENDPOINT)
+
+    assert not app.control.armed
+    assert app._pending_watchdog_halt is None
+    assert app._watchdog_halt_failed
+    assert "TX still active" in app.last_qso_notice
 
 
 def test_direct_reply_uses_same_qso_logged_completion_cycle() -> None:

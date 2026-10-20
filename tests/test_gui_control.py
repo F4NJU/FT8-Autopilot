@@ -497,6 +497,14 @@ def test_main_window_displays_adaptive_state_and_emits_reset(tmp_path, monkeypat
                 "current_band": "20m",
                 "next_band": "17m",
                 "band_changing_to": "17m",
+                "opportunities": {
+                    "available": ["XQ3SK", "DL1ABC"],
+                    "viable_count": 2,
+                    "quiet_elapsed_seconds": 47,
+                    "quiet_threshold_seconds": 180,
+                    "quiet_remaining_seconds": 133,
+                    "exhausted": False,
+                },
             }
         )
         application.processEvents()
@@ -505,6 +513,9 @@ def test_main_window_displays_adaptive_state_and_emits_reset(tmp_path, monkeypat
         assert window.tx_period_status.text() == "TX period: Second (Auto)"
         assert window.band_status.text() == "Band: 20m"
         assert window.next_band_status.text() == "Next adaptive band: 17m"
+        assert window.opportunity_status.text() == (
+            "VIABLES : 2   |   SANS NOUVELLE : 00:47 / 03:00   |   PROCHAINE BASCULE : 02:13"
+        )
         next(button for button in window.findChildren(type(window.arm_button)) if button.text() == "RESET ADAPTIVE STRATEGY").click()
         assert resets == [True]
     finally:

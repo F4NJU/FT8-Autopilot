@@ -166,6 +166,8 @@ class SettingsDialog(QDialog):
             ftx1_swr_trip_samples=self.ftx1_swr_samples.value(),
             ftx1_auto_apply_band_profiles=self.ftx1_alc_control.isChecked(),
             ftx1_band_profiles=self._settings.ftx1_band_profiles,
+            discord_presence_enabled=self.discord_presence_enabled.isChecked(),
+            discord_application_id=self.discord_application_id.text().strip(),
             logging_level=self.logging_level.currentData(),
         )
 
@@ -556,12 +558,18 @@ class SettingsDialog(QDialog):
         self.logging_level.addItem("Normal", "normal")
         self.logging_level.addItem("Debug", "debug")
         self.logging_level.setCurrentIndex(max(0, self.logging_level.findData(self._settings.logging_level)))
+        self.discord_presence_enabled = QCheckBox("Afficher l'activité FT8 sur Discord")
+        self.discord_presence_enabled.setChecked(self._settings.discord_presence_enabled)
+        self.discord_application_id = QLineEdit(self._settings.discord_application_id)
+        self.discord_application_id.setPlaceholderText("Discord Application ID")
         session = current_logging_session()
         log_path = session.path if session is not None else AppPaths.from_environment().log_dir
         current_log = QLabel(str(log_path))
         current_log.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         current_log.setWordWrap(True)
         form.addRow("File logging", self.logging_level)
+        form.addRow(self.discord_presence_enabled)
+        form.addRow("Discord Application ID", self.discord_application_id)
         form.addRow("Current session log", current_log)
         layout.addLayout(form)
         open_folder = QPushButton("OPEN LOG FOLDER")
@@ -705,6 +713,9 @@ class MainWindow(QMainWindow):
         self.reset_all_ftx1_band_profiles_button.clicked.connect(self.reset_all_ftx1_band_profiles_requested.emit)
         self.reset_all_ftx1_band_profiles_button.setVisible(False)
         controls_row = QHBoxLayout()
+        self.opportunity_status = QLabel("VIABLES : —   |   SANS NOUVELLE : — / 03:00   |   PROCHAINE BASCULE : —")
+        self.opportunity_status.setObjectName("opportunityStatus")
+        controls_row.addWidget(self.opportunity_status)
         controls_row.addStretch()
         self._profile_control_buttons = (
             reset_adaptive,
@@ -928,6 +939,28 @@ class MainWindow(QMainWindow):
             self.tx_period_status.setText(f"TX period: {text}" + (" (Auto)" if requested is not None else ""))
         self.band_status.setText(f"Band: {current_band}")
         self.next_band_status.setText(f"Next adaptive band: {snapshot.get('next_band') or '—'}")
+        opportunities = snapshot.get("opportunities")
+        if isinstance(opportunities, dict):
+            available_calls = tuple(opportunities.get("available") or ())
+            viable_count = int(opportunities.get("viable_count", len(available_calls)))
+            elapsed = max(0, int(float(opportunities.get("quiet_elapsed_seconds") or 0)))
+            threshold = max(1, int(float(opportunities.get("quiet_threshold_seconds") or 180)))
+            remaining = max(0, int(float(opportunities.get("quiet_remaining_seconds") or 0)))
+
+            def clock(seconds: int) -> str:
+                minutes, seconds = divmod(seconds, 60)
+                return f"{minutes:02d}:{seconds:02d}"
+
+            if bool(opportunities.get("exhausted")):
+                switch_text = "BANDE ÉPUISÉE"
+            elif remaining <= 0:
+                switch_text = "EN ATTENTE"
+            else:
+                switch_text = clock(remaining)
+            self.opportunity_status.setText(
+                f"VIABLES : {viable_count}   |   SANS NOUVELLE : {clock(elapsed)} / {clock(threshold)}"
+                f"   |   PROCHAINE BASCULE : {switch_text}"
+            )
         antenna = snapshot.get("antenna_safety")
         if isinstance(antenna, dict):
             level = str(antenna.get("level") or "ok")
@@ -1093,6 +1126,7 @@ class MainWindow(QMainWindow):
             #warningText { color: #efbd67; background: #2a2115; border: 1px solid #6f522b; padding: 8px; }
             #adaptiveAvailable { color: #70dfbd; font-weight: 700; }
             #adaptiveUnavailable { color: #efbd67; font-weight: 700; }
+            #opportunityStatus { color: #8dccff; font-weight: 800; letter-spacing: 0.5px; }
             #infoText { color: #8299a8; padding: 5px; }
             #qsoState { color: #70dfbd; font-size: 15px; font-weight: 800; padding: 2px 8px; }
             #antennaSafety { border-radius: 12px; padding: 6px 10px; font-weight: 900; }

@@ -44,6 +44,8 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
         ftx1_cat2_timeout_seconds=0.4,
         ftx1_auto_apply_band_profiles=True,
         ftx1_band_profiles={"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}, "40m": {"usb_mod_gain": 32, "tx_audio_attenuation": 145}},
+        discord_presence_enabled=True,
+        discord_application_id="1561768680193400902",
     )
 
     store.save(settings)
@@ -78,6 +80,8 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     assert loaded.ftx1_cat2_timeout_seconds == 0.4
     assert loaded.ftx1_auto_apply_band_profiles
     assert loaded.ftx1_band_profiles == {"20m": {"tx_audio_attenuation": 118}, "40m": {"tx_audio_attenuation": 145}}
+    assert loaded.discord_presence_enabled
+    assert loaded.discord_application_id == "1561768680193400902"
     assert "usb_mod_gain" not in payload["ftx1_band_profiles"]["20m"]
     assert "armed" not in payload
 
