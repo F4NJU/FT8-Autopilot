@@ -8,8 +8,8 @@ actuelle n'offre plus de contact intéressant.
 L'opérateur reste responsable de la station, des émissions et du respect de
 la réglementation.
 
-**Statut : `v0.1.0-wip.1` — première préversion officielle, encore en cours
-de validation sur le terrain.**
+**Statut : préversion officielle WIP, encore en cours de validation sur le
+terrain.**
 
 ## Installation
 
@@ -57,13 +57,27 @@ activé.
 - filtrage des doublons, blacklist et priorités DXCC/continent ;
 - changement automatique de cycle TX puis de bande quand les contacts viables
   sont épuisés ;
+- changement de bande forcé après une durée maximale réglable, fixée à
+  **30 minutes par défaut**, même si les autres critères de rotation ne sont
+  pas encore atteints ;
 - lecture et commande de la radio par Hamlib ;
 - régulation ALC et protection SWR lorsqu'elles sont compatibles avec la radio ;
 - affichage Discord, par exemple `FT8 - 40m` et `Working EA7CTA`.
 
-La protection SWR coupe immédiatement l'émission et désarme AutoPilot. La
-tentative d'accord automatique et l'exclusion automatique d'une bande sont
-actuellement désactivées.
+La durée maximale sur une bande se règle dans les préférences. La valeur `0`
+désactive uniquement cette limite de temps. Un QSO déjà engagé reste
+prioritaire : le changement attend sa fin. Les bandes exclues par la protection
+SWR sont ignorées et un changement de bande normal ne lance pas d'accord
+automatique.
+
+La protection SWR coupe immédiatement l'émission. Une fois le retour en RX
+confirmé, AutoPilot tente un accord par Hamlib et vérifie l'état réel du tuner
+ainsi que plusieurs mesures SWR. Si l'accord réussit, le trafic reprend après
+un cycle de sécurité. Si le SWR reste trop élevé, la bande est exclue pour la
+session et une autre bande autorisée est sélectionnée sans relancer d'accord.
+La protection contrôlera naturellement cette nouvelle bande au premier TX. Une
+commande non confirmée ou des mesures insuffisantes provoquent un arrêt de
+sécurité sans exclure la bande.
 
 ## En cas de problème
 

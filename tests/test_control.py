@@ -1377,6 +1377,66 @@ def test_remote_busy_halt_tx_does_not_disarm_control() -> None:
     assert app.control.actions_used == 1
 
 
+def test_remote_busy_waits_for_wsjtx_rx_when_hamlib_stop_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3)
+    app.handle(runtime_decode("CQ OH2ZZ KP20", ENDPOINT), NOW, ENDPOINT)
+    app.handle(
+        runtime_status(
+            "OH2ZZ",
+            tx_enabled=True,
+            transmitting=True,
+            tx_message="OH2ZZ F4NJU -08",
+        ),
+        NOW + timedelta(seconds=1),
+        ENDPOINT,
+    )
+    monkeypatch.setattr(app, "_request_halt_tx", lambda *_args: HaltTxResult(False, True, None))
+
+    app.handle(runtime_decode("UT2UB OH2ZZ +13", ENDPOINT, df=1201), NOW + timedelta(seconds=2), ENDPOINT)
+
+    assert app.control.armed
+    assert app.engine.state.session.state is QsoState.IDLE
+    assert app._pending_watchdog_halt is not None
+
+    app.handle(
+        runtime_status("", tx_enabled=False, transmitting=False),
+        NOW + timedelta(seconds=2, milliseconds=200),
+        ENDPOINT,
+    )
+
+    assert app.control.armed
+    assert app._pending_watchdog_halt is None
+    assert not app._watchdog_halt_failed
+
+
+def test_remote_busy_disarms_only_if_tx_stays_active_after_confirmation_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    app = control_runtime(transport, max_actions=3)
+    app.handle(runtime_decode("CQ OH2ZZ KP20", ENDPOINT), NOW, ENDPOINT)
+    app.handle(
+        runtime_status(
+            "OH2ZZ",
+            tx_enabled=True,
+            transmitting=True,
+            tx_message="OH2ZZ F4NJU -08",
+        ),
+        NOW + timedelta(seconds=1),
+        ENDPOINT,
+    )
+    monkeypatch.setattr(app, "_request_halt_tx", lambda *_args: HaltTxResult(False, True, None))
+    app.handle(runtime_decode("UT2UB OH2ZZ +13", ENDPOINT, df=1201), NOW + timedelta(seconds=2), ENDPOINT)
+
+    app.handle(None, NOW + timedelta(seconds=4, milliseconds=100), ENDPOINT)
+
+    assert not app.control.armed
+    assert app._pending_watchdog_halt is None
+    assert app._watchdog_halt_failed
+    assert "TX still active" in app.last_qso_notice
+
+
 def test_failed_remote_busy_halt_retains_active_qso_and_disarms() -> None:
     transport = FakeTransport()
     app = control_runtime(transport, max_actions=3)

@@ -118,6 +118,49 @@ def test_forced_hop_does_not_request_before_dwell_expires() -> None:
     assert not any(isinstance(packet, SetDialFrequencyPacket) for packet in sent_packets(transport))
 
 
+def test_adaptive_band_hop_forces_change_after_maximum_dwell() -> None:
+    transport = FakeTransport()
+    config = replace(
+        AppConfig(),
+        candidate_collection_seconds=0,
+        automatic_band_hopping_enabled=True,
+        allowed_auto_hop_bands=("20m", "30m", "40m"),
+        maximum_band_dwell_minutes=30,
+        forced_band_hopping_enabled=False,
+    )
+    app = AutopilotRuntime(config, control=WsjtxUdpControl(transport, 15, None, armed=True))
+    app.handle(heartbeat(), NOW, ENDPOINT)
+    app.handle(status(14_074_000), NOW, ENDPOINT)
+    transport.sent.clear()
+
+    app.handle(None, NOW + timedelta(minutes=29, seconds=59), ENDPOINT)
+    assert not any(isinstance(packet, SetDialFrequencyPacket) for packet in sent_packets(transport))
+
+    app.handle(None, NOW + timedelta(minutes=30), ENDPOINT)
+    assert dial_command(transport).frequency_hz == 10_136_000
+
+
+def test_maximum_dwell_never_selects_swr_excluded_band() -> None:
+    transport = FakeTransport()
+    config = replace(
+        AppConfig(),
+        candidate_collection_seconds=0,
+        automatic_band_hopping_enabled=True,
+        allowed_auto_hop_bands=("20m", "30m", "40m"),
+        maximum_band_dwell_minutes=30,
+        forced_band_hopping_enabled=False,
+    )
+    app = AutopilotRuntime(config, control=WsjtxUdpControl(transport, 15, None, armed=True))
+    app.handle(heartbeat(), NOW, ENDPOINT)
+    app.handle(status(14_074_000), NOW, ENDPOINT)
+    app._swr_excluded_bands.add("30m")
+    transport.sent.clear()
+
+    app.handle(None, NOW + timedelta(minutes=30), ENDPOINT)
+
+    assert dial_command(transport).frequency_hz == 7_074_000
+
+
 def test_expired_forced_dwell_requests_immediately_while_idle() -> None:
     transport = FakeTransport()
     app = runtime(transport)

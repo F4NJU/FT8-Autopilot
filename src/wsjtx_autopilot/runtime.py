@@ -41,13 +41,12 @@ _UNKNOWN_TR_PERIOD = 0xFFFFFFFF
 _SWR_TUNE_TIMEOUT = timedelta(seconds=15)
 _SWR_TUNE_RF_START_TIMEOUT = timedelta(seconds=3)
 _SWR_TUNE_POLL_INTERVAL = timedelta(seconds=0.5)
+_SWR_TUNE_MIN_ACTIVE_TIME = timedelta(seconds=2)
+_SWR_TUNE_MIN_RF_WATTS = 0.25
 _SWR_TUNE_MIN_SAMPLES = 2
 _SWR_RX_CONFIRM_TIMEOUT = timedelta(seconds=5)
 _WATCHDOG_HALT_CONFIRM_TIMEOUT = timedelta(seconds=2)
-# Automatic tuner/band recovery is intentionally parked for now.  Keep the
-# implementation below so it can be revisited without reintroducing it into
-# the live safety path.
-_SWR_AUTOMATIC_RECOVERY_ENABLED = False
+_SWR_AUTOMATIC_RECOVERY_ENABLED = True
 
 
 def _tr_period_seconds(raw_period: int) -> int | None:
@@ -100,6 +99,9 @@ class PendingWatchdogHalt:
     instance_id: str
     remote: str
     deadline: datetime
+    disarm_reason: str = "halt_tx_unconfirmed_wsjtx_watchdog"
+    source: str = "AutopilotRuntime._poll_watchdog_halt_confirmation"
+    context: str = "WATCHDOG"
 
 
 @dataclass(slots=True)
@@ -112,6 +114,8 @@ class SwrRecovery:
     tune_started_at: datetime | None = None
     next_poll_at: datetime | None = None
     seen_rf: bool = False
+    tuner_state_supported: bool = False
+    seen_tuning_state: bool = False
     swr_samples: list[float] | None = None
     tune_attempts: int = 0
 
@@ -786,7 +790,28 @@ class AutopilotRuntime:
             self.last_qso_notice = f"QSO abandoned - {remote} is working {other}; searching candidates"
             halt_failed = False
             if self.status.tx_enabled and self.status.dx_call.upper() == remote.upper():
-                halted = self._halt_tx(event.original.instance_id, "remote engaged another station")
+                halt_result = self._request_halt_tx(event.original.instance_id, "remote engaged another station")
+                halted = halt_result.radio_ok and halt_result.wsjtx_ok
+                if not halted and halt_result.wsjtx_ok and not self.status.transmitting:
+                    halted = True
+                    LOGGER.warning(
+                        "[REMOTE-BUSY] Hamlib PTT OFF confirmation unavailable, but WSJT-X is already in RX"
+                    )
+                elif not halted and halt_result.wsjtx_ok and not isinstance(self.control, DryRunControl):
+                    self._pending_watchdog_halt = PendingWatchdogHalt(
+                        event.original.instance_id,
+                        remote,
+                        now + _WATCHDOG_HALT_CONFIRM_TIMEOUT,
+                        "halt_tx_unconfirmed_remote_busy",
+                        "AutopilotRuntime._poll_watchdog_halt_confirmation",
+                        "REMOTE-BUSY",
+                    )
+                    halted = True
+                    LOGGER.warning(
+                        "[REMOTE-BUSY] HaltTx sent; waiting %.1f s for WSJT-X RX confirmation remote=%s",
+                        _WATCHDOG_HALT_CONFIRM_TIMEOUT.total_seconds(),
+                        remote,
+                    )
                 if not halted and not isinstance(self.control, DryRunControl):
                     self._disarm_control("halt_tx_failed_remote_busy", "AutopilotRuntime._handle_decode")
                     self.last_qso_notice = f"SAFETY FAULT - HaltTx failed ({remote})"
@@ -1068,10 +1093,18 @@ class AutopilotRuntime:
         self.last_band_change_at = now
         if pending.source == "swr_recovery":
             if self._swr_recovery is not None:
-                self._swr_recovery.phase = "wait_rx"
-                self._swr_recovery.current_band = pending.band
-                self._antenna_event(now, f"Bande {pending.band} confirmée, nouvel accord")
-            LOGGER.info("[BAND] SWR recovery confirmed=%s", pending.band)
+                self._swr_recovery = None
+                self._hamlib_swr_fault_latched = False
+                self._hamlib_high_swr_samples = 0
+                self.antenna_safety_level = "warning"
+                self._antenna_event(
+                    now,
+                    f"Bande {pending.band} confirmée, reprise sans nouvel accord automatique",
+                )
+                self.last_qso_notice = f"SWR BAND EXCLUDED - resumed on {pending.band} without tune"
+            self._band_resume_at = now + timedelta(seconds=period_seconds or 15)
+            self._band_resume_band = pending.band
+            LOGGER.info("[BAND] SWR recovery confirmed=%s without retune", pending.band)
             return
         if pending.source == "forced":
             self._start_forced_band_hop_dwell(pending.band, now)
@@ -1450,6 +1483,8 @@ class AutopilotRuntime:
                 return
             recovery.swr_samples = []
             recovery.seen_rf = False
+            recovery.tuner_state_supported = bool(getattr(cat, "tuner_reports_active_state", False))
+            recovery.seen_tuning_state = False
             self._antenna_event(
                 now,
                 f"Accord automatique {recovery.current_band or 'bande inconnue'} "
@@ -1471,22 +1506,60 @@ class AutopilotRuntime:
         recovery.next_poll_at = now + _SWR_TUNE_POLL_INTERVAL
         read_power_meter = getattr(cat, "read_power", None)
         read_swr = getattr(cat, "read_swr", None)
+        read_tuner_state = getattr(cat, "read_tuner_state", None)
+        tuner_state = read_tuner_state() if recovery.tuner_state_supported and callable(read_tuner_state) else None
         power = read_power_meter() if callable(read_power_meter) else None
         swr = read_swr() if callable(read_swr) else None
         self.last_hamlib_power_watts = float(power) if power is not None else None
         self.last_hamlib_swr = float(swr) if swr is not None else None
-        if power is not None and float(power) >= 1.0:
+        elapsed = now - recovery.tune_started_at
+        if power is not None and float(power) >= _SWR_TUNE_MIN_RF_WATTS:
             recovery.seen_rf = True
             if swr is not None:
                 recovery.swr_samples.append(float(swr))
             LOGGER.info("[HAMLIB] tune meters band=%s SWR=%s PWR_W=%s", recovery.current_band, swr, power)
-        elif recovery.seen_rf:
+        if tuner_state == 3:
+            recovery.seen_tuning_state = True
+        LOGGER.info(
+            "[HAMLIB] tune poll band=%s elapsed=%.2fs tuner_state=%s power_w=%s swr=%s "
+            "seen_active=%s seen_rf=%s samples=%d",
+            recovery.current_band,
+            elapsed.total_seconds(),
+            tuner_state,
+            power,
+            swr,
+            recovery.seen_tuning_state,
+            recovery.seen_rf,
+            len(recovery.swr_samples or []),
+        )
+        tuner_finished = (
+            recovery.tuner_state_supported
+            and recovery.seen_tuning_state
+            and recovery.seen_rf
+            and elapsed >= _SWR_TUNE_MIN_ACTIVE_TIME
+            and tuner_state in {0, 1}
+        )
+        generic_tune_finished = (
+            not recovery.tuner_state_supported
+            and recovery.seen_rf
+            and (power is None or float(power) < _SWR_TUNE_MIN_RF_WATTS)
+        )
+        if tuner_finished or generic_tune_finished:
             self._evaluate_swr_tune(now)
             return
-        if not recovery.seen_rf and now - recovery.tune_started_at >= _SWR_TUNE_RF_START_TIMEOUT:
+        # AC..3 alone is not sufficient proof that the FTX-1 really emitted a
+        # tuning carrier: rigctld can briefly return a stale state immediately
+        # after the start command. Require RF too before accepting AC..1 as the
+        # end of the sweep.
+        tune_confirmed = (
+            recovery.seen_tuning_state and recovery.seen_rf
+            if recovery.tuner_state_supported
+            else recovery.seen_rf
+        )
+        if not tune_confirmed and now - recovery.tune_started_at >= _SWR_TUNE_RF_START_TIMEOUT:
             self._finish_swr_recovery_fault(
                 now,
-                "accord automatique non démarré (aucune puissance RF)",
+                "accord automatique non démarré (état tuner/RF non confirmé, bande conservée)",
             )
             return
         if now - recovery.tune_started_at >= _SWR_TUNE_TIMEOUT:
@@ -1497,42 +1570,34 @@ class AutopilotRuntime:
         if recovery is None:
             return
         samples = recovery.swr_samples or []
-        # An automatic tuner normally sweeps through a high SWR before it
-        # reaches its match.  Judging the median of the whole tail therefore
-        # rejects a good match when the meter only catches one final low
-        # reading.  Only RF-valid samples are stored, so the best reading in
-        # the final window is the useful end-of-tune result.
-        terminal_samples = samples[-3:]
-        measured = min(terminal_samples) if terminal_samples else None
-        if measured is not None and measured < self.config.ftx1_swr_limit:
+        # The FTX-1 reports AC..3 for the whole tuner sweep and returns to
+        # AC..1 when it is finished.  Ignore the expected high SWR at the
+        # beginning and require the last two RF-valid samples to be good.
+        terminal_samples = samples[-_SWR_TUNE_MIN_SAMPLES:]
+        measured = max(terminal_samples) if terminal_samples else None
+        if (
+            len(terminal_samples) >= _SWR_TUNE_MIN_SAMPLES
+            and measured is not None
+            and measured < self.config.ftx1_swr_limit
+        ):
             self._complete_swr_tune(now, success=True, detail=f"SWR final {measured:.2f}")
             return
-
-        # Some external tuners drop their carrier before Hamlib refreshes the
-        # final meter value.  A second, short tune on the now matched network
-        # provides a real RF verification instead of excluding the band from
-        # measurements taken during the first sweep.
-        if recovery.tune_attempts < 2:
-            controller = self.ftx1_band_drive
-            start_tune = getattr(controller.cat, "start_tune", None) if controller is not None else None
-            if callable(start_tune) and start_tune():
-                recovery.tune_attempts += 1
-                recovery.swr_samples = []
-                recovery.seen_rf = False
-                recovery.tune_started_at = now
-                recovery.next_poll_at = now + timedelta(seconds=0.2)
-                self._antenna_event(
-                    now,
-                    f"Contrôle final de l'accord sur {recovery.current_band or 'bande inconnue'}",
-                )
-                LOGGER.warning(
-                    "[HAMLIB] SWR recovery verification tune started band=%s attempt=%d",
-                    recovery.current_band,
-                    recovery.tune_attempts,
-                )
-                return
-
-        detail = "mesures SWR insuffisantes" if len(samples) < _SWR_TUNE_MIN_SAMPLES else f"SWR final {measured:.2f}"
+        # A completed tuner cycle with even one RF-valid sample above the
+        # safety limit is enough to reject this band.  Requiring two samples
+        # here used to turn a clear SWR 5.0 failure into a global disarm before
+        # the recovery loop could exclude the band and try the next one.
+        if measured is not None and measured >= self.config.ftx1_swr_limit:
+            count = len(terminal_samples)
+            self._complete_swr_tune(
+                now,
+                success=False,
+                detail=f"SWR final {measured:.2f} ({count} mesure{'s' if count > 1 else ''} RF)",
+            )
+            return
+        if len(samples) < _SWR_TUNE_MIN_SAMPLES:
+            self._finish_swr_recovery_fault(now, "mesures SWR insuffisantes après accord, bande conservée")
+            return
+        detail = f"SWR final {measured:.2f}"
         self._complete_swr_tune(
             now,
             success=False,
@@ -1547,12 +1612,21 @@ class AutopilotRuntime:
         cat = controller.cat
         restored = True
         if recovery.original_power_fraction is not None:
-            set_power = getattr(cat, "set_rf_power_fraction", None)
-            restored = bool(callable(set_power) and set_power(recovery.original_power_fraction))
+            read_power = getattr(cat, "read_rf_power_fraction", None)
+            current_power = read_power() if callable(read_power) else None
+            radio_restores_power = bool(getattr(cat, "tuner_reports_active_state", False))
+            if radio_restores_power:
+                restored = current_power is not None and abs(float(current_power) - recovery.original_power_fraction) <= 0.011
+            else:
+                set_power = getattr(cat, "set_rf_power_fraction", None)
+                restored = bool(callable(set_power) and set_power(recovery.original_power_fraction))
             self._antenna_event(
                 now,
-                f"Puissance restaurée à {recovery.original_power_fraction * 100:.0f} W"
-                if restored else "Échec de restauration de la puissance RF",
+                f"Puissance radio restaurée automatiquement à {recovery.original_power_fraction * 100:.0f} W"
+                if restored and radio_restores_power
+                else f"Puissance restaurée à {recovery.original_power_fraction * 100:.0f} W"
+                if restored
+                else "Échec de restauration de la puissance RF",
             )
         if not restored:
             self._finish_swr_recovery_fault(now, "puissance RF non restaurée")
@@ -1597,6 +1671,8 @@ class AutopilotRuntime:
         recovery.tune_started_at = None
         recovery.next_poll_at = None
         recovery.seen_rf = False
+        recovery.tuner_state_supported = False
+        recovery.seen_tuning_state = False
         recovery.swr_samples = []
         recovery.tune_attempts = 0
         self._antenna_event(now, f"Essai de la bande {target}")
@@ -1737,10 +1813,15 @@ class AutopilotRuntime:
         return snapshot
 
     def _forced_band_hop_bands(self) -> tuple[str, ...]:
+        configured = (
+            self.config.forced_band_hop_bands
+            if self.config.forced_band_hopping_enabled
+            else self.config.allowed_auto_hop_bands
+        )
         return tuple(
             dict.fromkeys(
                 band.strip().lower()
-                for band in self.config.forced_band_hop_bands
+                for band in configured
                 if isinstance(band, str)
                 and band.strip()
                 and band.strip().lower() not in self._swr_excluded_bands
@@ -1748,8 +1829,22 @@ class AutopilotRuntime:
             )
         )
 
+    def _timed_band_hopping_enabled(self) -> bool:
+        return bool(
+            self.config.forced_band_hopping_enabled
+            or (
+                self.config.automatic_band_hopping_enabled
+                and self.config.maximum_band_dwell_minutes > 0
+            )
+        )
+
+    def _timed_band_hop_interval_minutes(self) -> float:
+        if self.config.forced_band_hopping_enabled:
+            return self.config.forced_band_hop_interval_minutes
+        return self.config.maximum_band_dwell_minutes
+
     def _observe_forced_band_hop_status(self, now: datetime) -> None:
-        if not self.config.forced_band_hopping_enabled or self._pending_dial_frequency is not None:
+        if not self._timed_band_hopping_enabled() or self._pending_dial_frequency is not None:
             return
         bands = self._forced_band_hop_bands()
         if not bands:
@@ -1764,7 +1859,7 @@ class AutopilotRuntime:
             LOGGER.info("[BAND-HOP] Current band is outside the configured sequence; pending %s", bands[0])
 
     def _run_forced_band_hop(self, now: datetime) -> None:
-        if self._swr_recovery is not None or not self.config.forced_band_hopping_enabled:
+        if self._swr_recovery is not None or not self._timed_band_hopping_enabled():
             return
         bands = self._forced_band_hop_bands()
         if not bands:
@@ -1775,7 +1870,7 @@ class AutopilotRuntime:
             current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
             if started_at is None or current_band not in bands:
                 return
-            if now - started_at < timedelta(minutes=self.config.forced_band_hop_interval_minutes):
+            if now - started_at < timedelta(minutes=self._timed_band_hop_interval_minutes()):
                 return
             target = self._next_forced_band_hop_band()
             if target is None:
@@ -1803,7 +1898,7 @@ class AutopilotRuntime:
         LOGGER.info(
             "[BAND-HOP] Started dwell on %s for %g min",
             band,
-            self.config.forced_band_hop_interval_minutes,
+            self._timed_band_hop_interval_minutes(),
         )
 
     def _next_forced_band_hop_band(self) -> str | None:
@@ -2123,18 +2218,20 @@ class AutopilotRuntime:
             self._pending_watchdog_halt = None
             self._watchdog_halt_failed = False
             LOGGER.warning(
-                "[WATCHDOG] WSJT-X RX confirmed after HaltTx; AutoPilot remains armed remote=%s",
+                "[%s] WSJT-X RX confirmed after HaltTx; AutoPilot remains armed remote=%s",
+                pending.context,
                 pending.remote or "unknown",
             )
             return
         if now < pending.deadline:
             return
         self._pending_watchdog_halt = None
-        self._disarm_control("halt_tx_unconfirmed_wsjtx_watchdog", "AutopilotRuntime._poll_watchdog_halt_confirmation")
+        self._disarm_control(pending.disarm_reason, pending.source)
         self._watchdog_halt_failed = True
         self.last_qso_notice = f"SAFETY FAULT - TX still active after HaltTx ({pending.remote})"
         LOGGER.critical(
-            "[WATCHDOG] WSJT-X still transmitting after HaltTx confirmation timeout; AutoPilot disarmed remote=%s",
+            "[%s] WSJT-X still transmitting after HaltTx confirmation timeout; AutoPilot disarmed remote=%s",
+            pending.context,
             pending.remote or "unknown",
         )
 

@@ -401,6 +401,44 @@ def test_ftx1_tuner_uses_documented_raw_cat_commands_through_hamlib(monkeypatch)
     assert commands == ["\\send_raw 0 AC101;", "\\send_raw 0 AC103;", "\\send_raw 0 AC100;"]
 
 
+def test_ftx1_tuner_state_reports_active_and_ready(monkeypatch) -> None:
+    controller = HamlibFtx1Controller("COM5", 38_400, 0.25, rig_model=1051)
+    controller._identified = True
+    controller.detected_radio_model = "Yaesu FTX-1"
+    responses = iter(["AC103;", "AC101;"])
+    monkeypatch.setattr(controller, "_command", lambda _command: next(responses))
+
+    assert controller.tuner_reports_active_state
+    assert controller.read_tuner_state() == 3
+    assert controller.read_tuner_state() == 1
+    assert controller._ftx1_tuner_prefix == "10"
+
+
+def test_hamlib_reuses_existing_daemon_without_starting_a_duplicate(monkeypatch) -> None:
+    class ExistingSocket:
+        closed = False
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    existing = ExistingSocket()
+    monkeypatch.setattr("wsjtx_autopilot.hamlib.socket.create_connection", lambda *_args, **_kwargs: existing)
+
+    def duplicate_process(*_args, **_kwargs):
+        raise AssertionError("a second rigctld must not be started")
+
+    controller = HamlibFtx1Controller("COM5", 38_400, 0.25, process_factory=duplicate_process)
+    assert controller.start()
+    assert controller._process is None
+    controller._identified = True
+    assert controller.is_ready
+    controller.close()
+    assert existing.closed
+
+
 def test_hamlib_detects_ftx1_from_real_cat_identity_before_vendor_commands(monkeypatch) -> None:
     controller = HamlibFtx1Controller("COM5", 38_400, 0.25, rig_model=1051)
     responses = {"f": "14074000", "\\get_info": "ID0840", "\\send_raw ; AC;": "AC001;"}
@@ -433,7 +471,8 @@ def test_hamlib_unknown_cat_identity_uses_only_generic_commands(monkeypatch) -> 
     assert commands == ["U TUNER 1", "G TUNE"]
 
 
-def test_hamlib_swr_trip_halts_tx_and_disarms_without_automatic_tune() -> None:
+def test_hamlib_swr_trip_halts_tx_and_disarms_when_automatic_tune_is_disabled(monkeypatch) -> None:
+    monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", False)
     cat = FakeCat(35, alc=0.05, swr=2.5, power=20.0)
     transport = FakeTransport()
     control = WsjtxUdpControl(transport, 15, None, armed=True)
@@ -521,6 +560,23 @@ class FakeTuneCat(FakeCat):
         return self.swr
 
 
+class FakeFtx1TuneCat(FakeTuneCat):
+    tuner_reports_active_state = True
+
+    def __init__(self, powers: list[float], swrs: list[float], states: list[int]) -> None:
+        super().__init__(powers, swrs)
+        self._tuner_states = list(states)
+        self._last_tuner_state = 1
+
+    def read_tuner_state(self) -> int:
+        if self._tuner_states:
+            self._last_tuner_state = self._tuner_states.pop(0)
+        return self._last_tuner_state
+
+    def read_rf_power_fraction(self) -> float:
+        return 0.05 if self._last_tuner_state == 3 else self.rf_power_fraction
+
+
 class FailingPttOffTuneCat(FakeTuneCat):
     def stop_transmit(self) -> bool:
         return False
@@ -570,6 +626,7 @@ def test_swr_tune_success_restores_power_and_keeps_control_armed(monkeypatch) ->
     runtime.handle(None, NOW + timedelta(seconds=1.3), ENDPOINT)
     runtime.handle(None, NOW + timedelta(seconds=1.9), ENDPOINT)
     runtime.handle(None, NOW + timedelta(seconds=2.5), ENDPOINT)
+    runtime.handle(None, NOW + timedelta(seconds=3.1), ENDPOINT)
 
     assert cat.tune_started
     assert cat.restored_power == [0.5]
@@ -580,9 +637,103 @@ def test_swr_tune_success_restores_power_and_keeps_control_armed(monkeypatch) ->
     assert "Accord réussi" in "\n".join(runtime.antenna_safety_events)
 
 
+def test_ftx1_swr_tune_uses_ac_state_and_never_writes_temporary_five_watts(monkeypatch) -> None:
+    monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", True)
+    cat = FakeFtx1TuneCat(
+        [1.2, 3.0, 4.0, 0.0],
+        [5.0, 1.49, 1.56, 1.0],
+        [3, 3, 3, 1],
+    )
+    control = WsjtxUdpControl(FakeTransport(), 15, None, armed=True)
+    runtime = AutopilotRuntime(
+        AppConfig(ftx1_hamlib_enabled=True, ftx1_swr_limit=2.0, ftx1_swr_trip_samples=1),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(21_074_000, transmitting=True), NOW, ENDPOINT)
+    runtime._trip_hamlib_swr(2.5, NOW)
+    runtime.handle(status(21_074_000), NOW + timedelta(seconds=1), ENDPOINT)
+    for seconds in (1.3, 1.9, 2.5, 3.1):
+        runtime.handle(None, NOW + timedelta(seconds=seconds), ENDPOINT)
+
+    assert runtime._swr_recovery is None
+    assert runtime._swr_excluded_bands == set()
+    assert control.armed
+    assert cat.restored_power == []
+    assert "restaurée automatiquement à 50 W" in "\n".join(runtime.antenna_safety_events)
+
+
+def test_ftx1_ignores_early_stale_tuner_completion_until_rf_is_observed(monkeypatch) -> None:
+    monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", True)
+    cat = FakeFtx1TuneCat(
+        [0.0, 0.0, 1.2, 3.0, 0.0],
+        [5.0, 5.0, 1.60, 1.50, 1.0],
+        [3, 1, 3, 3, 1],
+    )
+    control = WsjtxUdpControl(FakeTransport(), 15, None, armed=True)
+    runtime = AutopilotRuntime(
+        AppConfig(ftx1_hamlib_enabled=True, ftx1_swr_limit=2.0, ftx1_swr_trip_samples=1),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(21_074_000, transmitting=True), NOW, ENDPOINT)
+    runtime._trip_hamlib_swr(2.5, NOW)
+    runtime.handle(status(21_074_000), NOW + timedelta(seconds=1), ENDPOINT)
+
+    runtime.handle(None, NOW + timedelta(seconds=1.3), ENDPOINT)
+    runtime.handle(None, NOW + timedelta(seconds=1.9), ENDPOINT)
+
+    assert runtime._swr_recovery is not None
+    assert runtime._swr_recovery.phase == "tuning"
+    assert control.armed
+
+    for seconds in (2.5, 3.1, 3.7):
+        runtime.handle(None, NOW + timedelta(seconds=seconds), ENDPOINT)
+
+    assert runtime._swr_recovery is None
+    assert runtime._swr_excluded_bands == set()
+    assert control.armed
+
+
+def test_ftx1_single_bad_rf_sample_excludes_band_and_tries_next_band(monkeypatch) -> None:
+    monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", True)
+    cat = FakeFtx1TuneCat(
+        [2.78, 0.0, 0.0, 0.0],
+        [5.0, 1.0, 1.0, 1.0],
+        [3, 1, 1, 1],
+    )
+    control = WsjtxUdpControl(FakeTransport(), 15, None, armed=True)
+    runtime = AutopilotRuntime(
+        AppConfig(
+            ftx1_hamlib_enabled=True,
+            ftx1_swr_limit=2.0,
+            ftx1_swr_trip_samples=1,
+            allowed_auto_hop_bands=("30m", "20m"),
+        ),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(10_136_000, transmitting=True), NOW, ENDPOINT)
+    runtime._trip_hamlib_swr(5.0, NOW)
+    runtime.handle(status(10_136_000), NOW + timedelta(seconds=1), ENDPOINT)
+    for seconds in (1.3, 1.9, 2.5, 3.1):
+        runtime.handle(None, NOW + timedelta(seconds=seconds), ENDPOINT)
+
+    assert runtime._swr_excluded_bands == {"30m"}
+    assert runtime._pending_dial_frequency is not None
+    assert runtime._pending_dial_frequency.band == "20m"
+    assert runtime._swr_recovery is not None
+    assert runtime._swr_recovery.phase == "changing_band"
+    assert control.armed
+    assert "Bande 30m exclue" in "\n".join(runtime.antenna_safety_events)
+
+
 def test_swr_tune_accepts_low_final_sample_after_high_sweep(monkeypatch) -> None:
     monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", True)
-    cat = FakeTuneCat([5.0, 5.0, 5.0, 0.0], [5.0, 5.0, 1.2, 1.2])
+    cat = FakeTuneCat([5.0, 5.0, 5.0, 5.0, 0.0], [5.0, 5.0, 1.2, 1.2, 1.2])
     control = WsjtxUdpControl(FakeTransport(), 15, None, armed=True)
     runtime = AutopilotRuntime(
         AppConfig(ftx1_hamlib_enabled=True, ftx1_swr_limit=2.0, ftx1_swr_trip_samples=1),
@@ -593,7 +744,7 @@ def test_swr_tune_accepts_low_final_sample_after_high_sweep(monkeypatch) -> None
     runtime.handle(status(14_074_000, transmitting=True), NOW, ENDPOINT)
     runtime._trip_hamlib_swr(2.5, NOW)
     runtime.handle(status(14_074_000), NOW + timedelta(seconds=1), ENDPOINT)
-    for seconds in (1.3, 1.9, 2.5, 3.1):
+    for seconds in (1.3, 1.9, 2.5, 3.1, 3.7):
         runtime.handle(None, NOW + timedelta(seconds=seconds), ENDPOINT)
 
     assert runtime._swr_recovery is None
@@ -602,7 +753,7 @@ def test_swr_tune_accepts_low_final_sample_after_high_sweep(monkeypatch) -> None
     assert control.armed
 
 
-def test_swr_tune_rechecks_after_first_sweep_has_no_final_meter_refresh(monkeypatch) -> None:
+def test_swr_tune_does_not_accept_one_isolated_low_sample(monkeypatch) -> None:
     monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", True)
     cat = FakeTuneCat(
         [5.0, 5.0, 5.0, 0.0, 5.0, 5.0, 0.0],
@@ -622,10 +773,9 @@ def test_swr_tune_rechecks_after_first_sweep_has_no_final_meter_refresh(monkeypa
         runtime.handle(None, NOW + timedelta(seconds=seconds), ENDPOINT)
 
     assert runtime._swr_recovery is None
-    assert runtime._swr_excluded_bands == set()
-    assert cat.tune_start_count == 2
-    assert control.armed
-    assert "Contrôle final" in "\n".join(runtime.antenna_safety_events)
+    assert runtime._swr_excluded_bands == {"20m"}
+    assert cat.tune_start_count == 1
+    assert not control.armed
 
 
 def test_tune_that_never_produces_rf_stops_without_excluding_band(monkeypatch) -> None:
@@ -655,11 +805,11 @@ def test_tune_that_never_produces_rf_stops_without_excluding_band(monkeypatch) -
     assert "accord automatique non démarré" in runtime.last_qso_notice
 
 
-def test_failed_swr_tune_excludes_band_and_recovers_on_next_allowed_band(monkeypatch) -> None:
+def test_failed_swr_tune_excludes_band_and_resumes_on_next_band_without_retune(monkeypatch) -> None:
     monkeypatch.setattr("wsjtx_autopilot.runtime._SWR_AUTOMATIC_RECOVERY_ENABLED", True)
     cat = FakeTuneCat(
-        [5.0, 5.0, 0.0, 5.0, 5.0, 0.0, 5.0, 5.0, 0.0],
-        [2.6, 2.4, 2.4, 2.6, 2.4, 2.4, 1.5, 1.4, 1.4],
+        [5.0, 5.0, 0.0, 5.0, 5.0, 0.0],
+        [2.6, 2.4, 2.4, 1.5, 1.4, 1.4],
     )
     transport = FakeTransport()
     control = WsjtxUdpControl(transport, 15, None, armed=True)
@@ -684,15 +834,14 @@ def test_failed_swr_tune_excludes_band_and_recovers_on_next_allowed_band(monkeyp
     assert runtime._pending_dial_frequency.band == "15m"
 
     runtime.handle(status(21_074_000), NOW + timedelta(seconds=4.3), ENDPOINT)
-    for seconds in (4.6, 5.2, 5.8):
-        runtime.handle(None, NOW + timedelta(seconds=seconds), ENDPOINT)
 
     assert runtime._swr_recovery is None
+    assert cat.tune_start_count == 1
     assert control.armed
     assert runtime.antenna_safety_level == "warning"
     events = "\n".join(runtime.antenna_safety_events)
     assert "Bande 20m exclue" in events
-    assert "Accord réussi sur 15m" in events
+    assert "Bande 15m confirmée, reprise sans nouvel accord automatique" in events
 
 
 def test_unrecoverable_swr_disarms_and_sets_red_fault(monkeypatch) -> None:

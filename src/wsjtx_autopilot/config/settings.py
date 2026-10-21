@@ -67,10 +67,11 @@ class UserSettings:
     allowed_auto_hop_bands: list[str] = field(default_factory=list)
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
     minimum_band_dwell_minutes: float = 5.0
+    maximum_band_dwell_minutes: float = 30.0
     dial_change_confirmation_timeout_seconds: float = 5.0
     forced_band_hopping_enabled: bool = False
     forced_band_hop_bands: list[str] = field(default_factory=list)
-    forced_band_hop_interval_minutes: float = 10.0
+    forced_band_hop_interval_minutes: float = 30.0
     forced_band_hop_settle_seconds: float = 30.0
     pending_direct_ttl_seconds: float = 30.0
     ftx1_cat2_enabled: bool = False
@@ -133,6 +134,7 @@ class UserSettings:
             if isinstance(values, dict)
         }
         self.minimum_band_dwell_minutes = max(0.0, float(self.minimum_band_dwell_minutes))
+        self.maximum_band_dwell_minutes = max(0.0, float(self.maximum_band_dwell_minutes))
         self.dial_change_confirmation_timeout_seconds = max(1.0, float(self.dial_change_confirmation_timeout_seconds))
         self.forced_band_hopping_enabled = self.forced_band_hopping_enabled is True
         self.forced_band_hop_bands = [value.strip().lower() for value in self.forced_band_hop_bands if value.strip()]

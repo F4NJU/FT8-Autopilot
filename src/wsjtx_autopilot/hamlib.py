@@ -109,12 +109,28 @@ class HamlibFtx1Controller:
 
     @property
     def is_ready(self) -> bool:
-        return self._identified and self._process is not None and self._process.poll() is None and self._socket is not None
+        process_ready = self._process is None or self._process.poll() is None
+        return self._identified and process_ready and self._socket is not None
 
     def start(self) -> bool:
-        if self._process is not None and self._process.poll() is None and self._socket is not None:
+        if self._socket is not None and (self._process is None or self._process.poll() is None):
             return True
         self.close()
+        # Reuse a daemon which already owns the configured TCP port.  This is
+        # important after an unclean application exit: starting another
+        # rigctld on the same Windows port can appear to work while commands
+        # are actually routed to the older process.
+        try:
+            connection = socket.create_connection(("127.0.0.1", self.tcp_port), timeout=self.timeout_seconds)
+            connection.settimeout(self.timeout_seconds)
+            self._socket = connection
+            LOGGER.warning(
+                "[HAMLIB] reusing existing rigctld tcp=127.0.0.1:%d; process is externally owned",
+                self.tcp_port,
+            )
+            return True
+        except OSError:
+            pass
         executable = discover_rigctld(self.rigctld_path)
         if executable is None:
             LOGGER.error("[HAMLIB] rigctld not found configured=%s", self.rigctld_path or "auto")
@@ -216,6 +232,11 @@ class HamlibFtx1Controller:
     def is_ftx1(self) -> bool:
         """True only after the connected radio answered with the FTX-1 CAT ID."""
         return self.detected_radio_model == FTX1_RADIO_NAME
+
+    @property
+    def tuner_reports_active_state(self) -> bool:
+        """Whether tuner state 3 can confirm the complete tuning interval."""
+        return self.is_ftx1
 
     def _detect_radio_model(self) -> None:
         """Select vendor commands from a real CAT identity, never from config alone."""
@@ -366,6 +387,21 @@ class HamlibFtx1Controller:
         if response not in {"0", "1"}:
             return None
         return response == "1"
+
+    def read_tuner_state(self) -> int | None:
+        """Return 0=off, 1=ready/on, or 3=tuning when the radio exposes it."""
+        if not self.identify():
+            return None
+        if self.is_ftx1:
+            response = self._command("\\send_raw ; AC;")
+            match = re.fullmatch(r"AC([01])([02])([0-3]);", response or "")
+            if match is None:
+                LOGGER.warning("[HAMLIB] invalid FTX-1 tuner state response=%r", response)
+                return None
+            self._ftx1_tuner_prefix = "".join(match.groups()[:2])
+            return int(match.group(3))
+        enabled = self.read_tuner_enabled()
+        return None if enabled is None else int(enabled)
 
     def start_tune(self) -> bool:
         """Start a real tuner cycle through Hamlib."""

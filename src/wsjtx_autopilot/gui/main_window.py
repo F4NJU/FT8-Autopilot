@@ -143,6 +143,7 @@ class SettingsDialog(QDialog):
             automatic_band_hopping_enabled=self.auto_band_hop.isChecked(),
             allowed_auto_hop_bands=[band for band, checkbox in self.auto_band_checkboxes.items() if checkbox.isChecked()],
             minimum_band_dwell_minutes=float(self.band_dwell.value()),
+            maximum_band_dwell_minutes=float(self.maximum_band_dwell.value()),
             forced_band_hopping_enabled=self.forced_band_hop.isChecked(),
             forced_band_hop_bands=[value.strip().lower() for value in self.forced_band_bands.text().split(",") if value.strip()],
             forced_band_hop_interval_minutes=float(self.forced_band_interval.value()),
@@ -284,6 +285,11 @@ class SettingsDialog(QDialog):
         self.band_dwell.setRange(0, 120)
         self.band_dwell.setSuffix(" minutes")
         self.band_dwell.setValue(int(self._settings.minimum_band_dwell_minutes))
+        self.maximum_band_dwell = QSpinBox()
+        self.maximum_band_dwell.setRange(0, 24 * 60)
+        self.maximum_band_dwell.setSuffix(" minutes")
+        self.maximum_band_dwell.setSpecialValueText("Désactivé")
+        self.maximum_band_dwell.setValue(int(self._settings.maximum_band_dwell_minutes))
         self.forced_band_hop = QCheckBox("Rotation programmée des bandes")
         self.forced_band_hop.setChecked(self._settings.forced_band_hopping_enabled)
         self.forced_band_bands = QLineEdit(", ".join(self._settings.forced_band_hop_bands))
@@ -324,6 +330,7 @@ class SettingsDialog(QDialog):
         form.addRow(self.adaptive_parity)
         form.addRow(self.auto_band_hop)
         form.addRow("Minimum band dwell", self.band_dwell)
+        form.addRow("Durée maximale sur une bande", self.maximum_band_dwell)
         form.addRow(self.forced_band_hop)
         form.addRow("Bandes de la rotation programmée", self.forced_band_bands)
         form.addRow("Intervalle de rotation", self.forced_band_interval)
@@ -367,6 +374,7 @@ class SettingsDialog(QDialog):
             self.opportunity_quiet,
             self.auto_band_hop,
             self.band_dwell,
+            self.maximum_band_dwell,
             self.forced_band_hop,
             self.forced_band_bands,
             self.forced_band_interval,

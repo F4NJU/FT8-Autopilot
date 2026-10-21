@@ -297,6 +297,7 @@ class BackendWorker(QObject):
             allowed_auto_hop_bands=tuple(self._settings.allowed_auto_hop_bands),
             auto_hop_band_frequencies=self._settings.auto_hop_band_frequencies,
             minimum_band_dwell_minutes=self._settings.minimum_band_dwell_minutes,
+            maximum_band_dwell_minutes=self._settings.maximum_band_dwell_minutes,
             dial_change_confirmation_timeout_seconds=self._settings.dial_change_confirmation_timeout_seconds,
             forced_band_hopping_enabled=self._settings.forced_band_hopping_enabled,
             forced_band_hop_bands=tuple(self._settings.forced_band_hop_bands),

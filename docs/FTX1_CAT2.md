@@ -52,5 +52,14 @@ WSJT-X audio attenuation one small step in either direction to keep ALC inside
 the configured window. Samples without RF power are excluded from ALC learning.
 
 SWR protection remains active during the transmit period. Consecutive readings
-at or above the configured threshold send Halt Tx immediately, disarm AutoPilot,
-and latch the fault until the operator explicitly arms control again.
+at or above the configured threshold send Halt Tx immediately and wait for a
+confirmed return to RX. AutoPilot then starts one Hamlib tuner cycle. On the
+FTX-1, CAT state `AC..3` confirms that tuning really started and the transition
+back to `AC..1` confirms that the tuner finished. The radio temporarily selects
+5 W and restores its configured power itself; AutoPilot does not write a power
+value during this sequence.
+
+The last two RF-valid SWR samples must both be below the configured limit. A
+confirmed failed match excludes only the current band for the session and tries
+the next allowed band. Missing tuner confirmation or insufficient meter data
+stops and disarms AutoPilot without excluding the band.
