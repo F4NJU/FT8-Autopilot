@@ -1,18 +1,23 @@
 # WSJTX AutoPilot
 
 WSJTX AutoPilot est un assistant Windows pour les QSO FT8/FT4 avec WSJT-X.
-Il choisit une station, répond aux appels directs, suit le déroulement du QSO
-et peut changer automatiquement de cycle TX ou de bande lorsque la bande
-actuelle n'offre plus de contact intéressant.
+Il choisit une station, répond aux appels directs, suit le déroulement du QSO,
+recherche des stations rares et peut changer automatiquement de cycle TX,
+canal FT8 ou bande lorsque la bande actuelle n'offre plus de contact
+intéressant.
 
 L'opérateur reste responsable de la station, des émissions et du respect de
 la réglementation.
 
 **Statut : version stable 1.0.0.**
 
+Télécharger l'archive prête à utiliser depuis la
+[dernière release](https://github.com/F4NJU/FT8-Autopilot/releases/latest),
+l'extraire puis lancer `WSJTX-AutoPilot.exe`.
+
 ## Installation
 
-La version prête à utiliser se trouve ici :
+Après extraction de l'archive, l'exécutable est :
 
 ```text
 dist\WSJTX-AutoPilot\WSJTX-AutoPilot.exe
@@ -58,6 +63,20 @@ Le port UDP configuré dans AutoPilot doit être identique à celui de WSJT-X.
 AutoPilot démarre désarmé. Il ne transmet rien tant que **ARM** n'a pas été
 activé.
 
+## Services optionnels
+
+| Service | Utilité | Réglage |
+| --- | --- | --- |
+| Hamlib | fréquence radio, ALC, SWR et sécurité d'antenne | **Preferences > Radio / Hamlib** |
+| afu.tools | liste et activité FT8 des indicatifs spéciaux pour Hunt | clé API dans **Diagnostic** |
+| PSK Reporter MQTT | suivi des rares et DXCC LoTW recherchés sur les bandes autorisées | **OPTIONS REPLY** |
+| Wavelog API v2 | priorités DXCC confirmés/non confirmés par LoTW | URL + jeton `wl2_` dans **Diagnostic** |
+| NOAA | données SFI / Kp pour le départage de chemin favorable | automatique quand l'option est activée |
+| Discord | présence d'activité FT8 | **Diagnostic** |
+
+Les services Internet restent facultatifs : le fonctionnement Reply classique
+repose sur les décodages locaux de WSJT-X.
+
 ## Fonctions principales
 
 - interface organisée en trois onglets : **Reply**, **Hunt** et **CQ — À venir** ;
@@ -82,6 +101,30 @@ activé.
 - régulation ALC et protection SWR lorsqu'elles sont compatibles avec la radio ;
 - affichage Discord, par exemple `FT8 - 40m` et `Working EA7CTA`.
 
+### Priorités Reply
+
+Les appels directs et un QSO déjà en cours restent protégés. Pour les autres
+stations, AutoPilot départage selon les préférences DXCC/continent, les
+politiques POTA/SOTA/QRP, les doublons, le signal et les options choisies dans
+**OPTIONS REPLY** : stations rares, DXCC LoTW non validés, chemin favorable
+et exclusion de l'historique.
+
+Le suivi MQTT PSK Reporter sert uniquement à repérer une station rare ou un
+DXCC recherché sur une bande autorisée. Il peut faire déplacer le récepteur,
+mais ne peut jamais déclencher une émission sans Decode local de WSJT-X.
+
+### Rotation des bandes et canaux
+
+La rotation adaptative peut d'abord essayer l'autre cycle TX, puis changer de
+position d'écoute. Pour chaque bande autorisée, elle parcourt le canal FT8
+principal puis le canal FT8 secondaire/DX, avant de passer à la bande suivante.
+Une rotation temporisée force aussi le passage à une autre bande après la durée
+maximale configurée (30 minutes par défaut).
+
+Un changement est effectué seulement en réception, hors QSO, sans appel direct
+en attente et jamais vers une bande exclue par la sécurité SWR. Un changement
+de bande normal ne lance pas d'accord automatique.
+
 ### Onglet Hunt
 
 L’onglet **Hunt** affiche les indicatifs spéciaux annoncés dont une activité
@@ -96,10 +139,11 @@ Le service actuel utilise une clé API gratuite **afu.tools**, à renseigner dan
 cache connu est affiché clairement comme tel.
 
 Un double-clic surveille une seule station ; **HUNT TOUS** parcourt la liste.
-AutoPilot reste limité aux bandes autorisées et n’appelle jamais une station
-sur la seule foi d’Internet : il attend obligatoirement un vrai Decode local
-de WSJT-X. Si le correspondant répond déjà à quelqu’un d’autre, il n’émet pas.
-Les appels directs reçus et les QSO déjà engagés restent prioritaires.
+AutoPilot reste limité aux bandes autorisées et peut passer sur le canal FT8
+principal ou secondaire de la bande ciblée. Un spot Internet ne suffit jamais
+à lui seul : il attend obligatoirement un vrai Decode local de WSJT-X avant
+toute émission. Les appels directs reçus et les QSO déjà engagés restent
+prioritaires.
 
 La durée maximale sur une bande se règle dans les préférences. La valeur `0`
 désactive uniquement cette limite de temps. Un QSO déjà engagé reste
@@ -108,13 +152,16 @@ SWR sont ignorées et un changement de bande normal ne lance pas d'accord
 automatique.
 
 La protection SWR coupe immédiatement l'émission. Une fois le retour en RX
-confirmé, AutoPilot tente un accord par Hamlib et vérifie l'état réel du tuner
-ainsi que plusieurs mesures SWR. Si l'accord réussit, le trafic reprend après
-un cycle de sécurité. Si le SWR reste trop élevé, la bande est exclue pour la
-session et une autre bande autorisée est sélectionnée sans relancer d'accord.
-La protection contrôlera naturellement cette nouvelle bande au premier TX. Une
-commande non confirmée ou des mesures insuffisantes provoquent un arrêt de
-sécurité sans exclure la bande.
+confirmé, AutoPilot peut tenter un accord par Hamlib et vérifie l'état réel du
+tuner ainsi que plusieurs mesures SWR. Si l'accord réussit, le trafic reprend
+après un cycle de sécurité. Si le SWR reste trop élevé, la bande est exclue
+pour la session et une autre bande autorisée est sélectionnée sans relancer
+d'accord. Une commande non confirmée ou des mesures insuffisantes provoquent
+un arrêt de sécurité sans exclure la bande.
+
+Le voyant d'antenne résume l'état : vert (normal), jaune (incident corrigé) ou
+rouge (arrêt). **RÉINITIALISER SWR** efface explicitement l'état de sécurité
+et les exclusions de session, puis réarme sans lancer un nouvel essai d'accord.
 
 ## Fonctions retirées ou volontairement non automatisées
 
@@ -164,3 +211,4 @@ pyinstaller -y packaging/wsjtx-autopilot.spec
 ## Licence
 
 GPL-3.0-or-later
+
