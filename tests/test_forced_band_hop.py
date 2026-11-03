@@ -123,6 +123,7 @@ def test_adaptive_band_hop_forces_change_after_maximum_dwell() -> None:
     config = replace(
         AppConfig(),
         candidate_collection_seconds=0,
+        adaptive_operation_enabled=False,
         automatic_band_hopping_enabled=True,
         allowed_auto_hop_bands=("20m", "30m", "40m"),
         maximum_band_dwell_minutes=30,

@@ -1,9 +1,14 @@
 import json
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .paths import AppPaths
+
+if TYPE_CHECKING:
+    from . import AppConfig
 
 
 class DirectCallPolicy(StrEnum):
@@ -28,6 +33,7 @@ class UserSettings:
     direct_call_policy: DirectCallPolicy = DirectCallPolicy.ALWAYS_PRIORITY
     allow_direct_call_dupes: bool = False
     allow_dupes: bool = False
+    exclude_previously_worked_calls: bool = False
     minimum_snr: int | None = None
     favor_strong_signals: bool = True
     direct_call_bonus: int = 10_000
@@ -38,6 +44,9 @@ class UserSettings:
     sota_policy: ActivityPolicy = ActivityPolicy.NORMAL
     qrp_policy: ActivityPolicy = ActivityPolicy.NORMAL
     activity_priority_bonus: int = 750
+    prioritize_special_calls_in_reply: bool = False
+    prioritize_favorable_path_in_reply: bool = False
+    rare_stations_only: bool = False
     respond_to_cq_dx: bool = False
     blacklist: set[str] = field(default_factory=set)
     ignore_minutes: int = 10
@@ -63,6 +72,8 @@ class UserSettings:
     adaptive_parity_enabled: bool = True
     parity_trial_failed_attempts: int = 6
     adaptive_opportunity_quiet_minutes: float = 3.0
+    pskreporter_mqtt_enabled: bool = False
+    pskreporter_mqtt_spot_max_age_seconds: float = 180.0
     automatic_band_hopping_enabled: bool = False
     allowed_auto_hop_bands: list[str] = field(default_factory=list)
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -95,6 +106,13 @@ class UserSettings:
     ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
     discord_presence_enabled: bool = True
     discord_application_id: str = "1561768680193400902"
+    special_calls_api_key: str = ""
+    special_calls_refresh_minutes: int = 15
+    special_calls_lookback_minutes: int = 1440
+    wavelog_api_url: str = ""
+    wavelog_api_token: str = ""
+    wavelog_lotw_refresh_minutes: int = 60
+    wavelog_unconfirmed_dxcc_only: bool = False
     logging_level: str = "normal"
 
     def normalize(self) -> None:
@@ -105,6 +123,17 @@ class UserSettings:
         self.discord_application_id = "".join(character for character in str(self.discord_application_id) if character.isdigit())
         if not self.discord_application_id:
             self.discord_presence_enabled = False
+        self.special_calls_api_key = str(self.special_calls_api_key).strip()
+        self.prioritize_special_calls_in_reply = self.prioritize_special_calls_in_reply is True
+        self.prioritize_favorable_path_in_reply = self.prioritize_favorable_path_in_reply is True
+        self.rare_stations_only = self.rare_stations_only is True
+        self.special_calls_refresh_minutes = max(5, min(24 * 60, int(self.special_calls_refresh_minutes)))
+        self.special_calls_lookback_minutes = max(60, min(2880, int(self.special_calls_lookback_minutes)))
+        self.wavelog_api_url = str(self.wavelog_api_url).strip().rstrip("/")
+        self.wavelog_api_token = str(self.wavelog_api_token).strip()
+        self.wavelog_lotw_refresh_minutes = max(5, min(24 * 60, int(self.wavelog_lotw_refresh_minutes)))
+        self.wavelog_unconfirmed_dxcc_only = self.wavelog_unconfirmed_dxcc_only is True
+        self.exclude_previously_worked_calls = self.exclude_previously_worked_calls is True
         self.max_actions = max(1, int(self.max_actions))
         self.ignore_minutes = max(1, int(self.ignore_minutes))
         self.max_no_progress_periods = max(1, int(self.max_no_progress_periods))
@@ -123,6 +152,8 @@ class UserSettings:
         self.stagnation_max_unique_calls = max(1, int(self.stagnation_max_unique_calls))
         self.parity_trial_failed_attempts = max(1, int(self.parity_trial_failed_attempts))
         self.adaptive_opportunity_quiet_minutes = max(1.0, float(self.adaptive_opportunity_quiet_minutes))
+        self.pskreporter_mqtt_enabled = self.pskreporter_mqtt_enabled is True
+        self.pskreporter_mqtt_spot_max_age_seconds = max(30.0, min(900.0, float(self.pskreporter_mqtt_spot_max_age_seconds)))
         self.allowed_auto_hop_bands = [value.strip().lower() for value in self.allowed_auto_hop_bands if value.strip()]
         self.auto_hop_band_frequencies = {
             str(band).strip().lower(): {
@@ -175,6 +206,72 @@ class UserSettings:
             and 0 <= values["tx_audio_attenuation"] <= 450
         }
         self.logging_level = "debug" if str(self.logging_level).strip().lower() == "debug" else "normal"
+
+    def to_app_config(self, worked_store_path: Path) -> "AppConfig":
+        """Build the runtime configuration from the normalized user settings."""
+        from . import AppConfig
+
+        self.normalize()
+        return AppConfig(
+            local_callsign=self.local_callsign,
+            bind_address=self.bind_address,
+            udp_port=self.udp_port,
+            allow_dupes=self.allow_dupes,
+            exclude_previously_worked_calls=self.exclude_previously_worked_calls,
+            max_initiation_attempts=1,
+            wsjtx_direct_reply_patched=self.direct_reply_patched,
+            worked_store_path=worked_store_path,
+            wsjtx_log_path=Path(self.wsjtx_log_path) if self.wsjtx_log_path else None,
+            respond_to_cq_dx=self.respond_to_cq_dx,
+            max_no_progress_periods=self.max_no_progress_periods,
+            stalled_qso_cooldown_seconds=self.stalled_qso_cooldown_seconds,
+            remote_busy_cooldown_seconds=self.remote_busy_cooldown_seconds,
+            max_remote_cq_during_attempt=self.max_remote_cq_during_attempt,
+            remote_returned_to_cq_cooldown_seconds=self.remote_returned_to_cq_cooldown_seconds,
+            finalization_hold_periods=self.finalization_hold_periods,
+            final_tx_timeout_periods=self.final_tx_timeout_periods,
+            max_final_retries=self.max_final_retries,
+            adaptive_operation_enabled=self.adaptive_operation_enabled,
+            stagnation_attempt_window=self.stagnation_attempt_window,
+            stagnation_min_failed_attempts=self.stagnation_min_failed_attempts,
+            stagnation_max_unique_calls=self.stagnation_max_unique_calls,
+            adaptive_parity_enabled=self.adaptive_parity_enabled,
+            parity_trial_failed_attempts=self.parity_trial_failed_attempts,
+            adaptive_opportunity_quiet_seconds=self.adaptive_opportunity_quiet_minutes * 60,
+            pskreporter_mqtt_enabled=self.pskreporter_mqtt_enabled,
+            pskreporter_mqtt_spot_max_age_seconds=self.pskreporter_mqtt_spot_max_age_seconds,
+            automatic_band_hopping_enabled=self.automatic_band_hopping_enabled,
+            allowed_auto_hop_bands=tuple(self.allowed_auto_hop_bands),
+            auto_hop_band_frequencies=deepcopy(self.auto_hop_band_frequencies),
+            minimum_band_dwell_minutes=self.minimum_band_dwell_minutes,
+            maximum_band_dwell_minutes=self.maximum_band_dwell_minutes,
+            dial_change_confirmation_timeout_seconds=self.dial_change_confirmation_timeout_seconds,
+            forced_band_hopping_enabled=self.forced_band_hopping_enabled,
+            forced_band_hop_bands=tuple(self.forced_band_hop_bands),
+            forced_band_hop_interval_minutes=self.forced_band_hop_interval_minutes,
+            forced_band_hop_settle_seconds=self.forced_band_hop_settle_seconds,
+            pending_direct_ttl_seconds=self.pending_direct_ttl_seconds,
+            ftx1_cat2_enabled=self.ftx1_cat2_enabled,
+            ftx1_cat2_confirmed_ftx1=self.ftx1_cat2_confirmed_ftx1,
+            ftx1_cat2_port=self.ftx1_cat2_port,
+            ftx1_cat2_baudrate=self.ftx1_cat2_baudrate,
+            ftx1_cat2_timeout_seconds=self.ftx1_cat2_timeout_seconds,
+            ftx1_hamlib_enabled=self.ftx1_hamlib_enabled,
+            hamlib_rig_model=self.hamlib_rig_model,
+            ftx1_hamlib_rigctld_path=self.ftx1_hamlib_rigctld_path,
+            ftx1_hamlib_tcp_port=self.ftx1_hamlib_tcp_port,
+            ftx1_meter_poll_seconds=self.ftx1_meter_poll_seconds,
+            ftx1_alc_control_enabled=self.ftx1_alc_control_enabled,
+            ftx1_alc_minimum=self.ftx1_alc_minimum,
+            ftx1_alc_maximum=self.ftx1_alc_maximum,
+            ftx1_alc_attenuation_step=self.ftx1_alc_attenuation_step,
+            ftx1_swr_protection_enabled=self.ftx1_swr_protection_enabled,
+            ftx1_swr_limit=self.ftx1_swr_limit,
+            ftx1_swr_trip_samples=self.ftx1_swr_trip_samples,
+            ftx1_auto_apply_band_profiles=self.ftx1_auto_apply_band_profiles,
+            ftx1_band_profiles=deepcopy(self.ftx1_band_profiles),
+            cty_dat_path=Path(self.cty_dat_path) if self.cty_dat_path else None,
+        )
 
 
 class SettingsStore:

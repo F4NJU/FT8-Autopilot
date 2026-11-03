@@ -27,6 +27,7 @@ class AppConfig:
     direct_reply_confirmation_timeout_seconds: float = 20.0
     qso_completion_grace_seconds: float = 2.0
     allow_dupes: bool = False
+    exclude_previously_worked_calls: bool = False
     respond_to_cq_dx: bool = False
     max_no_progress_periods: int = 10
     stalled_qso_cooldown_seconds: float = 300.0
@@ -43,6 +44,8 @@ class AppConfig:
     adaptive_parity_enabled: bool = True
     parity_trial_failed_attempts: int = 6
     adaptive_opportunity_quiet_seconds: float = 180.0
+    pskreporter_mqtt_enabled: bool = False
+    pskreporter_mqtt_spot_max_age_seconds: float = 180.0
     automatic_band_hopping_enabled: bool = False
     allowed_auto_hop_bands: tuple[str, ...] = ()
     auto_hop_band_frequencies: dict[str, dict[str, int]] = field(default_factory=dict)

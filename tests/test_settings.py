@@ -1,6 +1,19 @@
 import json
+from pathlib import Path
 
 from wsjtx_autopilot.config import ActivityPolicy, DirectCallPolicy, SettingsStore, UserSettings
+
+
+def test_runtime_config_keeps_alc_and_band_profile_options_independent() -> None:
+    settings = UserSettings(
+        ftx1_alc_control_enabled=False,
+        ftx1_auto_apply_band_profiles=True,
+    )
+
+    config = settings.to_app_config(Path("worked.sqlite3"))
+
+    assert not config.ftx1_alc_control_enabled
+    assert config.ftx1_auto_apply_band_profiles
 
 
 def test_legacy_alc_target_is_migrated_to_power_correlated_reference() -> None:
@@ -22,7 +35,10 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
         direct_call_policy=DirectCallPolicy.NORMAL,
         blacklist={" dl1bad "},
         pota_policy=ActivityPolicy.PRIORITY,
+        prioritize_special_calls_in_reply=True,
+        prioritize_favorable_path_in_reply=True,
         respond_to_cq_dx=True,
+        exclude_previously_worked_calls=True,
         max_no_progress_periods=12,
         stalled_qso_cooldown_seconds=420,
         remote_busy_cooldown_seconds=240,
@@ -46,6 +62,10 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
         ftx1_band_profiles={"20m": {"usb_mod_gain": 35, "tx_audio_attenuation": 118}, "40m": {"usb_mod_gain": 32, "tx_audio_attenuation": 145}},
         discord_presence_enabled=True,
         discord_application_id="1561768680193400902",
+        wavelog_api_url="https://wavelog.example/index.php/api/v2",
+        wavelog_api_token="wl2_test-token",
+        wavelog_lotw_refresh_minutes=90,
+        wavelog_unconfirmed_dxcc_only=True,
     )
 
     store.save(settings)
@@ -58,7 +78,10 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     assert loaded.direct_call_policy is DirectCallPolicy.NORMAL
     assert loaded.blacklist == {"DL1BAD"}
     assert loaded.pota_policy is ActivityPolicy.PRIORITY
+    assert loaded.prioritize_special_calls_in_reply
+    assert loaded.prioritize_favorable_path_in_reply
     assert loaded.respond_to_cq_dx
+    assert loaded.exclude_previously_worked_calls
     assert loaded.max_no_progress_periods == 12
     assert loaded.stalled_qso_cooldown_seconds == 420
     assert loaded.remote_busy_cooldown_seconds == 240
@@ -82,6 +105,10 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     assert loaded.ftx1_band_profiles == {"20m": {"tx_audio_attenuation": 118}, "40m": {"tx_audio_attenuation": 145}}
     assert loaded.discord_presence_enabled
     assert loaded.discord_application_id == "1561768680193400902"
+    assert loaded.wavelog_api_url == "https://wavelog.example/index.php/api/v2"
+    assert loaded.wavelog_api_token == "wl2_test-token"
+    assert loaded.wavelog_lotw_refresh_minutes == 90
+    assert loaded.wavelog_unconfirmed_dxcc_only
     assert "usb_mod_gain" not in payload["ftx1_band_profiles"]["20m"]
     assert "armed" not in payload
 

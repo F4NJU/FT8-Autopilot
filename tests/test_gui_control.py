@@ -4,7 +4,7 @@ from datetime import datetime, time, timedelta, timezone
 from PySide6.QtCore import QSize
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QMessageBox, QScrollArea
 
-from wsjtx_autopilot.config import SettingsStore, UserSettings
+from wsjtx_autopilot.config import AppConfig, SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, EngineEvent, EngineEventKind, IntendedAction, OriginalDecode
 from wsjtx_autopilot.engine.state import QsoState
@@ -12,6 +12,7 @@ from wsjtx_autopilot.ftx1 import FTX1CatController
 from wsjtx_autopilot.gui.worker import BackendWorker
 from wsjtx_autopilot.gui.main_window import MainWindow, SettingsDialog
 import wsjtx_autopilot.runtime as runtime_module
+from wsjtx_autopilot.runtime import AutopilotRuntime, HaltTxResult
 from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, ReplyPacket, StatusPacket, TxAudioAttenuationStatePacket
 from wsjtx_autopilot.wsjtx.protocol import parse_datagram
 
@@ -248,6 +249,37 @@ def test_gui_resynchronizes_armed_visual_state_from_backend_signal(tmp_path, mon
         application.processEvents()
 
 
+def test_gui_swr_reset_requires_confirmation_and_emits_request(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    application = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0, worked_store_path=str(tmp_path / "worked.sqlite3")))
+    prompts = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args, **kwargs: prompts.append(args) or QMessageBox.StandardButton.Yes,
+    )
+    window = MainWindow(store)
+    requested = []
+    window.reset_swr_safety_requested.connect(lambda: requested.append(True))
+    application.processEvents()
+    try:
+        window._antenna_reset_available = True
+        window._update_swr_reset_button()
+        assert window.reset_swr_safety_button.isEnabled()
+
+        window._confirm_reset_swr_safety()
+
+        assert requested == [True]
+        assert prompts
+        assert "Aucun accord ni test de bande" in prompts[0][2]
+    finally:
+        window.close()
+        application.processEvents()
+
+
 def test_gui_cq_sends_exact_reply_to_decode_source(tmp_path, monkeypatch) -> None:
     backend = worker(tmp_path, monkeypatch)
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -342,6 +374,114 @@ def test_gui_control_remains_armed_after_ten_replies(tmp_path, monkeypatch) -> N
         backend._close_backend()
 
 
+def test_backend_runtime_exception_requests_halt_and_disarms(monkeypatch) -> None:
+    class Transport:
+        def sendto(self, data: bytes, endpoint: tuple[str, int]) -> int:
+            return len(data)
+
+    class Listener:
+        @staticmethod
+        def receive():
+            return None
+
+    control = WsjtxUdpControl(Transport(), 15, None, armed=True)
+    runtime = AutopilotRuntime(AppConfig(), control=control)
+    halt_requests: list[str] = []
+
+    def fail_handle(*_args, **_kwargs):
+        raise RuntimeError("runtime failure")
+
+    def record_halt(_instance_id: str | None, reason: str) -> HaltTxResult:
+        halt_requests.append(reason)
+        return HaltTxResult(True, True, False)
+
+    monkeypatch.setattr(runtime, "handle", fail_handle)
+    monkeypatch.setattr(runtime, "_request_halt_tx", record_halt)
+    backend = BackendWorker(UserSettings())
+    backend._runtime = runtime
+    backend._listener = Listener()
+    armed_states: list[bool] = []
+    backend.armed_changed.connect(armed_states.append)
+
+    backend._poll()
+
+    assert halt_requests == ["backend_exception"]
+    assert not control.armed
+    assert armed_states[-1] is False
+
+
+def test_backend_runtime_exception_still_disarms_when_halt_fails(monkeypatch) -> None:
+    class Transport:
+        def sendto(self, data: bytes, endpoint: tuple[str, int]) -> int:
+            return len(data)
+
+    class Listener:
+        @staticmethod
+        def receive():
+            return None
+
+    control = WsjtxUdpControl(Transport(), 15, None, armed=True)
+    runtime = AutopilotRuntime(AppConfig(), control=control)
+
+    def fail_handle(*_args, **_kwargs) -> None:
+        raise RuntimeError("runtime failure")
+
+    def fail_halt(*_args, **_kwargs) -> HaltTxResult:
+        raise RuntimeError("halt failure")
+
+    monkeypatch.setattr(runtime, "handle", fail_handle)
+    monkeypatch.setattr(runtime, "_request_halt_tx", fail_halt)
+    backend = BackendWorker(UserSettings())
+    backend._runtime = runtime
+    backend._listener = Listener()
+
+    backend._poll()
+
+    assert not control.armed
+
+
+def test_backend_presentation_exception_does_not_halt_or_disarm(monkeypatch) -> None:
+    class Transport:
+        def sendto(self, data: bytes, endpoint: tuple[str, int]) -> int:
+            return len(data)
+
+    class Listener:
+        @staticmethod
+        def receive():
+            return None
+
+    class FailingDiscordPresence:
+        @staticmethod
+        def publish(*_args, **_kwargs) -> None:
+            raise RuntimeError("discord failure")
+
+    control = WsjtxUdpControl(Transport(), 15, None, armed=True)
+    runtime = AutopilotRuntime(AppConfig(), control=control)
+    halt_requests: list[str] = []
+
+    def record_halt(_instance_id: str | None, reason: str) -> HaltTxResult:
+        halt_requests.append(reason)
+        return HaltTxResult(True, True, False)
+
+    monkeypatch.setattr(runtime, "_request_halt_tx", record_halt)
+    backend = BackendWorker(UserSettings())
+    backend._runtime = runtime
+    backend._listener = Listener()
+    backend._discord_presence = FailingDiscordPresence()
+    errors: list[str] = []
+    adaptive_states: list[dict[str, object]] = []
+    backend.error.connect(errors.append)
+    backend.adaptive_changed.connect(adaptive_states.append)
+
+    backend._poll()
+
+    assert halt_requests == []
+    assert control.armed
+    assert errors == ["discord failure"]
+    assert adaptive_states
+    assert backend._discord_presence is None
+
+
 def test_preferences_dialog_is_resizable_scrollable_and_keeps_buttons_visible() -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(UserSettings(), ap1_available=True)
@@ -371,6 +511,21 @@ def test_preferences_apply_ok_and_cancel_are_wired() -> None:
     cancelled = SettingsDialog(UserSettings(), ap1_available=True)
     cancelled.buttons.button(QDialogButtonBox.StandardButton.Cancel).click()
     assert cancelled.result() == QDialog.DialogCode.Rejected
+
+
+def test_preferences_can_prioritize_active_special_calls_in_reply() -> None:
+    QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        UserSettings(prioritize_special_calls_in_reply=True),
+        ap1_available=True,
+    )
+
+    assert dialog.special_call_priority.isChecked()
+    assert dialog.settings().prioritize_special_calls_in_reply
+
+    dialog.special_call_priority.setChecked(False)
+
+    assert not dialog.settings().prioritize_special_calls_in_reply
 
 
 def test_adaptive_controls_require_ap1_and_preserve_band_order() -> None:

@@ -38,6 +38,15 @@ class CandidateWindow:
     provisional: Candidate | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BusyStation:
+    """A station heard working another correspondent in an RX period."""
+
+    period_key: tuple[object, ...]
+    other: str
+    observed_at: datetime
+
+
 class DecisionEngine:
     def __init__(
         self,
@@ -67,9 +76,12 @@ class DecisionEngine:
         self._rescanning_candidates = False
         self._rescan_rejection_reason = "normal eligibility recheck"
         self._candidate_window: CandidateWindow | None = None
+        self._stations_busy_in_period: dict[str, BusyStation] = {}
         self._worked_lookup = worked_lookup
         self._scorer = scorer
-        self._event_sink = event_sink
+        self._event_listeners: list[Callable[[EngineEvent], None]] = []
+        if event_sink is not None:
+            self._event_listeners.append(event_sink)
         self._cq_eligibility = cq_eligibility or CqEligibility(
             StationProfile(config.local_callsign),
             respond_to_cq_dx=config.respond_to_cq_dx,
@@ -149,6 +161,15 @@ class DecisionEngine:
             self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, "exchange not actionable")
             return None
 
+        busy = self._stations_busy_in_period.get(message.sender)
+        if busy is not None and self._is_busy_in_same_rx_period(busy, event):
+            reason = f"working {busy.other}"
+            LOGGER.info("[ENGINE] candidate refused station=%s reason=%s", message.sender, reason)
+            self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, reason)
+            if direct_to_local:
+                self._log_direct_rejected(message.sender, "REMOTE_BUSY")
+            return None
+
         if kind is CandidateKind.CQ:
             cq_result = self._cq_eligibility.evaluate(message)
             if not cq_result.accepted:
@@ -175,12 +196,14 @@ class DecisionEngine:
                     self._log_direct_rejected(message.sender, "UNKNOWN_BAND")
                 return None
             if self._scorer is None and worked.duplicate:
+                reason = "worked previously" if worked.scope == "history" else "worked today"
                 LOGGER.info(
-                    "[ENGINE] candidate refused station=%s reason=worked today band=%s",
+                    "[ENGINE] candidate refused station=%s reason=%s band=%s",
                     message.sender,
+                    reason,
                     worked.band,
                 )
-                self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, f"worked today band={worked.band}")
+                self._emit(EngineEventKind.CANDIDATE_REFUSED, message.sender, f"{reason} band={worked.band}")
                 if direct_to_local:
                     self._log_direct_rejected(message.sender, "WORKED_TODAY")
                 return None
@@ -322,6 +345,58 @@ class DecisionEngine:
         if self.state.session.state is QsoState.IDLE:
             self._touch_candidate_window_key(period_key, now)
 
+    def add_event_listener(self, listener: Callable[[EngineEvent], None]) -> None:
+        """Register a passive observer without replacing the GUI listener."""
+        self._event_listeners.append(listener)
+
+    def note_station_working_other(self, event: DecodeEvent) -> bool:
+        """Withdraw a queued CQ when its sender is now working another station.
+
+        A decoded directed exchange is authoritative only for its own FT8 RX
+        period.  It prevents us from replying to an older CQ from the same
+        decode batch and places the station on a short, session-only cooldown
+        for the following periods.  This avoids repeatedly pursuing a stale
+        CQ while the station is still completing its other QSO.  A fresh
+        direct call to the local station remains allowed to override it.
+        """
+        message = event.parsed
+        if (
+            message.kind in {MessageKind.CQ, MessageKind.QRZ}
+            or message.addressee is None
+            or message.is_addressed_to(self.config.local_callsign)
+        ):
+            return False
+        station = message.sender.upper()
+        period_key = self._candidate_period_key(event)
+        self._stations_busy_in_period[station] = BusyStation(period_key, message.addressee, event.observed_at)
+        cooldown_seconds = min(60.0, self.config.remote_busy_cooldown_seconds)
+        if cooldown_seconds > 0:
+            cooldown = self._set_station_cooldown(
+                station,
+                event.observed_at,
+                cooldown_seconds,
+                CooldownKind.REMOTE_BUSY_OTHER_QSO,
+                f"observed working {message.addressee}",
+            )
+            LOGGER.info(
+                "[ENGINE] station cooldown station=%s reason=observed working %s until=%s",
+                station,
+                message.addressee,
+                cooldown.until.isoformat(),
+            )
+        candidate = self._candidates.pop(station, None)
+        if candidate is None:
+            return False
+        self._pending_candidate_stations.discard(station)
+        LOGGER.info(
+            "[ENGINE] candidate withdrawn station=%s reason=working %s",
+            station,
+            message.addressee,
+        )
+        self._emit(EngineEventKind.CANDIDATE_REFUSED, station, f"working {message.addressee}", candidate)
+        self._update_provisional_after_withdrawal()
+        return True
+
     def decide(
         self,
         now: datetime,
@@ -385,7 +460,7 @@ class DecisionEngine:
         else:
             pool = viable
             reason = "CQ candidate"
-        selected = max(pool, key=lambda candidate: (candidate.score, candidate.event.observed_at.timestamp()))
+        selected = max(pool, key=lambda candidate: (candidate.score, -candidate.event.observed_at.timestamp()))
         selected_was_pending = selected.station in self._pending_candidate_stations
         reason = (
             "PENDING_DIRECT_CALL"
@@ -491,6 +566,23 @@ class DecisionEngine:
             self.state.session.state.name,
             cooldown_until.isoformat(),
         )
+
+    def preflight_action(self, action: IntendedAction) -> bool:
+        """Check the selected Decode once more immediately before Reply."""
+        event = self._pending_actions.get(action.station)
+        if event is None:
+            return False
+        busy = self._stations_busy_in_period.get(action.station.upper())
+        if busy is None or not self._is_busy_in_same_rx_period(busy, event):
+            return True
+        self._pending_actions.pop(action.station, None)
+        LOGGER.info(
+            "[ENGINE] reply skipped station=%s reason=working %s before Reply",
+            action.station,
+            busy.other,
+        )
+        self._emit(EngineEventKind.CANDIDATE_REFUSED, action.station, f"working {busy.other} before Reply")
+        return False
 
     def invalidate_instance_decodes(self, instance_id: str) -> None:
         """Discard candidates and pending actions invalidated by WSJT-X Clear."""
@@ -798,6 +890,7 @@ class DecisionEngine:
                     len(self._candidates),
                 )
                 self._candidates.clear()
+            self._stations_busy_in_period.clear()
             self._candidate_window = CandidateWindow(period_key, now)
             return
         self._candidate_window.last_decode_at = now
@@ -844,6 +937,19 @@ class DecisionEngine:
                 provisional.station,
             )
 
+    def _update_provisional_after_withdrawal(self) -> None:
+        """Keep the candidate-window diagnostic aligned after a withdrawal."""
+        window = self._candidate_window
+        if window is None:
+            return
+        candidates = list(self._candidates.values())
+        if not candidates:
+            window.provisional = None
+            return
+        forced = [candidate for candidate in candidates if candidate.force_priority]
+        pool = forced or candidates
+        window.provisional = max(pool, key=lambda item: (item.score, -item.event.observed_at.timestamp()))
+
     @staticmethod
     def _log_direct_rejected(station: str, blocker: str) -> None:
         LOGGER.info("[DIRECT] hard_blockers=[%s]", blocker)
@@ -871,6 +977,17 @@ class DecisionEngine:
             return (event.original.instance_id, event.original.decode_time, event.mode)
         return (event.mode, event.frequency, event.period)
 
+    def _is_busy_in_same_rx_period(self, busy: BusyStation, event: DecodeEvent) -> bool:
+        """Keep an RX-period busy marker from leaking into a later period.
+
+        WSJT-X normally supplies the decode time in the period key.  The short
+        time bound is a defensive fallback for delayed or synthetic decodes
+        that reuse that key across distinct FT8 periods.
+        """
+        if busy.period_key != self._candidate_period_key(event):
+            return False
+        return abs(event.observed_at - busy.observed_at) < timedelta(seconds=15)
+
     def _emit(
         self,
         kind: EngineEventKind,
@@ -882,8 +999,9 @@ class DecisionEngine:
             self._pending_rejection_reason = self._direct_blocker_name(reason)
         if self._rescanning_candidates and kind is EngineEventKind.CANDIDATE_REFUSED:
             self._rescan_rejection_reason = reason
-        if self._event_sink is not None:
-            self._event_sink(EngineEvent(kind, station, reason, candidate))
+        event = EngineEvent(kind, station, reason, candidate)
+        for listener in tuple(self._event_listeners):
+            listener(event)
 
     def _set_station_cooldown(
         self,

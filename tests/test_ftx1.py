@@ -416,15 +416,24 @@ def test_ftx1_tuner_state_reports_active_and_ready(monkeypatch) -> None:
 
 def test_hamlib_reuses_existing_daemon_without_starting_a_duplicate(monkeypatch) -> None:
     class ExistingSocket:
-        closed = False
+        def __init__(self, responses: list[bytes]) -> None:
+            self.responses = responses
+            self.commands: list[bytes] = []
+            self.closed = False
 
         def settimeout(self, _timeout: float) -> None:
             pass
 
+        def sendall(self, data: bytes) -> None:
+            self.commands.append(data)
+
+        def recv(self, _size: int) -> bytes:
+            return self.responses.pop(0)
+
         def close(self) -> None:
             self.closed = True
 
-    existing = ExistingSocket()
+    existing = ExistingSocket([b"COM5\n", b"38400\n"])
     monkeypatch.setattr("wsjtx_autopilot.hamlib.socket.create_connection", lambda *_args, **_kwargs: existing)
 
     def duplicate_process(*_args, **_kwargs):
@@ -433,9 +442,66 @@ def test_hamlib_reuses_existing_daemon_without_starting_a_duplicate(monkeypatch)
     controller = HamlibFtx1Controller("COM5", 38_400, 0.25, process_factory=duplicate_process)
     assert controller.start()
     assert controller._process is None
+    assert existing.commands == [b"\\get_conf rig_pathname\n", b"\\get_conf serial_speed\n"]
     controller._identified = True
     assert controller.is_ready
     controller.close()
+    assert existing.closed
+
+
+def test_hamlib_reuses_daemon_with_hamlib_472_key_value_config_replies(monkeypatch) -> None:
+    class ExistingSocket:
+        def __init__(self) -> None:
+            self.responses = [b"rig_pathname=COM6\n", b"serial_speed=4800\n"]
+            self.closed = False
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def sendall(self, _data: bytes) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return self.responses.pop(0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    existing = ExistingSocket()
+    monkeypatch.setattr("wsjtx_autopilot.hamlib.socket.create_connection", lambda *_args, **_kwargs: existing)
+
+    controller = HamlibFtx1Controller("COM6", 4800, 0.25)
+
+    assert controller.start()
+    controller.close()
+    assert existing.closed
+
+
+def test_hamlib_refuses_existing_daemon_for_another_cat_port(monkeypatch) -> None:
+    class ExistingSocket:
+        def __init__(self) -> None:
+            self.responses = [b"COM7\n", b"38400\n"]
+            self.closed = False
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def sendall(self, _data: bytes) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            return self.responses.pop(0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    existing = ExistingSocket()
+    monkeypatch.setattr("wsjtx_autopilot.hamlib.socket.create_connection", lambda *_args, **_kwargs: existing)
+
+    controller = HamlibFtx1Controller("COM5", 38_400, 0.25)
+
+    assert not controller.start()
+    assert controller._socket is None
     assert existing.closed
 
 
@@ -523,13 +589,14 @@ def test_hamlib_ptt_timeout_is_not_fatal_when_wsjtx_is_already_in_rx() -> None:
     assert parse_datagram(transport.sent[-1][0]).header.packet_type == 8
 
 
-def test_transient_hamlib_identification_timeout_does_not_block_arm() -> None:
+def test_hamlib_identification_timeout_blocks_arm_when_swr_protection_is_enabled() -> None:
     cat = FakeHamlibCat()
     cat.identify = lambda: False  # type: ignore[attr-defined]
     transport = FakeTransport()
     control = WsjtxUdpControl(transport, 15, None, armed=False)
     runtime = AutopilotRuntime(
         AppConfig(
+            ftx1_cat2_enabled=True,
             ftx1_hamlib_enabled=True,
             ftx1_alc_control_enabled=True,
             ftx1_swr_protection_enabled=True,
@@ -538,8 +605,37 @@ def test_transient_hamlib_identification_timeout_does_not_block_arm() -> None:
         ftx1_band_drive=FTX1BandDriveController(cat),
     )
 
-    assert runtime.arm_control()
+    assert not runtime.arm_control()
+    assert not control.armed
+    assert runtime.antenna_safety_level == "fault"
+    assert runtime.last_qso_notice.startswith("SWR SAFETY UNAVAILABLE")
+
+
+def test_low_power_swr_sample_does_not_trip_protection() -> None:
+    cat = FakeCat(35, alc=0.05, swr=9.9, power=0.0)
+    transport = FakeTransport()
+    control = WsjtxUdpControl(transport, 15, None, armed=True)
+    runtime = AutopilotRuntime(
+        AppConfig(
+            ftx1_hamlib_enabled=True,
+            ftx1_meter_poll_seconds=0.2,
+            ftx1_swr_limit=2.0,
+            ftx1_swr_trip_samples=1,
+        ),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000, transmitting=True), NOW, ENDPOINT)
+    transport.sent.clear()
+
+    runtime.handle(None, NOW + timedelta(seconds=2), ENDPOINT)
+
     assert control.armed
+    assert not runtime._hamlib_swr_fault_latched
+    assert runtime._swr_recovery is None
+    assert runtime._hamlib_high_swr_samples == 0
+    assert not any(parse_datagram(data).header.packet_type == 8 for data, _ in transport.sent)
 
 
 class FakeTuneCat(FakeCat):
@@ -875,6 +971,52 @@ def test_unrecoverable_swr_disarms_and_sets_red_fault(monkeypatch) -> None:
     assert "ARRÊT DÉFINITIF" in "\n".join(runtime.antenna_safety_events)
 
 
+def test_operator_swr_reset_clears_session_fault_and_rearms_without_tune() -> None:
+    cat = FakeCat()
+    control = WsjtxUdpControl(FakeTransport(), 15, None, armed=False)
+    runtime = AutopilotRuntime(
+        AppConfig(ftx1_hamlib_enabled=True, allowed_auto_hop_bands=("80m", "40m", "20m", "15m")),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    runtime._swr_excluded_bands.update({"80m", "40m", "20m", "15m"})
+    runtime._hamlib_swr_fault_latched = True
+    runtime._hamlib_high_swr_samples = 2
+    runtime.antenna_safety_level = "fault"
+    runtime.antenna_safety_events.append("12:00:00  ARRÊT DÉFINITIF")
+    runtime.last_qso_notice = "SWR SAFETY FINAL - aucune bande autorisée utilisable - AutoPilot disarmed"
+
+    assert runtime.reset_swr_safety_and_rearm()
+
+    assert control.armed
+    assert runtime._swr_excluded_bands == set()
+    assert not runtime._hamlib_swr_fault_latched
+    assert runtime._hamlib_high_swr_samples == 0
+    assert runtime._swr_recovery is None
+    assert runtime.antenna_safety_level == "ok"
+    assert runtime.antenna_safety_events == []
+    assert runtime.last_qso_notice == ""
+    assert cat.tune_start_count == 0
+
+
+def test_operator_swr_reset_is_refused_while_transmitting() -> None:
+    control = WsjtxUdpControl(FakeTransport(), 15, None, armed=False)
+    runtime = AutopilotRuntime(AppConfig(), control=control)
+    runtime.handle(status(14_074_000, transmitting=True), NOW, ENDPOINT)
+    runtime._swr_excluded_bands.add("20m")
+    runtime._hamlib_swr_fault_latched = True
+    runtime.antenna_safety_level = "fault"
+
+    assert not runtime.reset_swr_safety_and_rearm()
+
+    assert not control.armed
+    assert runtime._swr_excluded_bands == {"20m"}
+    assert runtime._hamlib_swr_fault_latched
+    assert runtime.antenna_safety_level == "fault"
+    assert runtime.last_qso_notice == "SWR RESET REFUSED - transmission active"
+
+
 def test_non_ftx1_runtime_is_unchanged() -> None:
     runtime = AutopilotRuntime(AppConfig())
     assert runtime.ftx1_band_drive is None
@@ -984,6 +1126,43 @@ def test_forced_hop_blocks_calls_when_destination_profile_is_missing() -> None:
     assert runtime._blocked_band_drive_change is not None
     assert runtime.handle(cq, NOW + timedelta(minutes=10, seconds=2), ENDPOINT) is None
     assert not any(parse_datagram(data).header.packet_type == 0 for data, _ in transport.sent)
+
+    runtime.control.disarm("operator retry", source="test")
+    assert runtime.arm_control()
+    assert runtime._blocked_band_drive_change is None
+
+
+def test_failed_hamlib_band_change_preserves_current_candidates() -> None:
+    cat = FakeHamlibCat()
+    cat.set_frequency = lambda _frequency: False  # type: ignore[method-assign]
+    runtime = AutopilotRuntime(
+        AppConfig(candidate_collection_seconds=10),
+        control=WsjtxUdpControl(FakeTransport(), 15, None, armed=True),
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    runtime.handle(
+        DecodePacket(
+            PacketHeader(3, 2, "WSJT-X"),
+            True,
+            NOW.time(),
+            -8,
+            0.2,
+            900,
+            "~",
+            "CQ OH2ZZ KP20",
+            False,
+            False,
+        ),
+        NOW,
+        ENDPOINT,
+    )
+    assert "OH2ZZ" in runtime.engine._candidates
+
+    assert not runtime._request_band_change("40m", 7_074_000, NOW, "adaptive")
+
+    assert "OH2ZZ" in runtime.engine._candidates
 
 
 def test_manual_band_change_restores_saved_profile_once() -> None:

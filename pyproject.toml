@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wsjtx-autopilot"
-version = "0.1.0.dev1"
-description = "Dry-run FT8 decision companion for WSJT-X"
+version = "1.0.0"
+description = "Windows FT8/FT4 operating assistant for WSJT-X"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["pyserial>=3.5", "pypresence>=4.6,<5"]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest>=8.0", "pytest-cov>=6.0"]
 gui = ["PySide6>=6.7"]
 build = ["PyInstaller>=6.0"]
 

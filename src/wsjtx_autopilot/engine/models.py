@@ -83,6 +83,7 @@ class CandidateKind(Enum):
 class WorkedCheck:
     band: str | None
     duplicate: bool
+    scope: str = "today"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +173,7 @@ class EngineEvent:
 class ActionKind(Enum):
     CQ_REPLY = auto()
     DIRECT_REPLY = auto()
+    RARE_REPLY = auto()
 
 
 class ActionOutcome(Enum):

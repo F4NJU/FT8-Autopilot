@@ -81,9 +81,10 @@ class StatusView:
     mode: str
     dx_call: str
     tx_state: str
+    local_grid: str = ""
 
     @classmethod
     def from_status(cls, status: WsjtxStatus) -> "StatusView":
         frequency = "-" if status.dial_frequency is None else f"{status.dial_frequency / 1_000_000:.6f} MHz"
         tx_state = "TX" if status.transmitting else "TX ENABLED" if status.tx_enabled else "RX"
-        return cls(frequency, status.mode or "-", status.dx_call or "-", tx_state)
+        return cls(frequency, status.mode or "-", status.dx_call or "-", tx_state, status.local_grid)

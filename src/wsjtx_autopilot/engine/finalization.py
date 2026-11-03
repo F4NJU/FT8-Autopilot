@@ -17,6 +17,7 @@ class FinalizationState:
     last_terminal_kind: MessageKind
     source_decode: OriginalDecode | None
     deadline: datetime
+    hard_deadline: datetime
     period_seconds: int
     started_at: datetime
     last_terminal_period: tuple[object, ...]
@@ -56,6 +57,9 @@ class FinalizationTracker:
             last_terminal_kind=event.parsed.kind,
             source_decode=event.original,
             deadline=now + timedelta(seconds=period * self.final_tx_timeout_periods),
+            hard_deadline=now + timedelta(
+                seconds=period * (self.final_tx_timeout_periods + self.hold_periods)
+            ),
             period_seconds=period,
             started_at=now,
             last_terminal_period=_period_key(event),
@@ -74,6 +78,9 @@ class FinalizationTracker:
             return
         self.state.tx_confirmed = True
         self.state.deadline = now + timedelta(seconds=self.state.period_seconds * self.hold_periods)
+        self.state.hard_deadline = now + timedelta(
+            seconds=self.state.period_seconds * (self.final_tx_timeout_periods + self.hold_periods)
+        )
         LOGGER.info("[FINALIZE] local terminal TX observed message=73 remote=%s", self.state.remote_callsign)
 
     def begin_qso_logged_hold(
@@ -102,6 +109,9 @@ class FinalizationTracker:
             last_terminal_kind=MessageKind.RR73,
             source_decode=None,
             deadline=now + timedelta(seconds=period * self.hold_periods),
+            hard_deadline=now + timedelta(
+                seconds=period * (self.final_tx_timeout_periods + self.hold_periods)
+            ),
             period_seconds=period,
             started_at=now,
             last_terminal_period=(instance_id, now, mode),
@@ -147,6 +157,9 @@ class FinalizationTracker:
         self.state.deadline = now + timedelta(
             seconds=self.state.period_seconds * self.final_tx_timeout_periods
         )
+        self.state.hard_deadline = now + timedelta(
+            seconds=self.state.period_seconds * (self.final_tx_timeout_periods + self.hold_periods)
+        )
         LOGGER.info(
             "[FINALIZE] terminal progression remote=%s type=%s",
             self.state.remote_callsign,
@@ -166,6 +179,9 @@ class FinalizationTracker:
         self.state.last_terminal_period = _period_key(event)
         self.state.deadline = now + timedelta(
             seconds=self.state.period_seconds * self.final_tx_timeout_periods
+        )
+        self.state.hard_deadline = now + timedelta(
+            seconds=self.state.period_seconds * (self.final_tx_timeout_periods + self.hold_periods)
         )
         LOGGER.info(
             "[FINALIZE] retry final 73 count=%d/%d remote=%s",
@@ -196,7 +212,10 @@ class FinalizationTracker:
         if self.state is None or now < self.state.deadline:
             return False
         if self.state.tx_confirmed and not self.state.tx_completed:
-            return False
+            if now < self.state.hard_deadline:
+                return False
+            self.close("final TX status timeout")
+            return True
         self.close("grace period expired")
         return True
 

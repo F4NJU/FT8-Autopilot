@@ -8,8 +8,7 @@ actuelle n'offre plus de contact intéressant.
 L'opérateur reste responsable de la station, des émissions et du respect de
 la réglementation.
 
-**Statut : préversion officielle WIP, encore en cours de validation sur le
-terrain.**
+**Statut : version stable 1.0.0.**
 
 ## Installation
 
@@ -20,6 +19,15 @@ dist\WSJTX-AutoPilot\WSJTX-AutoPilot.exe
 ```
 
 AutoPilot doit être lancé en même temps que la version AP1 de WSJT-X.
+
+L’onglet **Hunt** nécessite également une clé API gratuite **afu.tools**.
+La clé s’obtient sur [afu.tools/api](https://afu.tools/api), puis se renseigne
+dans **Preferences > Diagnostic > Clé activité DX/FT8 (afu.tools)**.
+
+Pour le filtre **DXCC non validés LoTW uniquement**, renseigner également
+l'URL de l'API v2 Wavelog et un jeton `wl2_` ayant l'autorisation
+`confirmation:read` dans **Preferences > Diagnostic**. L'AutoPilot ne lit que
+les confirmations LoTW ; il ne modifie jamais le carnet Wavelog.
 
 ## Configuration obligatoire dans WSJT-X
 
@@ -42,7 +50,8 @@ Le port UDP configuré dans AutoPilot doit être identique à celui de WSJT-X.
 1. Lancer WSJT-X et vérifier que la réception FT8 fonctionne.
 2. Lancer `WSJTX-AutoPilot.exe`.
 3. Ouvrir **Preferences** et renseigner l'indicatif, le port UDP, la radio et
-   les bandes autorisées.
+   les bandes autorisées. Pour utiliser **Hunt**, renseigner aussi la clé API
+   **afu.tools** dans l’onglet **Diagnostic**.
 4. Vérifier que **WSJT-X AP1: Available** apparaît.
 5. Cliquer sur **ARM** pour autoriser AutoPilot à répondre.
 
@@ -51,10 +60,19 @@ activé.
 
 ## Fonctions principales
 
+- interface organisée en trois onglets : **Reply**, **Hunt** et **CQ — À venir** ;
 - sélection automatique des CQ et des stations qui appellent directement ;
 - priorité aux appels directs sans interrompre un QSO déjà engagé ;
 - suivi du QSO jusqu'au message final ;
 - filtrage des doublons, blacklist et priorités DXCC/continent ;
+- filtre optionnel **DXCC non validés LoTW uniquement**, basé sur les
+  confirmations LoTW visibles dans Wavelog ;
+- option pour prioriser en mode **Reply** les indicatifs spéciaux FT8 actifs vérifiés dans **Hunt** ;
+- option **Priorité chemin favorable (SFI / Kp)** dans **OPTIONS REPLY** :
+  départage les CQ ordinaires selon la distance, l'heure, la bande, le SFI et
+  le Kp ; elle ne bloque aucun CQ et ne passe jamais devant un appel direct ;
+- option **Exclure les stations déjà contactées** dans **OPTIONS REPLY**, sur
+  l'historique ADIF/WSJT-X, même un autre jour ou sur une autre bande ;
 - changement automatique de cycle TX puis de bande quand les contacts viables
   sont épuisés ;
 - changement de bande forcé après une durée maximale réglable, fixée à
@@ -63,6 +81,25 @@ activé.
 - lecture et commande de la radio par Hamlib ;
 - régulation ALC et protection SWR lorsqu'elles sont compatibles avec la radio ;
 - affichage Discord, par exemple `FT8 - 40m` et `Working EA7CTA`.
+
+### Onglet Hunt
+
+L’onglet **Hunt** affiche les indicatifs spéciaux annoncés dont une activité
+FT8 récente a aussi été observée sur les clusters, le réseau RBN numérique ou
+PSK Reporter via afu.tools. Les stations sans preuve d’activité FT8 ne sont pas
+proposées. La liste peut être limitée aux
+indicatifs français et elle est triée selon la fraîcheur, la bande, les heures
+d’activité et une estimation simple de la probabilité de chemin radio.
+
+Le service actuel utilise une clé API gratuite **afu.tools**, à renseigner dans
+**Preferences > Diagnostic**. En cas d’indisponibilité du service, le dernier
+cache connu est affiché clairement comme tel.
+
+Un double-clic surveille une seule station ; **HUNT TOUS** parcourt la liste.
+AutoPilot reste limité aux bandes autorisées et n’appelle jamais une station
+sur la seule foi d’Internet : il attend obligatoirement un vrai Decode local
+de WSJT-X. Si le correspondant répond déjà à quelqu’un d’autre, il n’émet pas.
+Les appels directs reçus et les QSO déjà engagés restent prioritaires.
 
 La durée maximale sur une bande se règle dans les préférences. La valeur `0`
 désactive uniquement cette limite de temps. Un QSO déjà engagé reste
@@ -78,6 +115,19 @@ session et une autre bande autorisée est sélectionnée sans relancer d'accord.
 La protection contrôlera naturellement cette nouvelle bande au premier TX. Une
 commande non confirmée ou des mesures insuffisantes provoquent un arrêt de
 sécurité sans exclure la bande.
+
+## Fonctions retirées ou volontairement non automatisées
+
+- **Smart TX** et la planification automatique du décalage TX ont été retirés ;
+- l'apprentissage automatique de drive a été retiré ;
+- AutoPilot ne modifie plus l'**USB MOD gain** ;
+- un changement de bande normal ne lance jamais d'accord automatique :
+  l'accord Hamlib est réservé à la récupération après un incident SWR ;
+- un spot Internet (Hunt ou MQTT) ne déclenche jamais seul une émission : un
+  Decode local WSJT-X reste obligatoire.
+
+Ces limites sont volontaires : elles réduisent les actions radio non
+vérifiables et gardent le comportement prévisible.
 
 ## En cas de problème
 

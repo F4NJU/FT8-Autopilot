@@ -164,6 +164,27 @@ def test_yesterdays_qso_does_not_block_today(tmp_path: Path) -> None:
         assert decision.decide(NOW) is not None
 
 
+def test_history_exclusion_blocks_a_station_worked_on_an_earlier_day_or_band(tmp_path: Path) -> None:
+    with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
+        record(store, qso_date=TODAY - timedelta(days=1), band="40m")
+        service = WorkedTodayService(store)
+
+        worked = service.check("YO6LM", 14_074_000, NOW, exclude_previously_worked=True)
+
+        assert worked.duplicate
+        assert worked.scope == "history"
+
+
+def test_history_exclusion_does_not_block_a_new_station(tmp_path: Path) -> None:
+    with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
+        record(store, qso_date=TODAY - timedelta(days=1))
+        service = WorkedTodayService(store)
+
+        worked = service.check("OH2ZZ", 14_074_000, NOW, exclude_previously_worked=True)
+
+        assert not worked.duplicate
+
+
 def test_mode_is_not_part_of_duplicate_key_and_callsign_is_normalized(tmp_path: Path) -> None:
     with WorkedQsoStore(tmp_path / "worked.sqlite3") as store:
         assert record(store, call="  yo6lm  ", mode="FT8")

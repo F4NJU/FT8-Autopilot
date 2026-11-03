@@ -102,7 +102,7 @@ class WsjtxUdpControl:
             self._armed,
             action.station,
         )
-        if action.kind is ActionKind.DIRECT_REPLY:
+        if action.kind in {ActionKind.DIRECT_REPLY, ActionKind.RARE_REPLY}:
             LOGGER.info("[CONTROL] direct Reply requested station=%s", action.station)
         rejection = self._validate(action, now)
         if rejection is not None:
@@ -168,7 +168,7 @@ class WsjtxUdpControl:
         self._actions_used += 1
         LOGGER.warning(
             "[CONTROL] %s sent station=%s instance=%s schema=%d endpoint=%s",
-            "Direct Reply" if action.kind is ActionKind.DIRECT_REPLY else "Reply",
+            "Direct Reply" if action.kind is ActionKind.DIRECT_REPLY else ("Rare Reply" if action.kind is ActionKind.RARE_REPLY else "Reply"),
             action.station,
             decode.instance_id,
             decode.schema,
@@ -379,7 +379,7 @@ class WsjtxUdpControl:
             return "control is disarmed"
         if self._max_actions is not None and self._actions_used >= self._max_actions:
             return "maximum initiations reached"
-        if action.kind not in {ActionKind.CQ_REPLY, ActionKind.DIRECT_REPLY} or action.original_decode is None:
+        if action.kind not in {ActionKind.CQ_REPLY, ActionKind.DIRECT_REPLY, ActionKind.RARE_REPLY} or action.original_decode is None:
             return "missing exact source Decode"
         decode = action.original_decode
         if not decode.is_new:
@@ -405,7 +405,9 @@ class WsjtxUdpControl:
                 or (session is not None and session.ap1_controls_available)
             ):
                 return "connected WSJT-X does not advertise AP1 Direct Reply support"
-            if parsed.kind in {MessageKind.CQ, MessageKind.QRZ} or not parsed.is_addressed_to(self._local_callsign):
+            if action.kind is ActionKind.DIRECT_REPLY and (
+                parsed.kind in {MessageKind.CQ, MessageKind.QRZ} or not parsed.is_addressed_to(self._local_callsign)
+            ):
                 return "Direct Reply requires a Decode addressed to the local callsign"
         if parsed.sender != action.station:
             return "selected station does not match source Decode"

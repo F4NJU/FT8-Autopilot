@@ -1,9 +1,10 @@
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QSize, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QGuiApplication, QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -45,6 +47,7 @@ from wsjtx_autopilot.config import (
     UserSettings,
 )
 from wsjtx_autopilot.engine.models import EngineEvent, EngineEventKind
+from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.logging_setup import (
     current_logging_session,
     export_diagnostic,
@@ -52,6 +55,7 @@ from wsjtx_autopilot.logging_setup import (
 )
 from wsjtx_autopilot.hamlib import list_supported_radios
 
+from .hunt import HuntPanel, PskReporterMqttPoller, SpaceWeatherPoller, SpecialCallPoller, WavelogLotwPoller
 from .viewmodels import ActivityRow, CandidateRow, StatusView
 from .worker import BackendWorker
 
@@ -113,11 +117,13 @@ class SettingsDialog(QDialog):
             direct_call_policy=DirectCallPolicy(self.direct_policy.currentData()),
             allow_direct_call_dupes=self.dupe_policy.currentData() == "direct",
             allow_dupes=self.dupe_policy.currentData() == "all",
+            exclude_previously_worked_calls=self._settings.exclude_previously_worked_calls,
             minimum_snr=minimum_snr,
             favor_strong_signals=self.strong_signals.isChecked(),
             pota_policy=ActivityPolicy(self.pota_policy.currentData()),
             sota_policy=ActivityPolicy(self.sota_policy.currentData()),
             qrp_policy=ActivityPolicy(self.qrp_policy.currentData()),
+            prioritize_special_calls_in_reply=self.special_call_priority.isChecked(),
             respond_to_cq_dx=self.respond_cq_dx.isChecked(),
             blacklist=_csv_set(self.blacklist.text()),
             ignore_minutes=self.ignore_minutes.value(),
@@ -169,6 +175,12 @@ class SettingsDialog(QDialog):
             ftx1_band_profiles=self._settings.ftx1_band_profiles,
             discord_presence_enabled=self.discord_presence_enabled.isChecked(),
             discord_application_id=self.discord_application_id.text().strip(),
+            special_calls_api_key=self.special_calls_api_key.text().strip(),
+            special_calls_refresh_minutes=self.special_calls_refresh.value(),
+            special_calls_lookback_minutes=self.special_calls_lookback.value(),
+            wavelog_api_url=self.wavelog_api_url.text().strip(),
+            wavelog_api_token=self.wavelog_api_token.text().strip(),
+            wavelog_lotw_refresh_minutes=self.wavelog_lotw_refresh.value(),
             logging_level=self.logging_level.currentData(),
         )
 
@@ -204,6 +216,11 @@ class SettingsDialog(QDialog):
         self.pota_policy = _activity_policy_combo(self._settings.pota_policy)
         self.sota_policy = _activity_policy_combo(self._settings.sota_policy)
         self.qrp_policy = _activity_policy_combo(self._settings.qrp_policy)
+        self.special_call_priority = QCheckBox("Prioriser les indicatifs spéciaux actifs en mode Reply")
+        self.special_call_priority.setChecked(self._settings.prioritize_special_calls_in_reply)
+        self.special_call_priority.setToolTip(
+            "Utilise la liste FT8 vérifiée de l'onglet Hunt. Les appels directs qui vous sont adressés restent prioritaires."
+        )
         self.respond_cq_dx = QCheckBox("Respond to relative CQ DX calls")
         self.respond_cq_dx.setChecked(self._settings.respond_to_cq_dx)
         form.addRow("Preferred continents", self.continents)
@@ -214,6 +231,7 @@ class SettingsDialog(QDialog):
         form.addRow("POTA", self.pota_policy)
         form.addRow("SOTA", self.sota_policy)
         form.addRow("QRP", self.qrp_policy)
+        form.addRow("Indicatifs spéciaux", self.special_call_priority)
         form.addRow("CQ DX", self.respond_cq_dx)
         return widget
 
@@ -570,6 +588,26 @@ class SettingsDialog(QDialog):
         self.discord_presence_enabled.setChecked(self._settings.discord_presence_enabled)
         self.discord_application_id = QLineEdit(self._settings.discord_application_id)
         self.discord_application_id.setPlaceholderText("Discord Application ID")
+        self.special_calls_api_key = QLineEdit(self._settings.special_calls_api_key)
+        self.special_calls_api_key.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.special_calls_api_key.setPlaceholderText("Clé gratuite afu.tools")
+        self.special_calls_refresh = QSpinBox()
+        self.special_calls_refresh.setRange(5, 24 * 60)
+        self.special_calls_refresh.setSuffix(" minutes")
+        self.special_calls_refresh.setValue(self._settings.special_calls_refresh_minutes)
+        self.special_calls_lookback = QSpinBox()
+        self.special_calls_lookback.setRange(60, 2880)
+        self.special_calls_lookback.setSuffix(" minutes")
+        self.special_calls_lookback.setValue(self._settings.special_calls_lookback_minutes)
+        self.wavelog_api_url = QLineEdit(self._settings.wavelog_api_url)
+        self.wavelog_api_url.setPlaceholderText("https://wavelog.example/index.php/api/v2")
+        self.wavelog_api_token = QLineEdit(self._settings.wavelog_api_token)
+        self.wavelog_api_token.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.wavelog_api_token.setPlaceholderText("Jeton wl2_ avec confirmation:read")
+        self.wavelog_lotw_refresh = QSpinBox()
+        self.wavelog_lotw_refresh.setRange(5, 24 * 60)
+        self.wavelog_lotw_refresh.setSuffix(" minutes")
+        self.wavelog_lotw_refresh.setValue(self._settings.wavelog_lotw_refresh_minutes)
         session = current_logging_session()
         log_path = session.path if session is not None else AppPaths.from_environment().log_dir
         current_log = QLabel(str(log_path))
@@ -578,6 +616,12 @@ class SettingsDialog(QDialog):
         form.addRow("File logging", self.logging_level)
         form.addRow(self.discord_presence_enabled)
         form.addRow("Discord Application ID", self.discord_application_id)
+        form.addRow("Clé activité DX/FT8 (afu.tools)", self.special_calls_api_key)
+        form.addRow("Actualisation indicatifs spéciaux", self.special_calls_refresh)
+        form.addRow("Historique activité FT8", self.special_calls_lookback)
+        form.addRow("URL API Wavelog v2", self.wavelog_api_url)
+        form.addRow("Jeton Wavelog (confirmation:read)", self.wavelog_api_token)
+        form.addRow("Actualisation validations LoTW", self.wavelog_lotw_refresh)
         form.addRow("Current session log", current_log)
         layout.addLayout(form)
         open_folder = QPushButton("OPEN LOG FOLDER")
@@ -607,9 +651,22 @@ class MainWindow(QMainWindow):
     disarm_requested = Signal(str)
     ignore_requested = Signal(str)
     reset_adaptive_requested = Signal()
+    reset_swr_safety_requested = Signal()
     save_ftx1_current_band_profile_requested = Signal()
     delete_ftx1_current_band_profile_requested = Signal()
     reset_all_ftx1_band_profiles_requested = Signal()
+    hunt_requested = Signal(object, str)
+    hunt_stop_requested = Signal()
+    special_calls_updated_requested = Signal(object)
+    reply_rare_tracking_requested = Signal(bool)
+    favorable_path_priority_requested = Signal(bool)
+    rare_stations_only_requested = Signal(bool)
+    unconfirmed_dxcc_only_requested = Signal(bool)
+    exclude_worked_history_requested = Signal(bool)
+    wavelog_lotw_updated_requested = Signal(object)
+    space_weather_updated_requested = Signal(object)
+    remote_spot_received = Signal(object)
+    unconfirmed_dxcc_remote_spot_received = Signal(object)
     stop_requested = Signal()
 
     def __init__(self, settings_store: SettingsStore | None = None) -> None:
@@ -618,7 +675,13 @@ class MainWindow(QMainWindow):
         self._settings = self._store.load()
         self._armed = False
         self._ap1_available = False
+        self._antenna_reset_available = False
         self._candidate_rows: dict[str, int] = {}
+        self._special_call_poller: SpecialCallPoller | None = None
+        self._wavelog_lotw_poller: WavelogLotwPoller | None = None
+        self._space_weather_poller: SpaceWeatherPoller | None = None
+        self._pskreporter_mqtt: PskReporterMqttPoller | None = None
+        self._local_grid = ""
         self.setWindowTitle("WSJTX AutoPilot")
         self.resize(1120, 700)
         self.setMinimumSize(820, 540)
@@ -635,21 +698,66 @@ class MainWindow(QMainWindow):
         self.disarm_requested.connect(self._worker.disarm)
         self.ignore_requested.connect(self._worker.ignore_station)
         self.reset_adaptive_requested.connect(self._worker.reset_adaptive_strategy)
+        self.reset_swr_safety_requested.connect(self._worker.reset_swr_safety)
         self.save_ftx1_current_band_profile_requested.connect(self._worker.save_ftx1_current_band_profile)
         self.delete_ftx1_current_band_profile_requested.connect(self._worker.delete_ftx1_current_band_profile)
         self.reset_all_ftx1_band_profiles_requested.connect(self._worker.reset_all_ftx1_band_profiles)
+        self.hunt_requested.connect(self._worker.start_hunt)
+        self.hunt_stop_requested.connect(self._worker.stop_hunt)
+        self.special_calls_updated_requested.connect(self._worker.update_special_calls)
+        self.reply_rare_tracking_requested.connect(self._worker.set_reply_rare_tracking)
+        self.favorable_path_priority_requested.connect(self._worker.set_favorable_path_priority)
+        self.rare_stations_only_requested.connect(self._worker.set_rare_stations_only)
+        self.unconfirmed_dxcc_only_requested.connect(self._worker.set_unconfirmed_dxcc_only)
+        self.exclude_worked_history_requested.connect(self._worker.set_exclude_worked_history)
+        self.wavelog_lotw_updated_requested.connect(self._worker.update_wavelog_lotw_calls)
+        self.space_weather_updated_requested.connect(self._worker.update_space_weather)
+        self.remote_spot_received.connect(self._worker.update_hunt_remote_spot)
+        self.unconfirmed_dxcc_remote_spot_received.connect(self._worker.update_unconfirmed_dxcc_remote_spot)
         self._worker.connection_changed.connect(self._show_connection)
         self._worker.armed_changed.connect(self._show_armed)
         self._worker.swr_safety_triggered.connect(self._show_swr_safety_notification)
         self._worker.activity_received.connect(self._add_activity)
         self._worker.engine_event.connect(self._handle_engine_event)
+        self._worker.unconfirmed_dxcc_spotted.connect(self._add_unconfirmed_dxcc_mqtt_spot)
         self._worker.status_changed.connect(self._show_status)
         self._worker.adaptive_changed.connect(self._show_adaptive)
         self._worker.qso_changed.connect(self._show_qso)
         self._worker.ftx1_band_profiles_changed.connect(self._update_ftx1_band_profiles)
+        self._worker.hunt_changed.connect(self._show_hunt_state)
+        self._worker.rare_station_worked.connect(self._add_rare_station_worked)
+        self._worker.wavelog_lotw_changed.connect(self._show_wavelog_lotw_state)
+        self._worker.diagnostics_changed.connect(self._show_session_diagnostics)
         self._worker.error.connect(self._show_error)
-        self._worker.stopped.connect(self._thread.quit)
+        # ``closeEvent`` waits for the worker thread.  A normal queued
+        # connection would schedule QThread.quit on the GUI event loop, which
+        # is precisely the loop that is waiting.  Run this thread-safe slot in
+        # the worker context instead so the event loop can really terminate.
+        self._worker.stopped.connect(self._thread.quit, Qt.ConnectionType.DirectConnection)
         self._thread.start()
+        self.rare_reply_tracking_action.toggled.connect(self._set_reply_rare_tracking)
+        self.favorable_path_priority_action.toggled.connect(self._set_favorable_path_priority)
+        self.rare_stations_only_action.toggled.connect(self._set_rare_stations_only)
+        self.unconfirmed_dxcc_only_action.toggled.connect(self._set_unconfirmed_dxcc_only)
+        self.exclude_worked_history_action.toggled.connect(self._set_exclude_worked_history)
+        self._update_reply_mode_summary()
+        self._special_refresh_timer = QTimer(self)
+        self._special_refresh_timer.timeout.connect(self._refresh_special_calls)
+        self._restart_special_refresh_timer()
+        self._wavelog_refresh_timer = QTimer(self)
+        self._wavelog_refresh_timer.timeout.connect(self._refresh_wavelog_lotw)
+        self._restart_wavelog_refresh_timer()
+        self._space_weather_refresh_timer = QTimer(self)
+        self._space_weather_refresh_timer.setInterval(15 * 60_000)
+        self._space_weather_refresh_timer.timeout.connect(self._refresh_space_weather)
+        self._space_weather_refresh_timer.start()
+        QTimer.singleShot(0, self._refresh_special_calls)
+        if self._settings.wavelog_api_url and self._settings.wavelog_api_token:
+            QTimer.singleShot(0, self._refresh_wavelog_lotw)
+        if self._settings.pskreporter_mqtt_enabled or self._settings.wavelog_unconfirmed_dxcc_only:
+            QTimer.singleShot(0, self._start_pskreporter_mqtt)
+        if self._settings.prioritize_favorable_path_in_reply:
+            QTimer.singleShot(0, self._refresh_space_weather)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -676,6 +784,10 @@ class MainWindow(QMainWindow):
         self.antenna_indicator = QLabel("●  OK")
         self.antenna_indicator.setObjectName("antennaSafety")
         self.antenna_indicator.setProperty("level", "ok")
+        self.reset_swr_safety_button = QPushButton("RÉINITIALISER SWR")
+        self.reset_swr_safety_button.setObjectName("resetSwrSafetyButton")
+        self.reset_swr_safety_button.setEnabled(False)
+        self.reset_swr_safety_button.clicked.connect(self._confirm_reset_swr_safety)
         self.arm_button = QPushButton("ARM CONTROL")
         self.arm_button.setObjectName("armButton")
         self.arm_button.clicked.connect(self._toggle_arm)
@@ -683,6 +795,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.frequency)
         header.addWidget(self.mode)
         header.addWidget(self.antenna_indicator)
+        header.addWidget(self.reset_swr_safety_button)
         header.addWidget(settings_button)
         header.addWidget(self.arm_button)
         layout.addLayout(header)
@@ -738,27 +851,87 @@ class MainWindow(QMainWindow):
         adaptive_layout.addLayout(controls_row)
         layout.addWidget(adaptive)
 
-        antenna_panel = QFrame()
-        antenna_panel.setObjectName("panel")
-        antenna_layout = QVBoxLayout(antenna_panel)
-        antenna_layout.setContentsMargins(10, 6, 10, 6)
-        antenna_title = QLabel("SÉCURITÉ ANTENNE")
-        antenna_title.setObjectName("panelTitle")
-        self.antenna_log = QPlainTextEdit()
-        self.antenna_log.setReadOnly(True)
-        self.antenna_log.setMaximumHeight(82)
-        self.antenna_log.setPlaceholderText("Aucun incident SWR pendant cette session.")
-        antenna_layout.addWidget(antenna_title)
-        antenna_layout.addWidget(self.antenna_log)
-        layout.addWidget(antenna_panel)
-
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._activity_panel())
-        splitter.addWidget(self._candidate_panel())
+        splitter.addWidget(self._rare_worked_panel())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([660, 440])
-        layout.addWidget(splitter, 1)
+
+        reply_page = QWidget()
+        reply_layout = QVBoxLayout(reply_page)
+        reply_layout.setContentsMargins(0, 0, 0, 0)
+        reply_options = QHBoxLayout()
+        self.reply_options_button = QPushButton("OPTIONS REPLY")
+        reply_menu = QMenu(self.reply_options_button)
+        self.rare_reply_tracking_action = reply_menu.addAction("Priorité rares et suivi MQTT PSK Reporter")
+        self.rare_reply_tracking_action.setCheckable(True)
+        self.rare_reply_tracking_action.setChecked(self._settings.pskreporter_mqtt_enabled)
+        self.rare_reply_tracking_action.setToolTip(
+            "Suit les indicatifs spéciaux FT8. Un spot distant ne provoque jamais une émission : un Decode local reste obligatoire."
+        )
+        self.rare_stations_only_action = reply_menu.addAction("Stations rares uniquement")
+        self.rare_stations_only_action.setCheckable(True)
+        self.rare_stations_only_action.setChecked(self._settings.rare_stations_only)
+        self.rare_stations_only_action.setToolTip("Ignore les CQ et appels classiques.")
+        self.unconfirmed_dxcc_only_action = reply_menu.addAction("Priorité DXCC non validés LoTW")
+        self.unconfirmed_dxcc_only_action.setCheckable(True)
+        self.unconfirmed_dxcc_only_action.setChecked(self._settings.wavelog_unconfirmed_dxcc_only)
+        self.unconfirmed_dxcc_only_action.setToolTip("Priorise les entités DXCC non confirmées dans LoTW selon Wavelog.")
+        self.favorable_path_priority_action = reply_menu.addAction("Priorité chemin favorable (SFI / Kp)")
+        self.favorable_path_priority_action.setCheckable(True)
+        self.favorable_path_priority_action.setChecked(self._settings.prioritize_favorable_path_in_reply)
+        self.favorable_path_priority_action.setToolTip(
+            "Départage les CQ ordinaires avec la distance, l'heure, le SFI et le Kp. "
+            "Ne bloque aucun CQ et ne prévaut jamais sur un appel direct."
+        )
+        reply_menu.addSeparator()
+        self.exclude_worked_history_action = reply_menu.addAction("Exclure les stations déjà contactées")
+        self.exclude_worked_history_action.setCheckable(True)
+        self.exclude_worked_history_action.setChecked(self._settings.exclude_previously_worked_calls)
+        self.exclude_worked_history_action.setToolTip("Écarte une station présente dans l'historique ADIF/WSJT-X, même un autre jour ou sur une autre bande.")
+        self.reply_options_button.setMenu(reply_menu)
+        self.reply_mode_summary = QLabel()
+        self.reply_mode_summary.setObjectName("infoText")
+        reply_options.addWidget(self.reply_options_button)
+        reply_options.addWidget(self.reply_mode_summary, 1)
+        reply_layout.addLayout(reply_options)
+        diagnostics_panel = QFrame()
+        diagnostics_panel.setObjectName("panel")
+        diagnostics_panel.setMaximumHeight(108)
+        diagnostics_layout = QVBoxLayout(diagnostics_panel)
+        diagnostics_layout.setContentsMargins(10, 6, 10, 6)
+        diagnostics_layout.setSpacing(3)
+        diagnostics_title = QLabel("DÉCISIONS SESSION")
+        diagnostics_title.setObjectName("panelTitle")
+        self.session_diagnostics = QLabel("En attente des premiers décodages.")
+        self.session_diagnostics.setObjectName("infoText")
+        self.session_diagnostics.setWordWrap(True)
+        self.session_diagnostic_log = QPlainTextEdit()
+        self.session_diagnostic_log.setReadOnly(True)
+        self.session_diagnostic_log.setMaximumHeight(46)
+        self.session_diagnostic_log.setPlaceholderText("Les trois dernières décisions utiles apparaîtront ici.")
+        diagnostics_layout.addWidget(diagnostics_title)
+        diagnostics_layout.addWidget(self.session_diagnostics)
+        diagnostics_layout.addWidget(self.session_diagnostic_log)
+        reply_layout.addWidget(diagnostics_panel)
+        reply_layout.addWidget(splitter)
+        self.hunt_panel = HuntPanel()
+        self.hunt_panel.refresh_requested.connect(self._refresh_special_calls)
+        self.hunt_panel.target_requested.connect(self._start_target_hunt)
+        self.hunt_panel.hunt_all_requested.connect(self._start_all_hunt)
+        self.hunt_panel.stop_requested.connect(self.hunt_stop_requested.emit)
+        cq_page = QWidget()
+        cq_layout = QVBoxLayout(cq_page)
+        cq_message = QLabel("CQ — À VENIR")
+        cq_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cq_message.setObjectName("comingSoon")
+        cq_layout.addWidget(cq_message, 1)
+        self.operation_tabs = QTabWidget()
+        self.operation_tabs.addTab(reply_page, "Reply")
+        self.operation_tabs.addTab(self.hunt_panel, "Hunt")
+        self.operation_tabs.addTab(cq_page, "CQ")
+        layout.addWidget(self.operation_tabs, 1)
 
         working = QFrame()
         working.setObjectName("qsoPanel")
@@ -797,12 +970,27 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.activity)
         return panel
 
-    def _candidate_panel(self) -> QWidget:
+    def _rare_worked_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("panel")
         layout = QVBoxLayout(panel)
-        label = QLabel("CANDIDATE RANKING")
+        label = QLabel("STATIONS RARES SUIVIES")
         label.setObjectName("panelTitle")
+        self.rare_worked_summary = QLabel("Aucune station rare reçue par MQTT cette session.")
+        self.rare_worked_summary.setObjectName("infoText")
+        self.rare_worked = QTableWidget(0, 4)
+        self.rare_worked.setHorizontalHeaderLabels(["UTC", "CALL", "BANDE", "ÉTAT"])
+        self.rare_worked.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rare_worked.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rare_worked.verticalHeader().hide()
+        rare_header = self.rare_worked.horizontalHeader()
+        rare_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        rare_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rare_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        rare_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._rare_worked_rows: dict[tuple[str, str], int] = {}
+        # Candidate events remain handled in the background for status messages,
+        # so replacing the visual panel cannot affect radio-control behavior.
         self.pending_direct_label = QLabel("Pending Direct Calls: 0")
         self._pending_direct_stations: set[str] = set()
         self.candidates = QTableWidget(0, 5)
@@ -821,9 +1009,101 @@ class MainWindow(QMainWindow):
         self.candidates.addAction(ignore)
         self.candidates.addAction(blacklist)
         layout.addWidget(label)
-        layout.addWidget(self.pending_direct_label)
-        layout.addWidget(self.candidates)
+        layout.addWidget(self.rare_worked_summary)
+        layout.addWidget(self.rare_worked)
         return panel
+
+    def _show_session_diagnostics(self, snapshot: dict[str, object]) -> None:
+        selected = int(snapshot.get("candidates_selected", 0))
+        sent = int(snapshot.get("replies_sent", 0))
+        completed = int(snapshot.get("qso_completed", 0))
+        refused = int(snapshot.get("candidates_refused", 0))
+        busy = int(snapshot.get("stations_busy", 0))
+        local_rejections = int(snapshot.get("local_rejections", 0))
+        failures = int(snapshot.get("control_failures", 0))
+        auto_watchdog = int(snapshot.get("autopilot_watchdogs", 0))
+        wsjtx_watchdog = int(snapshot.get("wsjtx_watchdogs", 0))
+        success_rate = snapshot.get("reply_success_percent")
+        success_text = "—" if success_rate is None else f"{int(success_rate)} %"
+        self.session_diagnostics.setText(
+            f"SÉLECTIONS : {selected} · REPLIES ENVOYÉS : {sent} · QSO TERMINÉS : {completed} · RÉUSSITE : {success_text}\n"
+            f"ÉCARTÉES : {refused} (DÉJÀ OCCUPÉES : {busy}) · REFUS WSJT-X : {local_rejections} · ÉCHECS : {failures}"
+            f" · WATCHDOGS : AutoPilot {auto_watchdog} / WSJT-X {wsjtx_watchdog}"
+        )
+        recent = snapshot.get("recent", ())
+        if isinstance(recent, (tuple, list)):
+            self.session_diagnostic_log.setPlainText("\n".join(str(item) for item in recent[:3]))
+
+    def _add_rare_station_worked(self, callsign: str, band: str) -> None:
+        key = (callsign.upper(), band.lower())
+        row = self._rare_worked_rows.get(key)
+        if row is None:
+            row = self.rare_worked.rowCount()
+            self.rare_worked.insertRow(row)
+            self._rare_worked_rows[key] = row
+        for column, value in enumerate((datetime.now().strftime("%H:%M"), callsign.upper(), band, "TRAVAILLÉ")):
+            self.rare_worked.setItem(row, column, QTableWidgetItem(value))
+        self._update_rare_summary()
+
+    def _add_rare_mqtt_spot(self, spot) -> None:
+        callsign = str(getattr(spot, "callsign", "")).strip().upper()
+        band = str(getattr(spot, "band", "")).strip().lower()
+        observed_at = getattr(spot, "observed_at", None)
+        if not callsign or not band:
+            return
+        key = (callsign, band)
+        row = self._rare_worked_rows.get(key)
+        if row is None:
+            row = self.rare_worked.rowCount()
+            self.rare_worked.insertRow(row)
+            self._rare_worked_rows[key] = row
+        timestamp = observed_at.strftime("%H:%M") if isinstance(observed_at, datetime) else datetime.now().strftime("%H:%M")
+        state = self.rare_worked.item(row, 3)
+        status = state.text() if state is not None and state.text() == "TRAVAILLÉ" else "VU MQTT"
+        for column, value in enumerate((timestamp, callsign, band, status)):
+            self.rare_worked.setItem(row, column, QTableWidgetItem(value))
+        self._update_rare_summary()
+
+    def _add_unconfirmed_dxcc_mqtt_spot(self, spot) -> None:
+        """Show one accepted DXCC discovery without exposing the raw MQTT firehose."""
+        callsign = str(getattr(spot, "callsign", "")).strip().upper()
+        band = str(getattr(spot, "band", "")).strip().lower()
+        observed_at = getattr(spot, "observed_at", None)
+        if not callsign or not band:
+            return
+        key = (callsign, band)
+        row = self._rare_worked_rows.get(key)
+        if row is None:
+            row = self.rare_worked.rowCount()
+            self.rare_worked.insertRow(row)
+            self._rare_worked_rows[key] = row
+        timestamp = observed_at.strftime("%H:%M") if isinstance(observed_at, datetime) else datetime.now().strftime("%H:%M")
+        state = self.rare_worked.item(row, 3)
+        status = state.text() if state is not None and state.text() == "TRAVAILLÉ" else "DXCC MQTT"
+        for column, value in enumerate((timestamp, callsign, band, status)):
+            self.rare_worked.setItem(row, column, QTableWidgetItem(value))
+        self._update_rare_summary()
+
+    def _update_rare_summary(self) -> None:
+        seen = self.rare_worked.rowCount()
+        rare_seen = sum(
+            1
+            for row in range(seen)
+            if (item := self.rare_worked.item(row, 3)) is not None and item.text() == "VU MQTT"
+        )
+        dxcc_seen = sum(
+            1
+            for row in range(seen)
+            if (item := self.rare_worked.item(row, 3)) is not None and item.text() == "DXCC MQTT"
+        )
+        worked = sum(
+            1
+            for row in range(seen)
+            if (item := self.rare_worked.item(row, 3)) is not None and item.text() == "TRAVAILLÉ"
+        )
+        self.rare_worked_summary.setText(
+            f"MQTT : {rare_seen} rare(s) suivie(s) · {dxcc_seen} DXCC à confirmer · QSO : {worked}"
+        )
 
     def _add_activity(self, row: ActivityRow) -> None:
         target = 0
@@ -838,6 +1118,9 @@ class MainWindow(QMainWindow):
             self.activity.setItem(target, column, QTableWidgetItem(value))
         while self.activity.rowCount() > 250:
             self.activity.removeRow(self.activity.rowCount() - 1)
+        parsed = parse_ft8_message(row.message)
+        if parsed is not None:
+            self.hunt_panel.note_local_decode(parsed.sender, row.observed_at)
 
     def _handle_engine_event(self, event: EngineEvent) -> None:
         if event.kind is EngineEventKind.PENDING_DIRECT_ADDED:
@@ -898,6 +1181,7 @@ class MainWindow(QMainWindow):
         self.arm_button.setProperty("armed", armed)
         self.arm_button.style().unpolish(self.arm_button)
         self.arm_button.style().polish(self.arm_button)
+        self._update_swr_reset_button()
         LOGGER.info("[GUI] ARM state update armed=%s", armed)
         LOGGER.info("[GUI] control state backend_armed=%s ui_armed=%s", armed, self._armed)
 
@@ -914,6 +1198,7 @@ class MainWindow(QMainWindow):
         self.frequency.setText(status.frequency)
         self.mode.setText(status.mode)
         self.tx_state.setText(status.tx_state)
+        self._local_grid = status.local_grid
 
     def _show_adaptive(self, snapshot: dict[str, object]) -> None:
         available = bool(snapshot["ap1_available"])
@@ -980,16 +1265,13 @@ class MainWindow(QMainWindow):
             if antenna.get("recovering"):
                 labels["warning"] = "⚠  ACCORD EN COURS"
             excluded = tuple(antenna.get("excluded_bands") or ())
+            self._antenna_reset_available = level != "ok" or bool(excluded)
+            self._update_swr_reset_button()
             suffix = f"  ({', '.join(excluded)} exclue{'s' if len(excluded) > 1 else ''})" if excluded else ""
             self.antenna_indicator.setText(labels.get(level, labels["ok"]) + suffix)
             self.antenna_indicator.setProperty("level", level)
             self.antenna_indicator.style().unpolish(self.antenna_indicator)
             self.antenna_indicator.style().polish(self.antenna_indicator)
-            events = tuple(antenna.get("events") or ())
-            rendered = "\n".join(events[-6:])
-            if self.antenna_log.toPlainText() != rendered:
-                self.antenna_log.setPlainText(rendered)
-                self.antenna_log.verticalScrollBar().setValue(self.antenna_log.verticalScrollBar().maximum())
         ftx1 = snapshot.get("ftx1")
         if isinstance(ftx1, dict):
             ftx1_band = ftx1.get("band") or current_band
@@ -1066,17 +1348,265 @@ class MainWindow(QMainWindow):
             LOGGER.info("[GUI] ARM requested by operator")
             self.arm_requested.emit()
 
+    def _update_swr_reset_button(self) -> None:
+        self.reset_swr_safety_button.setEnabled(self._antenna_reset_available and not self._armed)
+
+    def _confirm_reset_swr_safety(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Réinitialiser la protection SWR ?",
+            "Cette action efface toutes les bandes exclues et l'état d'arrêt SWR, puis réarme AutoPilot.\n\n"
+            "Aucun accord ni test de bande ne sera lancé. La protection SWR restera active dès la prochaine émission.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        LOGGER.info("[GUI] SWR safety reset confirmation result=%r", answer)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.reset_swr_safety_requested.emit()
+
     def _edit_settings(self) -> None:
         dialog = SettingsDialog(self._settings, self, self._ap1_available)
         dialog.settings_applied.connect(self._apply_settings)
         dialog.exec()
 
     def _apply_settings(self, settings: UserSettings) -> None:
+        self.hunt_panel.set_hunting(False)
+        self.hunt_stop_requested.emit()
         self._settings = settings
         self._store.save(self._settings)
         set_file_log_level(self._settings.logging_level)
         self.apply_settings_requested.emit(self._settings)
+        self._restart_special_refresh_timer()
+        self._restart_wavelog_refresh_timer()
+        self._refresh_special_calls()
+        self._refresh_wavelog_lotw()
         self.statusBar().showMessage("Preferences saved; backend restarted DISARMED", 6000)
+
+    def _restart_special_refresh_timer(self) -> None:
+        interval_ms = max(5, self._settings.special_calls_refresh_minutes) * 60_000
+        self._special_refresh_timer.setInterval(interval_ms)
+        self._special_refresh_timer.start()
+
+    def _restart_wavelog_refresh_timer(self) -> None:
+        interval_ms = max(5, self._settings.wavelog_lotw_refresh_minutes) * 60_000
+        self._wavelog_refresh_timer.setInterval(interval_ms)
+        self._wavelog_refresh_timer.start()
+
+    def _refresh_wavelog_lotw(self) -> None:
+        if self._wavelog_lotw_poller is not None and self._wavelog_lotw_poller.isRunning():
+            return
+        if not self._settings.wavelog_api_url or not self._settings.wavelog_api_token:
+            if self.unconfirmed_dxcc_only_action.isChecked():
+                self.statusBar().showMessage("DXCC LoTW : configure l'URL et le jeton API Wavelog v2", 7000)
+            return
+        from wsjtx_autopilot.wavelog import WavelogLotwCatalog
+
+        paths = AppPaths.from_environment().ensure_directories()
+        self._wavelog_lotw_poller = WavelogLotwPoller(
+            WavelogLotwCatalog(paths.data_dir / "wavelog_lotw_confirmations.json"),
+            self._settings.wavelog_api_url,
+            self._settings.wavelog_api_token,
+        )
+        self._wavelog_lotw_poller.completed.connect(self._wavelog_lotw_updated)
+        self._wavelog_lotw_poller.finished.connect(self._wavelog_lotw_poller.deleteLater)
+        self._wavelog_lotw_poller.start()
+
+    def _wavelog_lotw_updated(self, snapshot: object) -> None:
+        self.wavelog_lotw_updated_requested.emit(snapshot)
+        self._wavelog_lotw_poller = None
+
+    def _show_wavelog_lotw_state(self, entities: int, unresolved: int, available: bool, warning: str) -> None:
+        if not available:
+            if self.unconfirmed_dxcc_only_action.isChecked():
+                self.statusBar().showMessage(
+                    f"DXCC LoTW : synchronisation indisponible ({warning or 'aucun cache'}) — appels bloqués par sécurité",
+                    9000,
+                )
+            return
+        suffix = f" · cache ({warning})" if warning else ""
+        detail = f" · {unresolved} indicatif(s) non résolu(s)" if unresolved else ""
+        self.statusBar().showMessage(f"Wavelog LoTW : {entities} DXCC validés{detail}{suffix}", 7000)
+
+    def _refresh_special_calls(self) -> None:
+        if self._special_call_poller is not None and self._special_call_poller.isRunning():
+            return
+        paths = AppPaths.from_environment().ensure_directories()
+        from wsjtx_autopilot.special_calls import SpecialCallCatalog
+
+        self.hunt_panel.refresh_button.setEnabled(False)
+        self.hunt_panel.status.setText("Vérification des calendriers DX, clusters et PSK Reporter…")
+        self._special_call_poller = SpecialCallPoller(
+            SpecialCallCatalog(paths.data_dir / "special_calls.json"),
+            self._settings.special_calls_api_key,
+            self._settings.special_calls_lookback_minutes,
+            self._settings.allowed_auto_hop_bands,
+            self._local_grid,
+        )
+        self._special_call_poller.completed.connect(self._special_calls_updated)
+        self._special_call_poller.finished.connect(self._special_call_poller.deleteLater)
+        self._special_call_poller.start()
+
+    def _special_calls_updated(self, snapshot) -> None:
+        self.hunt_panel.refresh_button.setEnabled(True)
+        self.hunt_panel.set_snapshot(snapshot)
+        self.special_calls_updated_requested.emit(tuple(snapshot.activities))
+        if self._pskreporter_mqtt is not None:
+            self._pskreporter_mqtt.set_callsigns(self.hunt_panel.all_callsigns())
+            self._pskreporter_mqtt.set_discovery_bands(self._unconfirmed_dxcc_discovery_bands())
+        self._special_call_poller = None
+
+    def _set_reply_rare_tracking(self, enabled: bool) -> None:
+        self._settings.pskreporter_mqtt_enabled = bool(enabled)
+        # This main-screen mode deliberately combines tracking and scoring:
+        # a rare locally decoded CQ is ahead of ordinary CQ candidates.
+        self._settings.prioritize_special_calls_in_reply = bool(enabled)
+        self._store.save(self._settings)
+        self.reply_rare_tracking_requested.emit(bool(enabled))
+        if enabled:
+            self._start_pskreporter_mqtt()
+            self.statusBar().showMessage("Reply : indicatifs rares prioritaires, suivi MQTT PSK Reporter activé", 7000)
+        else:
+            if self.rare_stations_only_action.isChecked():
+                self.rare_stations_only_action.setChecked(False)
+            if not self.unconfirmed_dxcc_only_action.isChecked():
+                self._stop_pskreporter_mqtt()
+            self.statusBar().showMessage("Reply : suivi MQTT des indicatifs rares désactivé", 5000)
+        self._update_reply_mode_summary()
+
+    def _set_rare_stations_only(self, enabled: bool) -> None:
+        if enabled and not self.rare_reply_tracking_action.isChecked():
+            self.rare_reply_tracking_action.setChecked(True)
+        self._settings.rare_stations_only = bool(enabled)
+        self._store.save(self._settings)
+        self.rare_stations_only_requested.emit(bool(enabled))
+        self.statusBar().showMessage(
+            "Reply : stations rares uniquement" if enabled else "Reply : stations classiques à nouveau autorisées",
+            5000,
+        )
+        self._update_reply_mode_summary()
+
+    def _set_unconfirmed_dxcc_only(self, enabled: bool) -> None:
+        self._settings.wavelog_unconfirmed_dxcc_only = bool(enabled)
+        self._store.save(self._settings)
+        self.unconfirmed_dxcc_only_requested.emit(bool(enabled))
+        if enabled:
+            self._start_pskreporter_mqtt()
+            self._refresh_wavelog_lotw()
+            self.statusBar().showMessage(
+                "Reply : priorité aux DXCC non validés LoTW — synchronisation Wavelog en attente",
+                7000,
+            )
+        else:
+            if self._pskreporter_mqtt is not None:
+                self._pskreporter_mqtt.set_discovery_bands(())
+            if not self.rare_reply_tracking_action.isChecked():
+                self._stop_pskreporter_mqtt()
+            self.statusBar().showMessage("Reply : priorité DXCC LoTW désactivée", 5000)
+        self._update_reply_mode_summary()
+
+    def _set_favorable_path_priority(self, enabled: bool) -> None:
+        self._settings.prioritize_favorable_path_in_reply = bool(enabled)
+        self._store.save(self._settings)
+        self.favorable_path_priority_requested.emit(bool(enabled))
+        if enabled:
+            self._refresh_space_weather()
+            self.statusBar().showMessage("Reply : priorité chemin favorable activée (SFI / Kp en cours de mise à jour)", 7000)
+        else:
+            self.statusBar().showMessage("Reply : priorité chemin favorable désactivée", 5000)
+        self._update_reply_mode_summary()
+
+    def _refresh_space_weather(self) -> None:
+        if self._space_weather_poller is not None and self._space_weather_poller.isRunning():
+            return
+        self._space_weather_poller = SpaceWeatherPoller()
+        self._space_weather_poller.completed.connect(self._space_weather_updated)
+        self._space_weather_poller.finished.connect(self._space_weather_poller.deleteLater)
+        self._space_weather_poller.start()
+
+    def _space_weather_updated(self, snapshot: object) -> None:
+        self.space_weather_updated_requested.emit(snapshot)
+        if self.favorable_path_priority_action.isChecked():
+            solar_flux = getattr(snapshot, "solar_flux", None)
+            kp = getattr(snapshot, "kp", None)
+            warning = str(getattr(snapshot, "warning", ""))
+            if solar_flux is not None or kp is not None:
+                details = " · ".join(
+                    value for value in (
+                        f"SFI {float(solar_flux):.0f}" if solar_flux is not None else "",
+                        f"Kp {float(kp):.1f}" if kp is not None else "",
+                    ) if value
+                )
+                self.statusBar().showMessage(f"Reply : chemin favorable — {details}", 6000)
+            elif warning:
+                self.statusBar().showMessage(f"Reply : chemin favorable sans données NOAA ({warning})", 7000)
+        self._space_weather_poller = None
+
+    def _set_exclude_worked_history(self, enabled: bool) -> None:
+        self._settings.exclude_previously_worked_calls = bool(enabled)
+        self._store.save(self._settings)
+        self.exclude_worked_history_requested.emit(bool(enabled))
+        self.statusBar().showMessage(
+            "Reply : historique des contacts exclu" if enabled else "Reply : stations déjà contactées à nouveau autorisées",
+            5000,
+        )
+        self._update_reply_mode_summary()
+
+    def _update_reply_mode_summary(self) -> None:
+        enabled: list[str] = []
+        if self.rare_reply_tracking_action.isChecked():
+            enabled.append("Rares + MQTT")
+        if self.rare_stations_only_action.isChecked():
+            enabled.append("Rares uniquement")
+        if self.unconfirmed_dxcc_only_action.isChecked():
+            enabled.append("DXCC LoTW")
+        if self.favorable_path_priority_action.isChecked():
+            enabled.append("Chemin favorable")
+        if self.exclude_worked_history_action.isChecked():
+            enabled.append("Historique exclu")
+        self.reply_mode_summary.setText(
+            "MODE STANDARD" if not enabled else "ACTIF : " + " · ".join(enabled)
+        )
+
+    def _unconfirmed_dxcc_discovery_bands(self) -> tuple[str, ...]:
+        if not self.unconfirmed_dxcc_only_action.isChecked():
+            return ()
+        return tuple(self._settings.allowed_auto_hop_bands)
+
+    def _start_pskreporter_mqtt(self) -> None:
+        if self._pskreporter_mqtt is not None and self._pskreporter_mqtt.isRunning():
+            self._pskreporter_mqtt.set_callsigns(self.hunt_panel.all_callsigns())
+            self._pskreporter_mqtt.set_discovery_bands(self._unconfirmed_dxcc_discovery_bands())
+            return
+        self._pskreporter_mqtt = PskReporterMqttPoller(
+            self.hunt_panel.all_callsigns(),
+            self._unconfirmed_dxcc_discovery_bands(),
+        )
+        self._pskreporter_mqtt.spot_received.connect(self.hunt_panel.note_remote_spot)
+        self._pskreporter_mqtt.spot_received.connect(self._add_rare_mqtt_spot)
+        self._pskreporter_mqtt.spot_received.connect(self.remote_spot_received)
+        self._pskreporter_mqtt.discovery_spot_received.connect(self.unconfirmed_dxcc_remote_spot_received)
+        self._pskreporter_mqtt.state_changed.connect(self.hunt_panel.set_mqtt_state)
+        self._pskreporter_mqtt.finished.connect(self._pskreporter_mqtt.deleteLater)
+        self._pskreporter_mqtt.start()
+
+    def _stop_pskreporter_mqtt(self) -> None:
+        if self._pskreporter_mqtt is not None and self._pskreporter_mqtt.isRunning():
+            self._pskreporter_mqtt.requestInterruption()
+
+    def _start_target_hunt(self, callsign: str) -> None:
+        activities = tuple(item for item in self.hunt_panel.activities() if item.callsign == callsign)
+        if activities:
+            self.hunt_requested.emit(activities, callsign)
+            self.statusBar().showMessage(f"Hunt ciblé : {callsign} — attente d'un Decode local", 8000)
+
+    def _start_all_hunt(self, activities) -> None:
+        self.hunt_requested.emit(tuple(activities), "")
+        self.statusBar().showMessage("Hunt automatique des indicatifs spéciaux actifs", 8000)
+
+    def _show_hunt_state(self, active: bool, target: str) -> None:
+        self.hunt_panel.set_hunting(active, target)
+        if not active:
+            self.statusBar().showMessage("Hunt arrêté", 5000)
 
     def _update_ftx1_band_profiles(self, profiles: dict[str, dict[str, int]]) -> None:
         self._settings.ftx1_band_profiles = deepcopy(profiles)
@@ -1109,10 +1639,53 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "AutoPilot backend error", message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        LOGGER.info("[SHUTDOWN] requested")
+        self._special_refresh_timer.stop()
+        self._wavelog_refresh_timer.stop()
+        self._space_weather_refresh_timer.stop()
+        self._stop_pskreporter_mqtt()
+        if self._special_call_poller is not None and self._special_call_poller.isRunning():
+            self._special_call_poller.requestInterruption()
+        if self._wavelog_lotw_poller is not None and self._wavelog_lotw_poller.isRunning():
+            self._wavelog_lotw_poller.requestInterruption()
+        if self._space_weather_poller is not None and self._space_weather_poller.isRunning():
+            self._space_weather_poller.requestInterruption()
+        # Every external poller has a bounded socket/request timeout.  They
+        # are asked to stop before waiting so they cannot leave a hidden
+        # Python/Qt process behind after the main window disappears.
+        if self._pskreporter_mqtt is not None and self._pskreporter_mqtt.isRunning():
+            self._pskreporter_mqtt.wait(11_000)
+        if self._special_call_poller is not None and self._special_call_poller.isRunning():
+            self._special_call_poller.wait(6_000)
+        if self._wavelog_lotw_poller is not None and self._wavelog_lotw_poller.isRunning():
+            self._wavelog_lotw_poller.wait(9_000)
+        if self._space_weather_poller is not None and self._space_weather_poller.isRunning():
+            self._space_weather_poller.wait(6_000)
         self.stop_requested.emit()
-        if not self._thread.wait(2_000):
-            self._thread.quit()
-            self._thread.wait(500)
+        if not self._thread.wait(8_000):
+            # Do not hide the window while a radio-owning backend is still
+            # alive.  Keeping it visible makes the incomplete shutdown clear
+            # and avoids the locked executable symptom on the next update.
+            LOGGER.error("[SHUTDOWN] backend thread did not stop within timeout")
+            self.statusBar().showMessage("Arrêt en cours : backend radio encore actif. Réessaie dans quelques secondes.")
+            event.ignore()
+            return
+        lingering = [
+            name
+            for name, poller in (
+                ("MQTT", self._pskreporter_mqtt),
+                ("indicatifs spéciaux", self._special_call_poller),
+                ("Wavelog", self._wavelog_lotw_poller),
+                ("NOAA", self._space_weather_poller),
+            )
+            if poller is not None and poller.isRunning()
+        ]
+        if lingering:
+            LOGGER.error("[SHUTDOWN] pollers still running: %s", ", ".join(lingering))
+            self.statusBar().showMessage(f"Arrêt en cours : {', '.join(lingering)} encore actif(s).")
+            event.ignore()
+            return
+        LOGGER.info("[SHUTDOWN] complete")
         event.accept()
 
     def _apply_style(self) -> None:
@@ -1134,6 +1707,7 @@ class MainWindow(QMainWindow):
             #warningText { color: #efbd67; background: #2a2115; border: 1px solid #6f522b; padding: 8px; }
             #adaptiveAvailable { color: #70dfbd; font-weight: 700; }
             #adaptiveUnavailable { color: #efbd67; font-weight: 700; }
+            #comingSoon { color: #78c8ff; font-size: 28px; font-weight: 800; }
             #opportunityStatus { color: #8dccff; font-weight: 800; letter-spacing: 0.5px; }
             #infoText { color: #8299a8; padding: 5px; }
             #qsoState { color: #70dfbd; font-size: 15px; font-weight: 800; padding: 2px 8px; }

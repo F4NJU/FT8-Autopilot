@@ -118,3 +118,104 @@ def test_direct_call_override_can_allow_a_duplicate() -> None:
 
     assert result.accepted
     assert result.force_priority
+
+
+def test_active_special_call_gets_reply_priority_bonus() -> None:
+    scorer = CandidateScorer(
+        ScoringPreferences(
+            prioritize_special_calls=True,
+            special_calls={" tm8r "},
+            favor_strong_signals=False,
+        ),
+    )
+
+    special = scorer.evaluate(event("CQ TM8R JN18"), CandidateKind.CQ)
+    ordinary = scorer.evaluate(event("CQ F1ABC JN18"), CandidateKind.CQ)
+
+    assert special.breakdown.total == 5_000
+    assert [component.name for component in special.breakdown.components] == ["SPECIAL_CALL"]
+    assert ordinary.breakdown.total == 0
+
+
+def test_special_call_priority_forces_selection_when_enabled() -> None:
+    scorer = CandidateScorer(
+        ScoringPreferences(
+            prioritize_special_calls=True,
+            special_calls={"TM8R"},
+            favor_strong_signals=False,
+        ),
+    )
+
+    special = scorer.evaluate(event("CQ TM8R JN18"), CandidateKind.CQ)
+    direct = scorer.evaluate(event("F4NJU ON4ABC -05"), CandidateKind.DIRECT_CALLER)
+
+    assert special.breakdown.total == 5_000
+    assert special.force_priority
+    assert direct.breakdown.total == 10_000
+    assert direct.force_priority
+
+
+def test_rare_only_mode_refuses_regular_station() -> None:
+    scorer = CandidateScorer(
+        ScoringPreferences(rare_stations_only=True, special_calls={"TM8R"})
+    )
+
+    result = scorer.evaluate(event("CQ EA7CTA IM66"), CandidateKind.CQ)
+
+    assert not result.accepted
+    assert result.reason == "rare-only mode"
+
+
+def test_lotw_unconfirmed_dxcc_mode_prioritizes_new_entities_without_blocking_fallback() -> None:
+    resolver = StaticDxccResolver(
+        {
+            "ON4ABC": StationMetadata("ON", "ON", "Belgium", "EU"),
+            "EA7CTA": StationMetadata("EA", "EA", "Spain", "EU"),
+        }
+    )
+    scorer = CandidateScorer(
+        ScoringPreferences(
+            unconfirmed_dxcc_only=True,
+            lotw_confirmed_dxcc_entities={"ON"},
+            favor_strong_signals=False,
+        ),
+        resolver,
+    )
+
+    confirmed = scorer.evaluate(event("CQ ON4ABC JO20"), CandidateKind.CQ)
+    new = scorer.evaluate(event("CQ EA7CTA IM66"), CandidateKind.CQ)
+
+    assert confirmed.accepted
+    assert confirmed.breakdown.total == 0
+    assert new.accepted
+    assert [component.name for component in new.breakdown.components] == ["NEW_LOTW_DXCC"]
+
+
+def test_lotw_unconfirmed_dxcc_mode_keeps_normal_calls_available_while_snapshot_is_pending() -> None:
+    scorer = CandidateScorer(
+        ScoringPreferences(unconfirmed_dxcc_only=True, favor_strong_signals=False)
+    )
+
+    result = scorer.evaluate(event("CQ ON4ABC JO20"), CandidateKind.CQ)
+
+    assert result.accepted
+    assert result.breakdown.total == 0
+
+
+def test_favorable_path_is_an_advisory_bonus_for_normal_cq_only() -> None:
+    scorer = CandidateScorer(
+        ScoringPreferences(
+            prioritize_favorable_path=True,
+            local_grid="JN18AA",
+            solar_flux=180,
+            kp=1.0,
+            favor_strong_signals=False,
+        )
+    )
+
+    cq = scorer.evaluate(event("CQ K1ABC FN42"), CandidateKind.CQ)
+    direct = scorer.evaluate(event("F4NJU K1ABC -05"), CandidateKind.DIRECT_CALLER)
+
+    assert any(component.name == "FAVORABLE_PATH" for component in cq.breakdown.components)
+    assert all(component.name != "FAVORABLE_PATH" for component in direct.breakdown.components)
+    assert direct.force_priority

@@ -123,6 +123,15 @@ class HamlibFtx1Controller:
         try:
             connection = socket.create_connection(("127.0.0.1", self.tcp_port), timeout=self.timeout_seconds)
             connection.settimeout(self.timeout_seconds)
+            if not self._existing_daemon_matches(connection):
+                connection.close()
+                LOGGER.error(
+                    "[HAMLIB] existing rigctld tcp=127.0.0.1:%d does not match configured port=%s baud=%d; refusing reuse",
+                    self.tcp_port,
+                    self.port,
+                    self.baudrate,
+                )
+                return False
             self._socket = connection
             LOGGER.warning(
                 "[HAMLIB] reusing existing rigctld tcp=127.0.0.1:%d; process is externally owned",
@@ -182,6 +191,59 @@ class HamlibFtx1Controller:
         LOGGER.error("[HAMLIB] rigctld startup timeout port=%s", self.port)
         self.close()
         return False
+
+    def _existing_daemon_matches(self, connection: socket.socket) -> bool:
+        """Verify an externally owned rigctld before sending radio commands."""
+        pathname = self._existing_daemon_config(connection, "rig_pathname")
+        serial_speed = self._existing_daemon_config(connection, "serial_speed")
+        if pathname is None or serial_speed is None:
+            return False
+        configured_port = self._normalize_port(self.port)
+        daemon_port = self._normalize_port(pathname)
+        try:
+            daemon_baudrate = int(serial_speed)
+        except ValueError:
+            return False
+        return bool(configured_port and daemon_port == configured_port and daemon_baudrate == self.baudrate)
+
+    def _existing_daemon_config(self, connection: socket.socket, name: str) -> str | None:
+        """Read one rigctld option, accepting both Hamlib response formats.
+
+        Hamlib 4.7.2 prefixes ``get_conf`` replies with ``name=`` whereas
+        earlier releases returned the raw value.  Treat both as the same
+        option so a healthy daemon surviving an AutoPilot restart is reused.
+        """
+        response = self._command_on_socket(connection, f"\\get_conf {name}")
+        if response is None:
+            return None
+        prefix = f"{name}="
+        if response.casefold().startswith(prefix.casefold()):
+            return response[len(prefix):].strip()
+        return response
+
+    @staticmethod
+    def _normalize_port(value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized.startswith("\\\\.\\"):
+            normalized = normalized[4:]
+        return normalized
+
+    @staticmethod
+    def _command_on_socket(connection: socket.socket, command: str) -> str | None:
+        try:
+            connection.sendall(command.encode("ascii") + b"\n")
+            payload = bytearray()
+            while b"\n" not in payload:
+                chunk = connection.recv(512)
+                if not chunk:
+                    return None
+                payload.extend(chunk)
+        except OSError:
+            return None
+        response = bytes(payload).split(b"\n", 1)[0].decode("ascii", errors="replace").strip()
+        if not response or response.startswith("RPRT -"):
+            return None
+        return response
 
     def close(self) -> None:
         if self._socket is not None:

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
-from wsjtx_autopilot.config import AppConfig, AppPaths, SettingsStore, UserSettings
+from wsjtx_autopilot.config import AppPaths, SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.discord_presence import DiscordPresencePublisher
 from wsjtx_autopilot.engine.decision import DecisionEngine
@@ -13,9 +13,9 @@ from wsjtx_autopilot.engine.cq import CqEligibility
 from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
 from wsjtx_autopilot.engine.models import EngineEvent, StationProfile
 from wsjtx_autopilot.engine.scoring import CandidateScorer, ScoringPreferences
-from wsjtx_autopilot.runtime import AutopilotRuntime
+from wsjtx_autopilot.runtime import AutopilotRuntime, HuntRemoteSpot
 from wsjtx_autopilot.wsjtx.listener import UdpListener
-from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, StatusPacket
+from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, QsoLoggedPacket, StatusPacket
 from wsjtx_autopilot.worked.service import WorkedTodayService
 from wsjtx_autopilot.worked.bands import BandResolver
 from wsjtx_autopilot.worked.sync import synchronize_adif
@@ -40,6 +40,11 @@ class BackendWorker(QObject):
     adaptive_changed = Signal(object)
     qso_changed = Signal(str, str, str, str, int, int, int, int, str)
     ftx1_band_profiles_changed = Signal(object)
+    hunt_changed = Signal(bool, str)
+    rare_station_worked = Signal(str, str)
+    unconfirmed_dxcc_spotted = Signal(object)
+    wavelog_lotw_changed = Signal(int, int, bool, str)
+    diagnostics_changed = Signal(object)
 
     def __init__(self, settings: UserSettings) -> None:
         super().__init__()
@@ -54,7 +59,11 @@ class BackendWorker(QObject):
         self._connected = False
         self._last_reported_armed = False
         self._last_swr_safety_notice = ""
+        self._last_reported_hunt_active = False
+        self._last_diagnostics: dict[str, object] | None = None
         self._discord_presence: DiscordPresencePublisher | None = None
+        self._special_calls: set[str] = set()
+        self._dxcc_resolver = None
 
     @Slot()
     def start(self) -> None:
@@ -124,11 +133,140 @@ class BackendWorker(QObject):
         self._last_reported_armed = False
         self.armed_changed.emit(False)
 
+    @Slot()
+    def reset_swr_safety(self) -> None:
+        if self._runtime is None:
+            self.error.emit("Backend is not running")
+            return
+        armed = self._runtime.reset_swr_safety_and_rearm()
+        if armed:
+            self._last_swr_safety_notice = ""
+        else:
+            self.error.emit(self._runtime.last_qso_notice or "Impossible de réinitialiser la protection SWR")
+        self._last_reported_armed = armed
+        self.armed_changed.emit(armed)
+
     @Slot(str)
     def ignore_station(self, station: str) -> None:
         if self._scorer is not None:
             until = datetime.now(timezone.utc) + timedelta(minutes=self._settings.ignore_minutes)
             self._scorer.ignore_station(station, until)
+
+    @Slot(object)
+    def update_special_calls(self, callsigns: object) -> None:
+        activities = tuple(callsigns) if isinstance(callsigns, (list, tuple, set, frozenset)) else ()
+        self._special_calls = {
+            str(getattr(value, "callsign", value)).strip().upper()
+            for value in activities
+            if str(getattr(value, "callsign", value)).strip()
+        }
+        if self._scorer is not None:
+            self._scorer.update_special_calls(self._special_calls)
+        if self._runtime is not None:
+            self._runtime.set_reply_rare_targets(activities)
+
+    @Slot(bool)
+    def set_reply_rare_tracking(self, enabled: bool) -> None:
+        self._settings.pskreporter_mqtt_enabled = bool(enabled)
+        self._settings.prioritize_special_calls_in_reply = bool(enabled)
+        if self._scorer is not None:
+            self._scorer.preferences.prioritize_special_calls = bool(enabled)
+        if self._runtime is not None:
+            self._runtime.set_remote_hunt_enabled(bool(enabled))
+        LOGGER.info("[REPLY] rare priority + MQTT tracking=%s", bool(enabled))
+
+    @Slot(bool)
+    def set_favorable_path_priority(self, enabled: bool) -> None:
+        self._settings.prioritize_favorable_path_in_reply = bool(enabled)
+        if self._scorer is not None:
+            self._scorer.preferences.prioritize_favorable_path = bool(enabled)
+        LOGGER.info("[REPLY] favourable-path priority=%s", bool(enabled))
+
+    @Slot(object)
+    def update_space_weather(self, snapshot: object) -> None:
+        if self._scorer is not None:
+            self._scorer.update_space_weather(
+                getattr(snapshot, "solar_flux", None),
+                getattr(snapshot, "kp", None),
+            )
+
+    @Slot(bool)
+    def set_rare_stations_only(self, enabled: bool) -> None:
+        self._settings.rare_stations_only = bool(enabled)
+        if self._scorer is not None:
+            self._scorer.preferences.rare_stations_only = bool(enabled)
+        LOGGER.info("[REPLY] rare stations only=%s", bool(enabled))
+
+    @Slot(bool)
+    def set_unconfirmed_dxcc_only(self, enabled: bool) -> None:
+        self._settings.wavelog_unconfirmed_dxcc_only = bool(enabled)
+        if self._scorer is not None:
+            self._scorer.preferences.unconfirmed_dxcc_only = bool(enabled)
+        if self._runtime is not None:
+            self._runtime.set_unconfirmed_dxcc_follow_enabled(bool(enabled))
+        LOGGER.info("[REPLY] unconfirmed LoTW DXCC priority=%s", bool(enabled))
+
+    @Slot(bool)
+    def set_exclude_worked_history(self, enabled: bool) -> None:
+        self._settings.exclude_previously_worked_calls = bool(enabled)
+        LOGGER.info("[REPLY] exclude previously worked calls=%s", bool(enabled))
+
+    @Slot(object)
+    def update_wavelog_lotw_calls(self, snapshot: object) -> None:
+        available = bool(getattr(snapshot, "available", False))
+        warning = str(getattr(snapshot, "warning", ""))
+        callsigns = getattr(snapshot, "callsigns", ())
+        if self._scorer is None or self._dxcc_resolver is None:
+            return
+        if not available:
+            self._scorer.update_lotw_confirmed_dxcc(None)
+            self.wavelog_lotw_changed.emit(0, 0, False, warning)
+            return
+        entities: set[str] = set()
+        unresolved = 0
+        for callsign in callsigns:
+            metadata = self._dxcc_resolver.resolve(str(callsign))
+            entity = metadata.primary_prefix.strip().upper()
+            if entity:
+                entities.add(entity)
+            else:
+                unresolved += 1
+        self._scorer.update_lotw_confirmed_dxcc(entities)
+        self.wavelog_lotw_changed.emit(len(entities), unresolved, True, warning)
+
+    @Slot(object)
+    def update_hunt_remote_spot(self, spot: object) -> None:
+        received = self._remote_spot_from_object(spot)
+        if received is None or self._runtime is None:
+            return
+        self._runtime.note_hunt_remote_spot(received)
+
+    @Slot(object)
+    def update_unconfirmed_dxcc_remote_spot(self, spot: object) -> None:
+        received = self._remote_spot_from_object(spot)
+        if received is None or self._runtime is None or self._scorer is None:
+            return
+        if self._scorer.is_unconfirmed_lotw_dxcc(received.callsign):
+            if self._runtime.note_unconfirmed_dxcc_remote_spot(received):
+                # The UI receives only LoTW-eligible, allowed-band spots;
+                # never the unbounded raw MQTT discovery feed.
+                self.unconfirmed_dxcc_spotted.emit(spot)
+
+    @staticmethod
+    def _remote_spot_from_object(spot: object) -> HuntRemoteSpot | None:
+        try:
+            return HuntRemoteSpot(
+                str(getattr(spot, "callsign", "")),
+                str(getattr(spot, "band", "")),
+                getattr(spot, "observed_at"),
+                getattr(spot, "frequency_hz", None),
+                getattr(spot, "snr", None),
+                str(getattr(spot, "receiver", "")),
+                str(getattr(spot, "transmitter_grid", "")),
+                str(getattr(spot, "receiver_grid", "")),
+            )
+        except (TypeError, ValueError):
+            return None
 
     @Slot()
     def reset_adaptive_strategy(self) -> None:
@@ -150,6 +288,24 @@ class BackendWorker(QObject):
         if self._runtime is not None:
             self._runtime.reset_all_ftx1_band_profiles()
 
+    @Slot(object, str)
+    def start_hunt(self, activities: object, manual_target: str = "") -> None:
+        if self._runtime is None:
+            self.error.emit("Backend is not running")
+            return
+        active = self._runtime.configure_hunt(activities, manual_target)
+        self._last_reported_hunt_active = active
+        self.hunt_changed.emit(active, manual_target if active else "")
+        if not active:
+            self.error.emit("Aucune cible Hunt n'utilise une bande FT8 autorisée et disponible")
+
+    @Slot()
+    def stop_hunt(self) -> None:
+        if self._runtime is not None:
+            self._runtime.stop_hunt()
+        self._last_reported_hunt_active = False
+        self.hunt_changed.emit(False, "")
+
     @Slot()
     def _poll(self) -> None:
         if self._listener is None or self._runtime is None:
@@ -162,70 +318,118 @@ class BackendWorker(QObject):
             else:
                 self._last_packet_at = now
                 self._set_connected(True)
-                packet = received.packet
-                if isinstance(packet, DecodePacket):
-                    self.activity_received.emit(ActivityRow.from_decode(packet, now))
-                self._runtime.handle(packet, now, received.endpoint)
-                if isinstance(packet, (StatusPacket, HeartbeatPacket)):
-                    self.status_changed.emit(StatusView.from_status(self._runtime.status))
-            safety_notice = self._runtime.last_qso_notice
-            if safety_notice.startswith("SWR SAFETY") and safety_notice != self._last_swr_safety_notice:
-                self._last_swr_safety_notice = safety_notice
-                self.swr_safety_triggered.emit(safety_notice)
-            session = self._runtime.engine.state.session
-            remote_metadata = (
-                self._scorer.dxcc_resolver.resolve(session.remote_callsign)
-                if self._scorer is not None and session.remote_callsign
-                else None
-            )
-            remote_detail = (
-                f"{remote_metadata.country_name} / {remote_metadata.primary_prefix} / {remote_metadata.continent}"
-                if remote_metadata is not None and remote_metadata.country_name != "unknown"
-                else "-"
-            )
-            if remote_metadata is not None and remote_detail != "-":
-                location_detail = self._runtime.working_location_detail(session.remote_callsign, remote_metadata)
-                if location_detail:
-                    remote_detail = f"{remote_detail} / {location_detail}"
-            self.qso_changed.emit(
-                session.state.name,
-                session.remote_callsign or "-",
-                remote_detail,
-                session.progress_stage.name if session.progress_stage is not None else "-",
-                session.no_progress_periods,
-                self._runtime.config.max_no_progress_periods,
-                session.remote_cq_count,
-                self._runtime.config.max_remote_cq_during_attempt,
-                self._runtime.last_qso_notice,
-            )
-            if self._discord_presence is not None:
-                band = (
-                    BandResolver().resolve(self._runtime.status.dial_frequency)
-                    if self._runtime.status.dial_frequency
-                    else None
-                )
-                self._discord_presence.publish(
-                    self._runtime.status.mode,
-                    band,
-                    session.remote_callsign,
-                    self._connected,
-                )
-            self.adaptive_changed.emit(self._runtime.adaptive_snapshot())
-            control = self._runtime.control
-            backend_armed = isinstance(control, WsjtxUdpControl) and control.armed
-            periodic_state = received is not None and isinstance(received.packet, (StatusPacket, HeartbeatPacket))
-            if periodic_state or backend_armed != self._last_reported_armed:
-                self._last_reported_armed = backend_armed
-                if periodic_state:
-                    LOGGER.info("[WORKER] control state backend_armed=%s", backend_armed)
-                self.armed_changed.emit(backend_armed)
+                self._runtime.handle(received.packet, now, received.endpoint)
             if (
                 self._last_packet_at is not None
                 and (now - self._last_packet_at).total_seconds() > CONNECTION_TIMEOUT_SECONDS
             ):
                 self._set_connected(False)
         except Exception as exc:
-            LOGGER.exception("[GUI] backend_exception; control armed state is unchanged")
+            self._handle_runtime_exception(exc)
+            return
+        try:
+            self._publish_runtime_state(received, now)
+        except Exception as exc:
+            LOGGER.exception("[GUI] presentation_exception; control state unchanged")
+            self.error.emit(str(exc))
+
+    def _handle_runtime_exception(self, exc: Exception) -> None:
+        if self._runtime is None:
+            return
+        LOGGER.exception("[GUI] backend_exception; requesting fail-safe TX halt and disarm")
+        try:
+            self._runtime.fail_safe_disarm("backend_exception", "BackendWorker._poll")
+        except Exception:
+            LOGGER.exception("[GUI] backend_exception fail-safe TX halt also failed")
+        finally:
+            self._last_reported_armed = False
+            self.armed_changed.emit(False)
+        self.error.emit(str(exc))
+
+    def _publish_runtime_state(self, received, now: datetime) -> None:
+        if self._runtime is None:
+            return
+        if received is not None:
+            packet = received.packet
+            if isinstance(packet, DecodePacket):
+                self.activity_received.emit(ActivityRow.from_decode(packet, now))
+            if isinstance(packet, QsoLoggedPacket) and packet.dx_call.strip().upper() in self._special_calls:
+                band = BandResolver().resolve(packet.tx_frequency) or "—"
+                self.rare_station_worked.emit(packet.dx_call.strip().upper(), band)
+            if isinstance(packet, (StatusPacket, HeartbeatPacket)):
+                if self._scorer is not None:
+                    self._scorer.update_local_grid(self._runtime.status.local_grid)
+                self.status_changed.emit(StatusView.from_status(self._runtime.status))
+        safety_notice = self._runtime.last_qso_notice
+        if safety_notice.startswith("SWR SAFETY") and safety_notice != self._last_swr_safety_notice:
+            self._last_swr_safety_notice = safety_notice
+            self.swr_safety_triggered.emit(safety_notice)
+        session = self._runtime.engine.state.session
+        remote_metadata = (
+            self._scorer.dxcc_resolver.resolve(session.remote_callsign)
+            if self._scorer is not None and session.remote_callsign
+            else None
+        )
+        remote_detail = (
+            f"{remote_metadata.country_name} / {remote_metadata.primary_prefix} / {remote_metadata.continent}"
+            if remote_metadata is not None and remote_metadata.country_name != "unknown"
+            else "-"
+        )
+        if remote_metadata is not None and remote_detail != "-":
+            location_detail = self._runtime.working_location_detail(session.remote_callsign, remote_metadata)
+            if location_detail:
+                remote_detail = f"{remote_detail} / {location_detail}"
+        self.qso_changed.emit(
+            session.state.name,
+            session.remote_callsign or "-",
+            remote_detail,
+            session.progress_stage.name if session.progress_stage is not None else "-",
+            session.no_progress_periods,
+            self._runtime.config.max_no_progress_periods,
+            session.remote_cq_count,
+            self._runtime.config.max_remote_cq_during_attempt,
+            self._runtime.last_qso_notice,
+        )
+        self._publish_discord_presence(session.remote_callsign)
+        self.adaptive_changed.emit(self._runtime.adaptive_snapshot())
+        diagnostics = self._runtime.session_diagnostic_snapshot()
+        if diagnostics != self._last_diagnostics:
+            self._last_diagnostics = diagnostics
+            self.diagnostics_changed.emit(diagnostics)
+        control = self._runtime.control
+        backend_armed = isinstance(control, WsjtxUdpControl) and control.armed
+        periodic_state = received is not None and isinstance(received.packet, (StatusPacket, HeartbeatPacket))
+        if periodic_state or backend_armed != self._last_reported_armed:
+            self._last_reported_armed = backend_armed
+            if periodic_state:
+                LOGGER.info("[WORKER] control state backend_armed=%s", backend_armed)
+            self.armed_changed.emit(backend_armed)
+
+    def _publish_discord_presence(self, remote_callsign: str) -> None:
+        if self._discord_presence is None or self._runtime is None:
+            return
+        try:
+            band = (
+                BandResolver().resolve(self._runtime.status.dial_frequency)
+                if self._runtime.status.dial_frequency
+                else None
+            )
+            self._discord_presence.publish(
+                self._runtime.status.mode,
+                band,
+                remote_callsign,
+                self._connected,
+            )
+        except Exception as exc:
+            LOGGER.exception("[DISCORD] presence disabled after publication failure")
+            failed_publisher = self._discord_presence
+            self._discord_presence = None
+            close = getattr(failed_publisher, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    LOGGER.exception("[DISCORD] presence close failed after publication failure")
             self.error.emit(str(exc))
 
     def _open_backend(self) -> None:
@@ -249,6 +453,7 @@ class BackendWorker(QObject):
         )
         if self._settings.cty_dat_path:
             resolver = FallbackDxccResolver(resolver)
+        self._dxcc_resolver = resolver
         preferences = ScoringPreferences(
             preferred_continents=set(self._settings.preferred_continents),
             preferred_dxcc=set(self._settings.preferred_dxcc),
@@ -266,68 +471,25 @@ class BackendWorker(QObject):
             sota_policy=self._settings.sota_policy,
             qrp_policy=self._settings.qrp_policy,
             activity_priority_bonus=self._settings.activity_priority_bonus,
+            prioritize_special_calls=self._settings.prioritize_special_calls_in_reply,
+            prioritize_favorable_path=self._settings.prioritize_favorable_path_in_reply,
+            rare_stations_only=self._settings.rare_stations_only,
+            unconfirmed_dxcc_only=self._settings.wavelog_unconfirmed_dxcc_only,
+            special_calls=set(self._special_calls),
         )
         self._scorer = CandidateScorer(preferences, resolver)
-        config = AppConfig(
-            local_callsign=self._settings.local_callsign,
-            bind_address=self._settings.bind_address,
-            udp_port=self._settings.udp_port,
-            allow_dupes=self._settings.allow_dupes,
-            max_initiation_attempts=1,
-            wsjtx_direct_reply_patched=self._settings.direct_reply_patched,
-            worked_store_path=store_path,
-            wsjtx_log_path=Path(self._settings.wsjtx_log_path) if self._settings.wsjtx_log_path else None,
-            respond_to_cq_dx=self._settings.respond_to_cq_dx,
-            max_no_progress_periods=self._settings.max_no_progress_periods,
-            stalled_qso_cooldown_seconds=self._settings.stalled_qso_cooldown_seconds,
-            remote_busy_cooldown_seconds=self._settings.remote_busy_cooldown_seconds,
-            max_remote_cq_during_attempt=self._settings.max_remote_cq_during_attempt,
-            remote_returned_to_cq_cooldown_seconds=self._settings.remote_returned_to_cq_cooldown_seconds,
-            finalization_hold_periods=self._settings.finalization_hold_periods,
-            final_tx_timeout_periods=self._settings.final_tx_timeout_periods,
-            max_final_retries=self._settings.max_final_retries,
-            adaptive_operation_enabled=self._settings.adaptive_operation_enabled,
-            stagnation_attempt_window=self._settings.stagnation_attempt_window,
-            stagnation_min_failed_attempts=self._settings.stagnation_min_failed_attempts,
-            stagnation_max_unique_calls=self._settings.stagnation_max_unique_calls,
-            adaptive_parity_enabled=self._settings.adaptive_parity_enabled,
-            parity_trial_failed_attempts=self._settings.parity_trial_failed_attempts,
-            adaptive_opportunity_quiet_seconds=self._settings.adaptive_opportunity_quiet_minutes * 60,
-            automatic_band_hopping_enabled=self._settings.automatic_band_hopping_enabled,
-            allowed_auto_hop_bands=tuple(self._settings.allowed_auto_hop_bands),
-            auto_hop_band_frequencies=self._settings.auto_hop_band_frequencies,
-            minimum_band_dwell_minutes=self._settings.minimum_band_dwell_minutes,
-            maximum_band_dwell_minutes=self._settings.maximum_band_dwell_minutes,
-            dial_change_confirmation_timeout_seconds=self._settings.dial_change_confirmation_timeout_seconds,
-            forced_band_hopping_enabled=self._settings.forced_band_hopping_enabled,
-            forced_band_hop_bands=tuple(self._settings.forced_band_hop_bands),
-            forced_band_hop_interval_minutes=self._settings.forced_band_hop_interval_minutes,
-            forced_band_hop_settle_seconds=self._settings.forced_band_hop_settle_seconds,
-            pending_direct_ttl_seconds=self._settings.pending_direct_ttl_seconds,
-            ftx1_cat2_enabled=self._settings.ftx1_cat2_enabled,
-            ftx1_cat2_confirmed_ftx1=self._settings.ftx1_cat2_confirmed_ftx1,
-            ftx1_cat2_port=self._settings.ftx1_cat2_port,
-            ftx1_cat2_baudrate=self._settings.ftx1_cat2_baudrate,
-            ftx1_cat2_timeout_seconds=self._settings.ftx1_cat2_timeout_seconds,
-            ftx1_hamlib_enabled=self._settings.ftx1_hamlib_enabled,
-            hamlib_rig_model=self._settings.hamlib_rig_model,
-            ftx1_hamlib_rigctld_path=self._settings.ftx1_hamlib_rigctld_path,
-            ftx1_hamlib_tcp_port=self._settings.ftx1_hamlib_tcp_port,
-            ftx1_meter_poll_seconds=self._settings.ftx1_meter_poll_seconds,
-            ftx1_alc_control_enabled=self._settings.ftx1_alc_control_enabled,
-            ftx1_alc_minimum=self._settings.ftx1_alc_minimum,
-            ftx1_alc_maximum=self._settings.ftx1_alc_maximum,
-            ftx1_alc_attenuation_step=self._settings.ftx1_alc_attenuation_step,
-            ftx1_swr_protection_enabled=self._settings.ftx1_swr_protection_enabled,
-            ftx1_swr_limit=self._settings.ftx1_swr_limit,
-            ftx1_swr_trip_samples=self._settings.ftx1_swr_trip_samples,
-            ftx1_auto_apply_band_profiles=self._settings.ftx1_alc_control_enabled,
-            ftx1_band_profiles=deepcopy(self._settings.ftx1_band_profiles),
-            cty_dat_path=Path(self._settings.cty_dat_path) if self._settings.cty_dat_path else None,
-        )
+        config = self._settings.to_app_config(store_path)
         local_profile = StationProfile(config.local_callsign, resolver.resolve(config.local_callsign))
         cq_eligibility = CqEligibility(local_profile, resolver, config.respond_to_cq_dx)
-        engine = DecisionEngine(config, worked.check, self._scorer, self._on_engine_event, cq_eligibility)
+        def worked_lookup(callsign: str, frequency_hz: int | None, observed_at: datetime):
+            return worked.check(
+                callsign,
+                frequency_hz,
+                observed_at,
+                exclude_previously_worked=self._settings.exclude_previously_worked_calls,
+            )
+
+        engine = DecisionEngine(config, worked_lookup, self._scorer, self._on_engine_event, cq_eligibility)
         self._listener = UdpListener(config.bind_address, config.udp_port, timeout=0)
         control = WsjtxUdpControl(
             self._listener,
@@ -346,6 +508,7 @@ class BackendWorker(QObject):
             ftx1_band_profiles_changed=self._persist_ftx1_band_profiles,
         )
         self._runtime.initialize_ftx1_cat2()
+        self._runtime.set_unconfirmed_dxcc_follow_enabled(self._settings.wavelog_unconfirmed_dxcc_only)
         LOGGER.info(
             "[GUI] backend runtime=%d control=%d runtime_control=%d transport=%d implementation=%s armed=%s",
             id(self._runtime),
@@ -357,6 +520,7 @@ class BackendWorker(QObject):
         )
         self._last_packet_at = None
         self._last_reported_armed = False
+        self._last_diagnostics = None
         self._set_connected(False)
         self.armed_changed.emit(False)
         self.adaptive_changed.emit(self._runtime.adaptive_snapshot())

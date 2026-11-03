@@ -24,6 +24,7 @@ def event(
     snr: int = -10,
     identity: str | None = None,
     observed_at: datetime = NOW,
+    period: int = 15,
 ) -> DecodeEvent:
     parsed = parse_ft8_message(text)
     assert parsed is not None
@@ -33,7 +34,7 @@ def event(
         "FT8",
         snr,
         14_074_000,
-        15,
+        period,
         identity or text,
     )
 
@@ -52,6 +53,77 @@ def test_cq_alone_waits_then_is_selected() -> None:
     assert app.decide(NOW) is None
     action = close_window(app)
     assert action is not None and action.station == "TA1SW"
+
+
+def test_cq_candidate_is_withdrawn_when_station_is_decoded_working_other() -> None:
+    app = engine()
+    app.observe(event("CQ TA1SW KN41"), NOW)
+
+    assert app.note_station_working_other(event("K1ABC TA1SW -10")) is True
+    assert close_window(app) is None
+
+
+def test_busy_station_decoded_before_old_cq_cannot_be_selected() -> None:
+    app = engine()
+    app.note_station_working_other(event("K1ABC TA1SW -10"))
+
+    assert app.observe(event("CQ TA1SW KN41"), NOW) is None
+    assert close_window(app) is None
+
+
+def test_busy_station_is_temporarily_skipped_in_the_next_rx_period() -> None:
+    app = engine(remote_busy_cooldown_seconds=180)
+    app.note_station_working_other(event("K1ABC TA1SW -10", period=0))
+
+    next_period = NOW + timedelta(seconds=15)
+    assert app.observe(
+        event("CQ TA1SW KN41", identity="next-period-cq", observed_at=next_period, period=1),
+        next_period,
+    ) is None
+    cooldown = app.cooldown_for("TA1SW", next_period)
+    assert cooldown is not None
+    assert cooldown.kind is CooldownKind.REMOTE_BUSY_OTHER_QSO
+    assert cooldown.reason == "observed working K1ABC"
+
+
+def test_fresh_direct_call_overrides_passive_busy_cooldown() -> None:
+    app = engine(remote_busy_cooldown_seconds=180)
+    app.note_station_working_other(event("K1ABC TA1SW -10", period=0))
+
+    next_period = NOW + timedelta(seconds=15)
+    direct = app.observe(
+        event("F4NJU TA1SW -10", identity="next-period-direct", observed_at=next_period, period=1),
+        next_period,
+    )
+
+    assert direct is not None
+    assert direct.station == "TA1SW"
+    assert direct.kind is CandidateKind.DIRECT_CALLER
+    assert app.cooldown_for("TA1SW", next_period) is None
+
+
+def test_preflight_skips_selected_cq_when_fresher_decode_shows_other_qso() -> None:
+    app = engine()
+    app.observe(event("CQ TA1SW KN41"), NOW)
+    action = close_window(app)
+
+    assert action is not None
+    app.note_station_working_other(event("K1ABC TA1SW -10"))
+    assert app.preflight_action(action) is False
+
+
+def test_equal_score_candidates_keep_the_first_observed_station() -> None:
+    app = engine(allow_dupes=True)
+    app.observe(event("CQ K1ABC FN31", observed_at=NOW), NOW)
+    app.observe(
+        event("CQ K2ABC FN31", observed_at=NOW + timedelta(milliseconds=40)),
+        NOW + timedelta(milliseconds=40),
+    )
+
+    action = app.decide(NOW + timedelta(milliseconds=400))
+
+    assert action is not None
+    assert action.station == "K1ABC"
 
 
 @pytest.mark.parametrize(

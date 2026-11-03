@@ -35,6 +35,9 @@ class WorkedQsoStore:
         self._connection.execute(
             "CREATE INDEX IF NOT EXISTS worked_qso_date_idx ON worked_qso (qso_date_utc)"
         )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS worked_qso_callsign_idx ON worked_qso (callsign)"
+        )
         self._connection.commit()
 
     def record(
@@ -76,6 +79,11 @@ class WorkedQsoStore:
             (qso_date_utc.isoformat(),),
         )
         return {(str(callsign), str(band)) for callsign, band in rows}
+
+    def callsigns(self) -> set[str]:
+        """Return callsigns present in the persistent WSJT-X/AutoPilot history."""
+        rows = self._connection.execute("SELECT DISTINCT callsign FROM worked_qso")
+        return {str(callsign) for (callsign,) in rows}
 
     def count_for_date(self, qso_date_utc: date) -> int:
         row = self._connection.execute(

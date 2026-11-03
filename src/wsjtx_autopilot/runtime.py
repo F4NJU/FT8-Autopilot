@@ -14,7 +14,8 @@ from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
 from wsjtx_autopilot.engine.finalization import FinalizationTracker
 from wsjtx_autopilot.engine.location import StationLocatorCache, distance_and_bearing, grid_to_location
-from wsjtx_autopilot.engine.models import ActionOutcome, Candidate, CooldownKind, DecodeEvent, IntendedAction, MessageKind, OriginalDecode, StationMetadata, StationProfile
+from wsjtx_autopilot.engine.propagation import mqtt_path_probability
+from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, Candidate, CooldownKind, DecodeEvent, EngineEvent, EngineEventKind, IntendedAction, MessageKind, OriginalDecode, StationMetadata, StationProfile
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.progress import QsoProgressStage
 from wsjtx_autopilot.engine.state import QsoState
@@ -47,6 +48,23 @@ _SWR_TUNE_MIN_SAMPLES = 2
 _SWR_RX_CONFIRM_TIMEOUT = timedelta(seconds=5)
 _WATCHDOG_HALT_CONFIRM_TIMEOUT = timedelta(seconds=2)
 _SWR_AUTOMATIC_RECOVERY_ENABLED = True
+_MINIMUM_DXCC_MQTT_PATH_PROBABILITY = 55
+
+# The normal FT8 watering holes are defined in DEFAULT_BAND_PROFILES.  These
+# additional dial frequencies are the conventional DXpedition / secondary FT8
+# channels shipped by WSJT-X.  They are deliberately a receive scan target;
+# a normal QSO still has to originate from a local WSJT-X Decode.
+_SECONDARY_FT8_DIAL_FREQUENCIES = {
+    "80m": 3_567_000,
+    "40m": 7_056_000,
+    "30m": 10_131_000,
+    "20m": 14_090_000,
+    "17m": 18_095_000,
+    "15m": 21_091_000,
+    "12m": 24_911_000,
+    "10m": 28_091_000,
+    "6m": 50_323_000,
+}
 
 
 def _tr_period_seconds(raw_period: int) -> int | None:
@@ -75,6 +93,47 @@ class WsjtxStatus:
     period: int | None = None
     instance_id: str = ""
     local_grid: str = ""
+
+
+@dataclass(slots=True)
+class SessionDiagnostics:
+    """Small, session-only operational ledger for the Reply screen."""
+
+    candidates_selected: int = 0
+    replies_sent: int = 0
+    qso_completed: int = 0
+    candidates_refused: int = 0
+    stations_busy: int = 0
+    local_rejections: int = 0
+    control_failures: int = 0
+    autopilot_watchdogs: int = 0
+    wsjtx_watchdogs: int = 0
+    recent: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.recent is None:
+            self.recent = []
+
+    def note(self, message: str) -> None:
+        assert self.recent is not None
+        self.recent.append(message)
+        del self.recent[:-5]
+
+    def snapshot(self) -> dict[str, object]:
+        reply_success_percent = round(100 * self.qso_completed / self.replies_sent) if self.replies_sent else None
+        return {
+            "candidates_selected": self.candidates_selected,
+            "replies_sent": self.replies_sent,
+            "qso_completed": self.qso_completed,
+            "candidates_refused": self.candidates_refused,
+            "stations_busy": self.stations_busy,
+            "local_rejections": self.local_rejections,
+            "control_failures": self.control_failures,
+            "autopilot_watchdogs": self.autopilot_watchdogs,
+            "wsjtx_watchdogs": self.wsjtx_watchdogs,
+            "reply_success_percent": reply_success_percent,
+            "recent": tuple(reversed(self.recent or [])),
+        }
 
 
 @dataclass(slots=True)
@@ -122,6 +181,29 @@ class SwrRecovery:
     def __post_init__(self) -> None:
         if self.swr_samples is None:
             self.swr_samples = []
+
+
+@dataclass(frozen=True, slots=True)
+class HuntTarget:
+    callsign: str
+    bands: tuple[str, ...]
+    best_band: str | None
+    path_score: int
+
+
+@dataclass(frozen=True, slots=True)
+class HuntRemoteSpot:
+    """A recent remote FT8 reception used only to select a Hunt RX band."""
+
+    callsign: str
+    band: str
+    observed_at: datetime
+    frequency_hz: int | None = None
+    snr: int | None = None
+    receiver: str = ""
+    transmitter_grid: str = ""
+    receiver_grid: str = ""
+    path_probability: int = 0
 
 
 class AutopilotRuntime:
@@ -178,6 +260,8 @@ class AutopilotRuntime:
         self.last_hamlib_power_watts: float | None = None
         self.last_hamlib_requested_power_watts: float | None = None
         self.last_qso_notice = ""
+        self.session_diagnostics = SessionDiagnostics()
+        self.engine.add_event_listener(self.note_engine_event)
         self._watchdog_halt_failed = False
         self._pending_watchdog_halt: PendingWatchdogHalt | None = None
         self.finalization = FinalizationTracker(
@@ -239,6 +323,19 @@ class AutopilotRuntime:
         self._forced_band_hop_dwell_band: str | None = None
         self._forced_band_hop_pending_band: str | None = None
         self._forced_band_hop_config_warning_logged = False
+        self._hunt_active = False
+        self._hunt_manual_target = ""
+        self._hunt_targets: tuple[HuntTarget, ...] = ()
+        self._reply_rare_targets: tuple[HuntTarget, ...] = ()
+        self._hunt_band_started_at: datetime | None = None
+        self._hunt_observed_band: str | None = None
+        self._hunt_rotation_index = 0
+        self._remote_hunt_enabled = config.pskreporter_mqtt_enabled
+        self._hunt_remote_spots: dict[str, HuntRemoteSpot] = {}
+        self._unconfirmed_dxcc_follow_enabled = False
+        self._unconfirmed_dxcc_remote_spots: dict[str, HuntRemoteSpot] = {}
+        self._unconfirmed_dxcc_target = ""
+        self._unconfirmed_dxcc_target_started_at: datetime | None = None
         if isinstance(self.control, WsjtxUdpControl):
             self.control.set_disarm_context(self._disarm_context)
         session = current_logging_session()
@@ -247,6 +344,159 @@ class AutopilotRuntime:
                 "autocall": config.autocall_enabled,
                 "direct_reply_patch": config.wsjtx_direct_reply_patched,
             }
+
+    def configure_hunt(self, activities: object, manual_target: str = "") -> bool:
+        allowed = set(self.config.allowed_auto_hop_bands)
+        targets = self._rare_targets_from_activities(activities)
+        selected = manual_target.strip().upper()
+        if selected:
+            targets = [target for target in targets if target.callsign == selected]
+        targets.sort(key=lambda target: (-target.path_score, target.callsign))
+        self.engine.clear_candidates()
+        self._hunt_targets = tuple(targets)
+        self._hunt_manual_target = selected
+        self._hunt_active = bool(targets)
+        self._hunt_band_started_at = None
+        self._hunt_observed_band = None
+        self._hunt_rotation_index = 0
+        LOGGER.info(
+            "[HUNT] %s targets=%s manual=%s allowed_bands=%s",
+            "started" if self._hunt_active else "refused",
+            ",".join(target.callsign for target in targets) or "-",
+            selected or "auto",
+            ",".join(sorted(allowed)) or "-",
+        )
+        return self._hunt_active
+
+    def set_reply_rare_targets(self, activities: object) -> None:
+        """Update rare calls eligible for Reply-mode remote band guidance."""
+        self._reply_rare_targets = tuple(self._rare_targets_from_activities(activities))
+        LOGGER.info("[REPLY] rare remote tracking targets=%s", ",".join(item.callsign for item in self._reply_rare_targets) or "-")
+
+    def _rare_targets_from_activities(self, activities: object) -> list[HuntTarget]:
+        allowed = set(self.config.allowed_auto_hop_bands)
+        targets: list[HuntTarget] = []
+        for activity in activities if isinstance(activities, (tuple, list)) else ():
+            callsign = str(getattr(activity, "callsign", "")).strip().upper()
+            bands = tuple(
+                band for band in dict.fromkeys(str(value).lower() for value in getattr(activity, "bands", ()))
+                if band in allowed and band not in self._swr_excluded_bands and self._band_frequency(band, "FT8") is not None
+            )
+            best_band = str(getattr(activity, "best_band", "") or "").lower() or None
+            if best_band not in bands:
+                best_band = bands[0] if bands else None
+            if callsign and bands:
+                targets.append(HuntTarget(callsign, bands, best_band, int(getattr(activity, "path_score", 0))))
+        return targets
+
+    def set_remote_hunt_enabled(self, enabled: bool) -> None:
+        self._remote_hunt_enabled = bool(enabled)
+        LOGGER.info("[HUNT] PSK Reporter remote spot guidance=%s", self._remote_hunt_enabled)
+
+    def set_unconfirmed_dxcc_follow_enabled(self, enabled: bool) -> None:
+        self._unconfirmed_dxcc_follow_enabled = bool(enabled)
+        if not enabled:
+            self._unconfirmed_dxcc_remote_spots.clear()
+            self._unconfirmed_dxcc_target = ""
+            self._unconfirmed_dxcc_target_started_at = None
+        LOGGER.info("[REPLY] PSK Reporter LoTW-missing DXCC guidance=%s", self._unconfirmed_dxcc_follow_enabled)
+
+    def note_hunt_remote_spot(self, spot: HuntRemoteSpot) -> bool:
+        """Record an advisory spot for a selected Hunt target.
+
+        It is deliberately not inserted into the candidate engine: only a
+        local WSJT-X decode can produce a reply or any RF transmission.
+        """
+        callsign = spot.callsign.strip().upper()
+        band = spot.band.strip().lower()
+        if not self._remote_hunt_enabled or not callsign or not band:
+            return False
+        if not self._rare_target_accepts(callsign):
+            return False
+        if band in self._swr_excluded_bands or self._band_frequency(band, "FT8") is None:
+            return False
+        if spot.frequency_hz is not None and BandResolver().resolve(spot.frequency_hz) != band:
+            LOGGER.warning("[HUNT] remote spot ignored: frequency=%s does not match band=%s", spot.frequency_hz, band)
+            return False
+        current = self._hunt_remote_spots.get(callsign)
+        if current is not None and current.observed_at >= spot.observed_at:
+            return False
+        self._hunt_remote_spots[callsign] = HuntRemoteSpot(
+            callsign, band, spot.observed_at, spot.frequency_hz, spot.snr, spot.receiver
+        )
+        LOGGER.info("[HUNT] remote FT8 spot target=%s band=%s receiver=%s", callsign, band, spot.receiver or "-")
+        return True
+
+    def note_unconfirmed_dxcc_remote_spot(self, spot: HuntRemoteSpot) -> bool:
+        """Keep an advisory spot for a Wavelog-unconfirmed DXCC only."""
+        callsign = spot.callsign.strip().upper()
+        band = spot.band.strip().lower()
+        if not self._unconfirmed_dxcc_follow_enabled or not callsign or not band:
+            return False
+        if band in self._swr_excluded_bands or band not in self.config.allowed_auto_hop_bands:
+            return False
+        if self._band_frequency(band, "FT8") is None:
+            return False
+        if spot.frequency_hz is not None and BandResolver().resolve(spot.frequency_hz) != band:
+            return False
+        path_probability = mqtt_path_probability(
+            self.status.local_grid,
+            spot.transmitter_grid,
+            spot.receiver_grid,
+            band,
+            spot.observed_at,
+            spot.snr,
+        )
+        if path_probability < _MINIMUM_DXCC_MQTT_PATH_PROBABILITY:
+            LOGGER.info(
+                "[REPLY] remote FT8 spot skipped unconfirmed-dxcc=%s band=%s path_probability=%d",
+                callsign,
+                band,
+                path_probability,
+            )
+            return False
+        current = self._unconfirmed_dxcc_remote_spots.get(callsign)
+        if current is not None and current.observed_at >= spot.observed_at:
+            return False
+        self._unconfirmed_dxcc_remote_spots[callsign] = HuntRemoteSpot(
+            callsign,
+            band,
+            spot.observed_at,
+            spot.frequency_hz,
+            spot.snr,
+            spot.receiver,
+            spot.transmitter_grid,
+            spot.receiver_grid,
+            path_probability,
+        )
+        LOGGER.info(
+            "[REPLY] remote FT8 spot unconfirmed-dxcc=%s band=%s receiver=%s path_probability=%d",
+            callsign,
+            band,
+            spot.receiver or "-",
+            path_probability,
+        )
+        return True
+
+    def stop_hunt(self, reason: str = "user request") -> None:
+        if self._hunt_active:
+            LOGGER.info("[HUNT] stopped reason=%s", reason)
+        self._hunt_active = False
+        self._hunt_manual_target = ""
+        self._hunt_targets = ()
+        self._hunt_band_started_at = None
+        self._hunt_observed_band = None
+        self._hunt_rotation_index = 0
+        self.engine.clear_candidates()
+
+    def hunt_snapshot(self) -> dict[str, object]:
+        return {
+            "active": self._hunt_active,
+            "manual_target": self._hunt_manual_target,
+            "targets": [target.callsign for target in self._hunt_targets],
+            "current_target": self._hunt_current_target().callsign if self._hunt_current_target() is not None else None,
+            "remote_guidance": self._remote_hunt_enabled,
+        }
 
     def initialize_ftx1_cat2(self) -> bool:
         """Open and identify the configured CAT-2 port during backend startup."""
@@ -312,12 +562,22 @@ class AutopilotRuntime:
                 and self.ftx1_band_drive.cat.identify()
             )
             if not radio_ready:
-                # A transient CAT timeout must not lock the whole WSJT-X
-                # automation in DISARM. Meter reads retry Hamlib while TX is
-                # active; SWR protection can therefore recover as soon as the
-                # radio answers again.
+                if self.config.ftx1_swr_protection_enabled:
+                    self.antenna_safety_level = "fault"
+                    self.last_qso_notice = (
+                        "SWR SAFETY UNAVAILABLE - Hamlib radio not ready - AutoPilot disarmed"
+                    )
+                    self._antenna_event(
+                        self._last_runtime_at or datetime.now(timezone.utc),
+                        "Armement refusé : protection SWR indisponible (Hamlib ne répond pas)",
+                    )
+                    self.control.disarm(
+                        "swr_protection_unavailable",
+                        source="AutopilotRuntime.arm_control",
+                    )
+                    return False
                 LOGGER.warning(
-                    "[HAMLIB] radio source unavailable during ARM; continuing armed with CAT monitoring pending"
+                    "[HAMLIB] radio source unavailable during ARM; ALC monitoring will retry during TX"
                 )
         if self._hamlib_swr_fault_latched:
             LOGGER.info("[HAMLIB] SWR safety latch reset by explicit ARM request")
@@ -329,6 +589,17 @@ class AutopilotRuntime:
                 self._last_runtime_at or datetime.now(timezone.utc),
                 "Protection SWR réarmée par l'opérateur",
             )
+        if self._blocked_band_drive_change is not None:
+            blocked = self._blocked_band_drive_change
+            LOGGER.warning(
+                "[BAND-HOP] Drive block for %s cleared by explicit operator ARM",
+                blocked.band,
+            )
+            self._blocked_band_drive_change = None
+            self._pending_ftx1_band_change = None
+            self._pending_ftx1_profile_apply = None
+            self._forced_band_hop_pending_band = None
+            self.adaptive_state = AdaptiveState.NORMAL
         armed = self.control.arm()
         if armed:
             self._pending_watchdog_halt = None
@@ -338,6 +609,35 @@ class AutopilotRuntime:
             band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
             self.opportunities.reset(band, self.status.mode, self._last_runtime_at or datetime.now(timezone.utc))
         return armed
+
+    def reset_swr_safety_and_rearm(self) -> bool:
+        """Clear session SWR safety state and resume after an explicit operator reset."""
+        now = self._last_runtime_at or datetime.now(timezone.utc)
+        if self.status.transmitting:
+            self.last_qso_notice = "SWR RESET REFUSED - transmission active"
+            LOGGER.warning("[ANTENNA-SAFETY] Réinitialisation refusée : émission encore active")
+            return False
+        if self._swr_recovery is not None and self.ftx1_band_drive is not None:
+            set_tuner = getattr(self.ftx1_band_drive.cat, "set_tuner_enabled", None)
+            if callable(set_tuner) and not set_tuner(False):
+                self.last_qso_notice = "SWR RESET REFUSED - tuner stop unconfirmed"
+                LOGGER.warning("[ANTENNA-SAFETY] Réinitialisation refusée : arrêt du tuner non confirmé")
+                return False
+        excluded = tuple(sorted(self._swr_excluded_bands))
+        self._swr_recovery = None
+        self._swr_excluded_bands.clear()
+        self._hamlib_swr_fault_latched = False
+        self._hamlib_high_swr_samples = 0
+        self._band_resume_at = None
+        self._band_resume_band = None
+        self.antenna_safety_level = "ok"
+        self.antenna_safety_events.clear()
+        self.last_qso_notice = ""
+        LOGGER.warning(
+            "[ANTENNA-SAFETY] Protection réinitialisée par l'opérateur; exclusions effacées=%s; réarmement demandé",
+            ",".join(excluded) or "none",
+        )
+        return self.arm_control()
 
     def _disarm_context(self) -> dict[str, object]:
         heartbeat_age_seconds: float | None = None
@@ -374,6 +674,13 @@ class AutopilotRuntime:
             )
         wsjtx_ok = self.control.halt_tx(instance_id, reason)
         return HaltTxResult(radio_ok, wsjtx_ok, observed_ptt)
+
+    def fail_safe_disarm(self, reason: str, source: str) -> HaltTxResult:
+        """Request an immediate TX halt and always leave control disarmed."""
+        try:
+            return self._request_halt_tx(self.status.instance_id or None, reason)
+        finally:
+            self._disarm_control(reason, source)
 
     def _halt_tx(self, instance_id: str | None, reason: str) -> bool:
         """Drop hardware PTT through Hamlib, then cancel WSJT-X's TX scheduler."""
@@ -521,6 +828,7 @@ class AutopilotRuntime:
                     packet.dx_call,
                 )
             elif self.engine.complete_qso(packet.dx_call, packet.header.instance_id, "QSOLogged received"):
+                self.note_qso_completed(packet.dx_call)
                 self._log_ready_for_next_qso()
 
         self._poll_watchdog_halt_confirmation(now)
@@ -555,26 +863,26 @@ class AutopilotRuntime:
                 final_state.instance_id,
                 "final TX timeout",
             ):
+                self.note_qso_completed(final_state.remote_callsign)
                 self._log_ready_for_next_qso()
         self._expire_dial_frequency_request(now)
         self._expire_tx_audio_attenuation_request(now)
         self._query_tx_audio_attenuation_if_needed(self._attenuation_query_instance_id, now)
         self._complete_pending_ftx1_band_change(now)
-        self._run_forced_band_hop(now)
-        if (
-            self._pending_watchdog_halt is None
-            and self._pending_dial_frequency is None
-            and self._pending_ftx1_band_change is None
-            and self._pending_ftx1_profile_apply is None
-        ):
-            self._run_adaptive(now)
+        if self._hunt_active:
+            self._run_hunt(now)
+        else:
+            if self._unconfirmed_dxcc_follow_enabled:
+                self._run_unconfirmed_dxcc_watch(now)
+            else:
+                self._run_reply_rare_watch(now)
+            self._run_forced_band_hop(now)
+            if self._pending_watchdog_halt is None and not self._band_transition_pending():
+                self._run_adaptive(now)
         if (
             self._pending_watchdog_halt is not None
-            or self._pending_dial_frequency is not None
-            or self._pending_ftx1_band_change is not None
-            or self._pending_ftx1_profile_apply is not None
+            or self._band_transition_pending()
             or self.pending_tx_audio_attenuation is not None
-            or self._blocked_band_drive_change is not None
             or self._swr_recovery is not None
         ):
             action = None
@@ -690,6 +998,7 @@ class AutopilotRuntime:
                 off_air=packet.off_air,
             ),
         )
+        self.engine.note_station_working_other(event)
         if parsed.kind is MessageKind.SEVENTY_THREE and self.finalization.state is not None:
             if parsed.sender == self.finalization.state.remote_callsign:
                 self.finalization.close("remote 73 received")
@@ -755,6 +1064,8 @@ class AutopilotRuntime:
             if not terminal_progress and session.state is not QsoState.IDLE and session.remote_callsign == parsed.sender:
                 if self.finalization.begin(event, now):
                     self.last_qso_notice = f"QSO complete - final confirmation {parsed.sender}"
+        if self._try_rare_reply_from_decode(event, now):
+            return None
         remote_cq = self.engine.remote_cq_during_attempt(event, now)
         if remote_cq is not None:
             session = self.engine.state.session
@@ -855,6 +1166,13 @@ class AutopilotRuntime:
             LOGGER.info("[DIRECT] preempted unanswered CQ attempt remote=%s caller=%s", previous_remote, parsed.sender)
             return candidate
         self.station_locator_cache.note(parsed.sender, parsed.grid)
+        if (
+            self._hunt_active
+            and parsed.kind in {MessageKind.CQ, MessageKind.QRZ}
+            and not self._hunt_accepts(parsed.sender)
+        ):
+            LOGGER.info("[HUNT] CQ ignored station=%s reason=not selected special target", parsed.sender)
+            return None
         candidate = self.engine.observe(event, now)
         if parsed.kind in {MessageKind.CQ, MessageKind.QRZ} and packet.header.instance_id == self.status.instance_id:
             worked = bool(
@@ -870,6 +1188,35 @@ class AutopilotRuntime:
                     self._adaptive_pending_origin = None
                     LOGGER.info("[ADAPT] New viable CQ %s; pending switch cancelled", parsed.sender)
         return candidate
+
+    def _try_rare_reply_from_decode(self, event: DecodeEvent, now: datetime) -> bool:
+        """Use WSJT-X's Reply command as a rare-station double click.
+
+        This is intentionally restricted to the explicit Reply rare-tracking
+        mode, a fresh local Decode, idle QSO state, and AP1/direct-Reply
+        capable WSJT-X.  The original Decode is forwarded unchanged.
+        """
+        parsed = event.parsed
+        if not (
+            self._remote_hunt_enabled
+            and self._rare_target_accepts(parsed.sender)
+            and parsed.kind in {MessageKind.DIRECTED, MessageKind.REPORT, MessageKind.R_REPORT}
+            and not parsed.is_addressed_to(self.config.local_callsign)
+            and self.engine.state.session.state is QsoState.IDLE
+            and not self.finalization.active
+            and event.original is not None
+        ):
+            return False
+        action = IntendedAction(ActionKind.RARE_REPLY, parsed.sender, "rare station local Decode", event.original, now)
+        outcome = self.control.execute(action, now)
+        if outcome is ActionOutcome.SENT:
+            self.engine.clear_candidates()
+            self.engine.state.start_station(event, now)
+            self.last_qso_notice = f"Rare station Reply sent: {parsed.sender}"
+            LOGGER.warning("[REPLY] rare double-click sent station=%s message=%s", parsed.sender, parsed.raw)
+        elif outcome is ActionOutcome.REJECTED_LOCAL:
+            LOGGER.info("[REPLY] rare double-click not available station=%s", parsed.sender)
+        return outcome is not ActionOutcome.REJECTED_LOCAL
 
     def _can_preempt_unanswered_cq_attempt(self, event: DecodeEvent) -> bool:
         blocker = self._direct_preemption_blocker(event)
@@ -934,12 +1281,23 @@ class AutopilotRuntime:
         LOGGER.info("[DIRECT] rejected station=%s blocker=%s", parsed.sender, blocker)
 
     def _execute_action(self, action: IntendedAction, now: datetime) -> None:
+        if not self.engine.preflight_action(action):
+            self.last_qso_notice = f"Reply skipped - {action.station} is already working another station"
+            return
         outcome = self.control.execute(action, now)
         LOGGER.info("[RUNTIME] control outcome=%s station=%s", outcome.name, action.station)
         self.engine.record_action_outcome(action, outcome, now)
         if outcome is ActionOutcome.SENT:
+            self.session_diagnostics.replies_sent += 1
+            self.session_diagnostics.note(f"Reply envoyé : {action.station}")
             self.last_qso_notice = ""
             self._watchdog_halt_failed = False
+        elif outcome is ActionOutcome.REJECTED_LOCAL:
+            self.session_diagnostics.local_rejections += 1
+            self.session_diagnostics.note(f"Reply refusé par WSJT-X : {action.station}")
+        elif outcome is ActionOutcome.FAILED:
+            self.session_diagnostics.control_failures += 1
+            self.session_diagnostics.note(f"Échec d'envoi Reply : {action.station}")
 
     def _observe_finalization_status(
         self,
@@ -974,6 +1332,7 @@ class AutopilotRuntime:
                     state.instance_id,
                     "QSOLogged received after final 73 completed",
                 ):
+                    self.note_qso_completed(state.remote_callsign)
                     self._log_ready_for_next_qso()
             elif self.engine.state.matches_remote(state.remote_callsign):
                 self.engine.state.mark_complete("final 73 transmitted")
@@ -1314,7 +1673,13 @@ class AutopilotRuntime:
             self._hamlib_alc_samples.append(float(alc))
             if power is not None:
                 self._hamlib_power_samples.append(float(power))
-        if self.config.ftx1_swr_protection_enabled and swr is not None and float(swr) >= self.config.ftx1_swr_limit:
+        rf_valid_for_swr = power is not None and float(power) >= _SWR_TUNE_MIN_RF_WATTS
+        if (
+            self.config.ftx1_swr_protection_enabled
+            and rf_valid_for_swr
+            and swr is not None
+            and float(swr) >= self.config.ftx1_swr_limit
+        ):
             self._hamlib_high_swr_samples += 1
         else:
             self._hamlib_high_swr_samples = 0
@@ -1759,6 +2124,18 @@ class AutopilotRuntime:
         else:
             self.control.disarm(reason)
 
+    def _band_transition_pending(self) -> bool:
+        """Whether a requested band change still needs confirmation or operator action."""
+        return any(
+            pending is not None
+            for pending in (
+                self._pending_dial_frequency,
+                self._pending_ftx1_band_change,
+                self._pending_ftx1_profile_apply,
+                self._blocked_band_drive_change,
+            )
+        )
+
     def adaptive_snapshot(self) -> dict[str, object]:
         current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
         observed_at = self._last_runtime_at or datetime.now(timezone.utc)
@@ -1782,6 +2159,11 @@ class AutopilotRuntime:
             "requested_tx_period": self.requested_tx_period,
             "current_band": current_band,
             "next_band": self._next_auto_hop_band(),
+            "next_frequency_hz": (
+                self._next_auto_hop_destination()[1]
+                if self._next_auto_hop_destination() is not None
+                else None
+            ),
             "band_changing_to": self._pending_dial_frequency.band if self._pending_dial_frequency else None,
             "opportunities": opportunities,
             "antenna_safety": {
@@ -1811,6 +2193,171 @@ class AutopilotRuntime:
             )
             snapshot["ftx1"] = ftx1
         return snapshot
+
+    def _hunt_accepts(self, station: str) -> bool:
+        normalized = station.strip().upper()
+        return any(target.callsign == normalized for target in self._hunt_targets)
+
+    def _rare_target_accepts(self, station: str) -> bool:
+        normalized = station.strip().upper()
+        return any(target.callsign == normalized for target in (*self._hunt_targets, *self._reply_rare_targets))
+
+    def _hunt_current_target(self) -> HuntTarget | None:
+        if not self._hunt_targets:
+            return None
+        if self._hunt_manual_target:
+            return self._hunt_targets[0]
+        return self._hunt_targets[self._hunt_rotation_index % len(self._hunt_targets)]
+
+    def _run_hunt(self, now: datetime) -> None:
+        target = self._hunt_current_target()
+        if target is None:
+            self.stop_hunt("no usable target")
+            return
+        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+        if current_band != self._hunt_observed_band:
+            self._hunt_observed_band = current_band
+            self._hunt_band_started_at = now
+        spot = self._hunt_remote_spots.get(target.callsign)
+        spot_is_recent = bool(
+            spot is not None
+            and now - spot.observed_at <= timedelta(seconds=self.config.pskreporter_mqtt_spot_max_age_seconds)
+        )
+        allowed = set(self.config.allowed_auto_hop_bands)
+        available_bands = tuple(
+            dict.fromkeys(
+                band
+                for band in (*target.bands, spot.band if spot_is_recent and spot is not None else "")
+                if band in allowed and band not in self._swr_excluded_bands and self._band_frequency(band, "FT8") is not None
+            )
+        )
+        remote_band = spot.band if spot_is_recent and spot is not None and spot.band in available_bands else None
+        desired_band = remote_band or (target.best_band if target.best_band in available_bands else (available_bands[0] if available_bands else None))
+        if desired_band is None:
+            self._advance_hunt_target(now, "target band unavailable")
+            return
+        frequency = self._remote_spot_frequency(spot, desired_band) if remote_band else self._band_frequency(desired_band, "FT8")
+        if frequency is None:
+            self._advance_hunt_target(now, "no FT8 frequency")
+            return
+        if current_band != desired_band or self.status.dial_frequency != frequency:
+            if not self._forced_band_hop_safe():
+                return
+            if self._request_band_change(desired_band, frequency, now, "hunt"):
+                source = "remote PSK Reporter spot" if remote_band else "activity schedule"
+                LOGGER.info("[HUNT] target=%s changing band %s -> %s source=%s", target.callsign, current_band or "unknown", desired_band, source)
+                self._hunt_band_started_at = now
+            return
+        if self._hunt_manual_target or len(self._hunt_targets) < 2:
+            return
+        dwell_started = self._hunt_band_started_at or now
+        if now - dwell_started >= timedelta(seconds=self.config.adaptive_opportunity_quiet_seconds):
+            self._advance_hunt_target(now, "listen window expired")
+
+    def _run_reply_rare_watch(self, now: datetime) -> None:
+        """Follow the freshest rare FT8 spot while ordinary Reply remains active.
+
+        A remote spot can only select an RX band; candidate creation and every
+        transmission still require a local WSJT-X Decode.
+        """
+        if not self._remote_hunt_enabled or not self._reply_rare_targets:
+            return
+        targets = {target.callsign: target for target in self._reply_rare_targets}
+        candidates = [
+            (spot, targets.get(callsign))
+            for callsign, spot in self._hunt_remote_spots.items()
+            if callsign in targets
+            and now - spot.observed_at <= timedelta(seconds=self.config.pskreporter_mqtt_spot_max_age_seconds)
+            and spot.band not in self._swr_excluded_bands
+            and spot.band in self.config.allowed_auto_hop_bands
+            and self._band_frequency(spot.band, "FT8") is not None
+        ]
+        if not candidates:
+            return
+        spot, target = max(candidates, key=lambda item: (item[0].observed_at, item[1].path_score if item[1] else 0))
+        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+        frequency = self._remote_spot_frequency(spot, spot.band)
+        if frequency is None or (current_band == spot.band and self.status.dial_frequency == frequency) or not self._forced_band_hop_safe():
+            return
+        if self._request_band_change(spot.band, frequency, now, "reply rare MQTT"):
+            LOGGER.info(
+                "[REPLY] rare=%s changing band %s -> %s from remote PSK Reporter spot",
+                target.callsign,
+                current_band or "unknown",
+                spot.band,
+            )
+
+    def _run_unconfirmed_dxcc_watch(self, now: datetime) -> None:
+        """Follow one fresh MQTT lead for an entity missing from LoTW.
+
+        This is receiver guidance only.  The scorer still requires a local
+        WSJT-X Decode before it can select a station or request any TX.
+        """
+        max_age = timedelta(seconds=self.config.pskreporter_mqtt_spot_max_age_seconds)
+        eligible = {
+            callsign: spot
+            for callsign, spot in self._unconfirmed_dxcc_remote_spots.items()
+            if now - spot.observed_at <= max_age
+            and spot.band not in self._swr_excluded_bands
+            and spot.band in self.config.allowed_auto_hop_bands
+            and self._band_frequency(spot.band, "FT8") is not None
+        }
+        self._unconfirmed_dxcc_remote_spots = eligible
+        if not eligible or not self._forced_band_hop_safe():
+            return
+        dwell = timedelta(seconds=self.config.adaptive_opportunity_quiet_seconds)
+        current_spot = eligible.get(self._unconfirmed_dxcc_target)
+        if current_spot is not None and self._unconfirmed_dxcc_target_started_at is not None:
+            if now - self._unconfirmed_dxcc_target_started_at < dwell:
+                return
+        callsign, spot = max(
+            eligible.items(),
+            key=lambda item: (item[1].path_probability, item[1].observed_at, item[1].snr if item[1].snr is not None else -99, item[0]),
+        )
+        frequency = self._remote_spot_frequency(spot, spot.band)
+        if frequency is None:
+            return
+        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+        if current_band != spot.band or self.status.dial_frequency != frequency:
+            if not self._request_band_change(spot.band, frequency, now, "reply unconfirmed DXCC MQTT"):
+                return
+            LOGGER.info(
+                "[REPLY] unconfirmed-dxcc=%s changing band %s -> %s from remote PSK Reporter spot",
+                callsign,
+                current_band or "unknown",
+                spot.band,
+            )
+        self._unconfirmed_dxcc_target = callsign
+        self._unconfirmed_dxcc_target_started_at = now
+
+    def _remote_spot_frequency(self, spot: HuntRemoteSpot | None, band: str) -> int | None:
+        """Pick the nearest configured FT8 scan channel for a remote spot.
+
+        PSK Reporter may report any dial offset used by the transmitting
+        station.  Remote information is guidance, not authority to retune the
+        radio to an arbitrary frequency: Reply and Hunt use only the primary
+        or secondary FT8 channels configured for that band.
+        """
+        channels = self._scan_frequencies(band, "FT8")
+        if not channels:
+            return None
+        if spot is None or spot.frequency_hz is None:
+            return channels[0]
+        return min(channels, key=lambda frequency: abs(frequency - int(spot.frequency_hz)))
+
+    def _advance_hunt_target(self, now: datetime, reason: str) -> None:
+        if not self._hunt_targets:
+            return
+        previous = self._hunt_current_target()
+        self._hunt_rotation_index = (self._hunt_rotation_index + 1) % len(self._hunt_targets)
+        self._hunt_band_started_at = now
+        target = self._hunt_current_target()
+        LOGGER.info(
+            "[HUNT] next target=%s previous=%s reason=%s",
+            target.callsign if target else "-",
+            previous.callsign if previous else "-",
+            reason,
+        )
 
     def _forced_band_hop_bands(self) -> tuple[str, ...]:
         configured = (
@@ -1921,9 +2468,7 @@ class AutopilotRuntime:
             and self.engine.state.session.state is QsoState.IDLE
             and not self.finalization.active
             and self._pending_watchdog_halt is None
-            and self._pending_dial_frequency is None
-            and self._pending_ftx1_band_change is None
-            and self._pending_ftx1_profile_apply is None
+            and not self._band_transition_pending()
             and not self.engine.pending_direct_snapshot(self._last_runtime_at or datetime.now(timezone.utc))
         )
 
@@ -1933,8 +2478,6 @@ class AutopilotRuntime:
             self._forced_band_hop_config_warning_logged = True
 
     def _request_band_change(self, target: str, frequency: int, now: datetime, source: str) -> bool:
-        self.engine.clear_candidates()
-        self.engine.invalidate_pending_context(self.status.instance_id, target, self.status.mode or "unknown")
         cat = self.ftx1_band_drive.cat if self.ftx1_band_drive is not None else None
         set_frequency = getattr(cat, "set_frequency", None)
         read_frequency = getattr(cat, "read_frequency", None)
@@ -1951,6 +2494,8 @@ class AutopilotRuntime:
             # Compatibility path for dry-run/tests and installations where
             # Hamlib radio control is explicitly unavailable.
             return False
+        self.engine.clear_candidates()
+        self.engine.invalidate_pending_context(self.status.instance_id, target, self.status.mode or "unknown")
         self._pending_dial_frequency = PendingDialFrequency(
             self.status.instance_id,
             frequency,
@@ -1993,18 +2538,20 @@ class AutopilotRuntime:
             if not self.config.adaptive_parity_enabled or not self._adaptive_safe(now):
                 return
             if self.current_tx_first is None:
+                self.adaptive_state = AdaptiveState.BAND_HOP_PENDING
+                LOGGER.warning("[ADAPT] TX period unknown; skipping parity trial and requesting band hop")
+            else:
+                requested = not self.current_tx_first
+                if self.control.set_tx_period(self.status.instance_id, requested):
+                    self.requested_tx_period = requested
+                    self.adaptive_state = AdaptiveState.PARITY_TRIAL
+                    self._adaptive_pending_origin = None
+                    self.stagnation.reset()
+                    band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
+                    self.opportunities.reset(band, self.status.mode or "unknown", now)
+                    LOGGER.info("[ADAPT] action=TX_PERIOD_FLIP")
+                    LOGGER.info("[ADAPT] %s -> %s", "FIRST" if self.current_tx_first else "SECOND", "FIRST" if requested else "SECOND")
                 return
-            requested = not self.current_tx_first
-            if self.control.set_tx_period(self.status.instance_id, requested):
-                self.requested_tx_period = requested
-                self.adaptive_state = AdaptiveState.PARITY_TRIAL
-                self._adaptive_pending_origin = None
-                self.stagnation.reset()
-                band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
-                self.opportunities.reset(band, self.status.mode or "unknown", now)
-                LOGGER.info("[ADAPT] action=TX_PERIOD_FLIP")
-                LOGGER.info("[ADAPT] %s -> %s", "FIRST" if self.current_tx_first else "SECOND", "FIRST" if requested else "SECOND")
-            return
         if self.adaptive_state is AdaptiveState.BAND_HOP_PENDING:
             if not self.config.automatic_band_hopping_enabled or not self._adaptive_safe(now):
                 return
@@ -2012,12 +2559,10 @@ class AutopilotRuntime:
                 dwell = now - self.last_band_change_at
                 if dwell < timedelta(minutes=self.config.minimum_band_dwell_minutes):
                     return
-            target = self._next_auto_hop_band()
-            if target is None:
+            destination = self._next_auto_hop_destination()
+            if destination is None:
                 return
-            frequency = self._band_frequency(target, self.status.mode or "")
-            if frequency is None:
-                return
+            target, frequency = destination
             self._request_band_change(target, frequency, now, "adaptive")
 
     def _adaptive_safe(self, now: datetime) -> bool:
@@ -2035,10 +2580,21 @@ class AutopilotRuntime:
             and self._pending_watchdog_halt is None
             and self._pending_dial_frequency is None
             and self.pending_tx_audio_attenuation is None
+            and self._blocked_band_drive_change is None
             and not has_pending_direct
         )
 
     def _next_auto_hop_band(self) -> str | None:
+        destination = self._next_auto_hop_destination()
+        return destination[0] if destination is not None else None
+
+    def _next_auto_hop_destination(self) -> tuple[str, int] | None:
+        """Return the next primary/secondary FT8 scan position.
+
+        Each allowed band is visited first on its normal FT8 frequency, then
+        on its secondary DX channel.  SWR-excluded bands are intentionally
+        absent, so the scanner can never bring them back into service.
+        """
         allowed = tuple(
             band for band in dict.fromkeys(band.lower() for band in self.config.allowed_auto_hop_bands)
             if band not in self._swr_excluded_bands
@@ -2046,14 +2602,29 @@ class AutopilotRuntime:
         if not allowed or self.status.dial_frequency is None:
             return None
         current = (BandResolver().resolve(self.status.dial_frequency) or "").lower()
-        if current not in allowed:
-            return next((band for band in allowed if self._band_frequency(band, self.status.mode or "") is not None), None)
-        start = allowed.index(current)
-        for offset in range(1, len(allowed)):
-            candidate = allowed[(start + offset) % len(allowed)]
-            if self._band_frequency(candidate, self.status.mode or "") is not None:
-                return candidate
-        return None
+        positions = tuple(
+            (band, frequency)
+            for band in allowed
+            for frequency in self._scan_frequencies(band, self.status.mode or "")
+        )
+        if not positions:
+            return None
+        for index, position in enumerate(positions):
+            if position == (current, self.status.dial_frequency):
+                return positions[(index + 1) % len(positions)]
+        if current in allowed:
+            return next((position for position in positions if position[0] == current), positions[0])
+        return positions[0]
+
+    def _scan_frequencies(self, band: str, mode: str) -> tuple[int, ...]:
+        primary = self._band_frequency(band, mode)
+        if primary is None:
+            return ()
+        frequencies = [primary]
+        secondary = _SECONDARY_FT8_DIAL_FREQUENCIES.get(band.lower()) if mode.upper() == "FT8" else None
+        if secondary is not None and secondary != primary and BandResolver().resolve(secondary) == band.lower():
+            frequencies.append(secondary)
+        return tuple(frequencies)
 
     def _band_frequency(self, band: str, mode: str) -> int | None:
         override = self.config.auto_hop_band_frequencies.get(band.lower(), {}).get(mode.upper())
@@ -2101,6 +2672,7 @@ class AutopilotRuntime:
             completion_age = (now - session.last_activity).total_seconds()
             if inactive and completion_age >= self.config.qso_completion_grace_seconds:
                 if self.engine.finalize_observed_completion("terminal Decode and inactive WSJT-X Status"):
+                    self.note_qso_completed(session.remote_callsign or "station inconnue")
                     self._log_ready_for_next_qso()
             return
 
@@ -2120,6 +2692,8 @@ class AutopilotRuntime:
                 session.no_progress_periods,
                 self.config.max_no_progress_periods,
             )
+            self.session_diagnostics.autopilot_watchdogs += 1
+            self.session_diagnostics.note(f"Watchdog AutoPilot : {remote or 'station inconnue'}")
             halted = self._halt_tx(session.instance_id, "QSO stalled")
             if not halted and not isinstance(self.control, DryRunControl):
                 self._disarm_control("halt_tx_failed_stalled_qso", "AutopilotRuntime._maintain_qso_lifecycle")
@@ -2170,6 +2744,8 @@ class AutopilotRuntime:
             remote or "unknown",
             stage,
         )
+        self.session_diagnostics.wsjtx_watchdogs += 1
+        self.session_diagnostics.note(f"Watchdog WSJT-X : {remote or 'station inconnue'}")
         if packet.transmitting or packet.tx_enabled:
             halt_result = self._request_halt_tx(packet.header.instance_id, "WSJT-X Runaway TX watchdog")
             halted = halt_result.radio_ok and halt_result.wsjtx_ok
@@ -2244,6 +2820,29 @@ class AutopilotRuntime:
                 maximum,
             )
 
+    def note_engine_event(self, event: EngineEvent) -> None:
+        """Record a decision outcome without changing the decision itself."""
+        if event.kind is EngineEventKind.CANDIDATE_SELECTED:
+            self.session_diagnostics.candidates_selected += 1
+            self.session_diagnostics.note(f"Sélection : {event.station}")
+            return
+        if event.kind is not EngineEventKind.CANDIDATE_REFUSED:
+            return
+        reason = event.reason.strip()
+        if reason.lower() in {"exchange not actionable", "duplicate decode", "stale"}:
+            return
+        self.session_diagnostics.candidates_refused += 1
+        if "working " in reason.lower():
+            self.session_diagnostics.stations_busy += 1
+            self.session_diagnostics.note(f"Écartée, déjà occupée : {event.station} ({reason})")
+
+    def note_qso_completed(self, station: str) -> None:
+        self.session_diagnostics.qso_completed += 1
+        self.session_diagnostics.note(f"QSO terminé : {station}")
+
+    def session_diagnostic_snapshot(self) -> dict[str, object]:
+        return self.session_diagnostics.snapshot()
+
     def _update_diagnostic_context(self, now: datetime) -> None:
         session = current_logging_session()
         if session is not None:
@@ -2261,5 +2860,10 @@ class AutopilotRuntime:
                 "last_band_change": self.last_band_change_at.isoformat() if self.last_band_change_at else None,
                 "minimum_band_dwell_minutes": self.config.minimum_band_dwell_minutes,
                 "next_band": self._next_auto_hop_band(),
+                "next_frequency_hz": (
+                    self._next_auto_hop_destination()[1]
+                    if self._next_auto_hop_destination() is not None
+                    else None
+                ),
                 "opportunities": self.opportunities.snapshot(now),
             }

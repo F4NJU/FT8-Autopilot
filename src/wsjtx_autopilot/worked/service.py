@@ -16,8 +16,16 @@ class WorkedTodayService:
         self.bands = bands or BandResolver()
         self._cache_date: date | None = None
         self._keys: set[tuple[str, str]] = set()
+        self._history_callsigns: set[str] | None = None
 
-    def check(self, callsign: str, frequency_hz: int | None, observed_at: datetime) -> WorkedCheck:
+    def check(
+        self,
+        callsign: str,
+        frequency_hz: int | None,
+        observed_at: datetime,
+        *,
+        exclude_previously_worked: bool = False,
+    ) -> WorkedCheck:
         if frequency_hz is None:
             return WorkedCheck(None, False)
         band = self.bands.resolve(frequency_hz)
@@ -27,9 +35,15 @@ class WorkedTodayService:
         self._load_date(qso_date)
         normalized = normalize_callsign(callsign)
         duplicate = (normalized, band) in self._keys
+        scope = "today"
+        if exclude_previously_worked:
+            if self._history_callsigns is None:
+                self._history_callsigns = self.store.callsigns()
+            duplicate = normalized in self._history_callsigns
+            scope = "history" if duplicate else "today"
         if duplicate:
-            LOGGER.info("[WORKED] duplicate %s band=%s date=%s", normalized, band, qso_date.isoformat())
-        return WorkedCheck(band, duplicate)
+            LOGGER.info("[WORKED] duplicate %s band=%s scope=%s date=%s", normalized, band, scope, qso_date.isoformat())
+        return WorkedCheck(band, duplicate, scope)
 
     def record_qso_logged(self, packet: QsoLoggedPacket) -> bool:
         band = self.bands.resolve(packet.tx_frequency)
@@ -52,6 +66,8 @@ class WorkedTodayService:
         )
         if self._cache_date == qso_date:
             self._keys.add((normalize_callsign(packet.dx_call), band))
+        if self._history_callsigns is not None:
+            self._history_callsigns.add(normalize_callsign(packet.dx_call))
         if inserted:
             LOGGER.info(
                 "[WORKED] recorded %s band=%s date=%s source=WSJTX_QSOLOGGED",
@@ -79,6 +95,7 @@ class WorkedTodayService:
     def refresh(self) -> None:
         self._cache_date = None
         self._keys.clear()
+        self._history_callsigns = None
 
     def _load_date(self, qso_date: date) -> None:
         if self._cache_date != qso_date:

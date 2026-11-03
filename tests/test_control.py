@@ -397,6 +397,31 @@ def test_adaptive_band_hop_requires_status_confirmation() -> None:
     assert app.adaptive_state is AdaptiveState.BAND_TRIAL
 
 
+def test_adaptive_unknown_tx_period_skips_directly_to_band_hop() -> None:
+    transport = FakeTransport()
+    config = replace(
+        AppConfig(),
+        candidate_collection_seconds=0,
+        adaptive_opportunity_quiet_seconds=5,
+        adaptive_parity_enabled=True,
+        automatic_band_hopping_enabled=True,
+        allowed_auto_hop_bands=("20m", "17m"),
+        minimum_band_dwell_minutes=0,
+    )
+    app = AutopilotRuntime(config, control=WsjtxUdpControl(transport, 15, 3))
+    app.handle(HeartbeatPacket(PacketHeader(3, 0, "WSJT-X"), 3, "3.2.0", "260818-AP1"), NOW, ENDPOINT)
+    app.handle(runtime_status("", schema=3, tx_enabled=False), NOW, ENDPOINT)
+
+    assert app.current_tx_first is None
+
+    app.handle(None, NOW + timedelta(seconds=6), ENDPOINT)
+
+    command = parse_datagram(transport.sent[-1][0])
+    assert isinstance(command, SetDialFrequencyPacket)
+    assert command.frequency_hz == 18_100_000
+    assert app.adaptive_state is AdaptiveState.BAND_CHANGING
+
+
 def test_band_trial_can_request_another_hop_when_no_viable_cq_appears() -> None:
     transport = FakeTransport()
     config = replace(
