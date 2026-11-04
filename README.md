@@ -8,7 +8,7 @@ actuelle n'offre plus de contact intéressant.
 L'opérateur reste responsable de la station, des émissions et du respect de
 la réglementation.
 
-**Statut : version stable 1.0.0.**
+**Statut : version stable 1.0.1.**
 
 ## Installation
 
@@ -190,4 +190,3 @@ pyinstaller -y packaging/wsjtx-autopilot.spec
 ## Licence
 
 GPL-3.0-or-later
-
