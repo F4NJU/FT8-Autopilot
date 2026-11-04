@@ -32,11 +32,52 @@ BUILD_INFO_PATH.write_text(
     encoding="utf-8",
 )
 
+
+def bundled_ap1_data() -> list[tuple[str, str]]:
+    """Collect a complete AP1 runtime when the integrated release is built."""
+
+    raw_runtime = os.environ.get("WSJTX_AP1_RUNTIME_DIR", "").strip()
+    required = os.environ.get("FT8_REQUIRE_AP1_BUNDLE", "").strip() == "1"
+    if not raw_runtime:
+        if required:
+            raise SystemExit("FT8_REQUIRE_AP1_BUNDLE=1 requires WSJTX_AP1_RUNTIME_DIR")
+        return []
+    runtime = Path(raw_runtime).expanduser().resolve()
+    executable = runtime / "bin" / "wsjtx.exe"
+    if not executable.is_file():
+        raise SystemExit(f"Invalid AP1 runtime: missing {executable}")
+    source_url = os.environ.get("WSJTX_AP1_SOURCE_URL", "").strip()
+    if required and not source_url:
+        raise SystemExit("FT8_REQUIRE_AP1_BUNDLE=1 requires WSJTX_AP1_SOURCE_URL")
+    notice = Path(tempfile.gettempdir()) / "AP1-SOURCE.txt"
+    notice.write_text(
+        "Bundled FT8 engine: WSJT-X Improved / AP1\\n"
+        f"Runtime source directory: {runtime.name}\\n"
+        f"Corresponding source: {source_url or 'not bundled in this developer build'}\\n"
+        "AutoPilot AP1 changes: patches/wsjtx-3.2-direct-reply.patch in the AutoPilot source tree.\\n"
+        "Licence: GNU GPL version 3 or later.\\n",
+        encoding="utf-8",
+    )
+    files = [
+        (str(path), str(Path("wsjtx-ap1") / path.relative_to(runtime).parent))
+        for path in runtime.rglob("*")
+        if path.is_file()
+    ]
+    files.append((str(notice), "wsjtx-ap1"))
+    return files
+
+
+DATA_FILES = [
+    (str(BUILD_INFO_PATH), "."),
+    (str(PROJECT_ROOT / "LICENSE"), "licenses"),
+    *bundled_ap1_data(),
+]
+
 a = Analysis(
     [str(PROJECT_ROOT / "packaging" / "gui_entry.py")],
     pathex=[str(PROJECT_ROOT / "src")],
     binaries=[],
-    datas=[(str(BUILD_INFO_PATH), ".")],
+    datas=DATA_FILES,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -81,3 +122,4 @@ collect = COLLECT(
     upx_exclude=[],
     name="WSJTX-AutoPilot",
 )
+

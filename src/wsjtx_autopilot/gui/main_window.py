@@ -4,7 +4,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QProcess, QSize, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices, QGuiApplication, QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -49,13 +49,16 @@ from wsjtx_autopilot.config import (
 from wsjtx_autopilot.engine.models import EngineEvent, EngineEventKind
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.logging_setup import (
+    build_metadata,
     current_logging_session,
     export_diagnostic,
     set_file_log_level,
 )
 from wsjtx_autopilot.hamlib import list_supported_radios
+from wsjtx_autopilot.updates import RELEASES_PAGE_URL, UpdateCheckResult, UpdateRelease, version_key
 
 from .hunt import HuntPanel, PskReporterMqttPoller, SpaceWeatherPoller, SpecialCallPoller, WavelogLotwPoller
+from .updates import UpdateCheckPoller, UpdateDownloadPoller
 from .viewmodels import ActivityRow, CandidateRow, StatusView
 from .worker import BackendWorker
 
@@ -129,6 +132,8 @@ class SettingsDialog(QDialog):
             ignore_minutes=self.ignore_minutes.value(),
             cty_dat_path=self.cty_path.text().strip() or None,
             wsjtx_log_path=self.adif_path.text().strip() or None,
+            launch_wsjtx_with_autopilot=self.manage_wsjtx.isChecked(),
+            wsjtx_executable_path=self.wsjtx_executable_path.text().strip(),
             sync_adif_on_startup=self.sync_adif.isChecked(),
             direct_reply_patched=False,
             max_no_progress_periods=self.max_no_progress.value(),
@@ -195,7 +200,40 @@ class SettingsDialog(QDialog):
         form.addRow("Local callsign", self.callsign)
         form.addRow("UDP bind address", self.bind_address)
         form.addRow("UDP port", self.udp_port)
+        self.manage_wsjtx = QCheckBox("Démarrer AP1 intégré avec AutoPilot (réduit)")
+        self.manage_wsjtx.setChecked(self._settings.launch_wsjtx_with_autopilot)
+        self.wsjtx_executable_path = QLineEdit(self._settings.wsjtx_executable_path)
+        self.wsjtx_executable_path.setPlaceholderText("AP1 intégré (détection automatique)")
+        self.wsjtx_browse = QPushButton("Parcourir…")
+        executable_row = QWidget()
+        executable_layout = QHBoxLayout(executable_row)
+        executable_layout.setContentsMargins(0, 0, 0, 0)
+        executable_layout.addWidget(self.wsjtx_executable_path, 1)
+        executable_layout.addWidget(self.wsjtx_browse)
+        self.wsjtx_browse.clicked.connect(self._choose_wsjtx_executable)
+        self.manage_wsjtx.toggled.connect(self.wsjtx_executable_path.setEnabled)
+        self.manage_wsjtx.toggled.connect(self.wsjtx_browse.setEnabled)
+        self.wsjtx_executable_path.setEnabled(self.manage_wsjtx.isChecked())
+        self.wsjtx_browse.setEnabled(self.manage_wsjtx.isChecked())
+        form.addRow(self.manage_wsjtx)
+        form.addRow("Fichier WSJT-X", executable_row)
+        note = QLabel(
+            "AutoPilot démarre WSJT-X réduit et ne ferme que l’instance qu’il a lancée. "
+            "Une instance ouverte manuellement reste intacte."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
         return widget
+
+    def _choose_wsjtx_executable(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Sélectionner wsjtx.exe",
+            self.wsjtx_executable_path.text().strip(),
+            "WSJT-X (wsjtx.exe);;Programmes (*.exe)",
+        )
+        if filename:
+            self.wsjtx_executable_path.setText(filename)
 
     def _priority_tab(self) -> QWidget:
         widget = QWidget()
@@ -681,6 +719,10 @@ class MainWindow(QMainWindow):
         self._wavelog_lotw_poller: WavelogLotwPoller | None = None
         self._space_weather_poller: SpaceWeatherPoller | None = None
         self._pskreporter_mqtt: PskReporterMqttPoller | None = None
+        self._update_check_poller: UpdateCheckPoller | None = None
+        self._update_download_poller: UpdateDownloadPoller | None = None
+        self._available_update: UpdateRelease | None = None
+        self._current_version = str(build_metadata().get("app_version", ""))
         self._local_grid = ""
         self.setWindowTitle("WSJTX AutoPilot")
         self.resize(1120, 700)
@@ -758,6 +800,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._start_pskreporter_mqtt)
         if self._settings.prioritize_favorable_path_in_reply:
             QTimer.singleShot(0, self._refresh_space_weather)
+        if version_key(self._current_version) is not None:
+            QTimer.singleShot(2_500, self._check_for_updates)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -779,6 +823,9 @@ class MainWindow(QMainWindow):
         self.connection.setObjectName("statusPill")
         self.frequency = QLabel("-")
         self.mode = QLabel("-")
+        self.update_button = QPushButton("MISES À JOUR")
+        self.update_button.setObjectName("updateButton")
+        self.update_button.clicked.connect(self._on_update_button_clicked)
         settings_button = QPushButton("PREFERENCES")
         settings_button.clicked.connect(self._edit_settings)
         self.antenna_indicator = QLabel("●  OK")
@@ -796,6 +843,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.mode)
         header.addWidget(self.antenna_indicator)
         header.addWidget(self.reset_swr_safety_button)
+        header.addWidget(self.update_button)
         header.addWidget(settings_button)
         header.addWidget(self.arm_button)
         layout.addLayout(header)
@@ -1382,6 +1430,115 @@ class MainWindow(QMainWindow):
         self._refresh_wavelog_lotw()
         self.statusBar().showMessage("Preferences saved; backend restarted DISARMED", 6000)
 
+    def _on_update_button_clicked(self) -> None:
+        if self._available_update is None:
+            self._check_for_updates(manual=True)
+            return
+        self._offer_update(self._available_update)
+
+    def _check_for_updates(self, manual: bool = False) -> None:
+        if self._update_check_poller is not None and self._update_check_poller.isRunning():
+            return
+        if version_key(self._current_version) is None:
+            if manual:
+                QDesktopServices.openUrl(QUrl(RELEASES_PAGE_URL))
+            return
+        self.update_button.setEnabled(False)
+        self.update_button.setText("VÉRIFICATION…")
+        poller = UpdateCheckPoller(self._current_version)
+        self._update_check_poller = poller
+        poller.completed.connect(lambda result: self._show_update_check(result, manual))
+        poller.finished.connect(poller.deleteLater)
+        poller.start()
+
+    def _show_update_check(self, result: object, manual: bool) -> None:
+        self._update_check_poller = None
+        self.update_button.setEnabled(True)
+        if not isinstance(result, UpdateCheckResult):
+            self.update_button.setText("MISES À JOUR")
+            return
+        if result.available and result.release is not None:
+            self._available_update = result.release
+            self.update_button.setText(f"MISE À JOUR v{result.release.version}")
+            self.update_button.setProperty("available", True)
+            self.update_button.style().unpolish(self.update_button)
+            self.update_button.style().polish(self.update_button)
+            self.statusBar().showMessage(
+                f"Mise à jour v{result.release.version} disponible — clique sur le bouton MISE À JOUR.",
+                10_000,
+            )
+            if manual:
+                self._offer_update(result.release)
+            return
+        self.update_button.setText("À JOUR")
+        self.update_button.setProperty("available", False)
+        self.update_button.style().unpolish(self.update_button)
+        self.update_button.style().polish(self.update_button)
+        if manual:
+            self.statusBar().showMessage(result.warning or "AutoPilot est déjà à jour.", 6_000)
+        elif result.warning:
+            LOGGER.info("[UPDATE] background check skipped: %s", result.warning)
+
+    def _offer_update(self, release: UpdateRelease) -> None:
+        if release.installer is None or release.checksums is None:
+            answer = QMessageBox.information(
+                self,
+                "Mise à jour disponible",
+                f"La version {release.version} est disponible, mais son installateur vérifiable n'est pas encore joint à la release.\n\n"
+                "La page GitHub va s'ouvrir pour consulter les notes et téléchargements.",
+                QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Open,
+            )
+            if answer == QMessageBox.StandardButton.Open:
+                QDesktopServices.openUrl(QUrl(release.release_url))
+            return
+        answer = QMessageBox.question(
+            self,
+            "Installer la mise à jour ?",
+            f"Télécharger et vérifier WSJTX AutoPilot v{release.version} ?\n\n"
+            "L'installateur ne sera lancé qu'après vérification SHA-256. AutoPilot restera ouvert pendant le téléchargement.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.update_button.setEnabled(False)
+        self.update_button.setText("TÉLÉCHARGEMENT…")
+        paths = AppPaths.from_environment().ensure_directories()
+        poller = UpdateDownloadPoller(release, paths.data_dir / "updates")
+        self._update_download_poller = poller
+        poller.completed.connect(self._offer_verified_installer)
+        poller.failed.connect(self._show_update_download_error)
+        poller.finished.connect(poller.deleteLater)
+        poller.start()
+
+    def _show_update_download_error(self, message: str) -> None:
+        self._update_download_poller = None
+        self.update_button.setEnabled(True)
+        self.update_button.setText("MISE À JOUR")
+        QMessageBox.warning(self, "Mise à jour non installée", message)
+
+    def _offer_verified_installer(self, installer: object) -> None:
+        self._update_download_poller = None
+        self.update_button.setEnabled(True)
+        self.update_button.setText("MISE À JOUR PRÊTE")
+        path = Path(str(installer))
+        answer = QMessageBox.question(
+            self,
+            "Mise à jour vérifiée",
+            "La somme SHA-256 est correcte. AutoPilot va se fermer, puis l'installateur va démarrer. Continuer ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Installateur vérifié, prêt lorsque tu cliqueras à nouveau sur MISE À JOUR.", 8_000)
+            return
+        if not QProcess.startDetached(str(path), ["/SP-", "/CLOSEAPPLICATIONS"]):
+            QMessageBox.critical(self, "Mise à jour", "Impossible de démarrer l'installateur vérifié.")
+            return
+        self.statusBar().showMessage("Installateur lancé : arrêt d'AutoPilot…")
+        QTimer.singleShot(0, self.close)
+
     def _restart_special_refresh_timer(self) -> None:
         interval_ms = max(5, self._settings.special_calls_refresh_minutes) * 60_000
         self._special_refresh_timer.setInterval(interval_ms)
@@ -1650,6 +1807,10 @@ class MainWindow(QMainWindow):
             self._wavelog_lotw_poller.requestInterruption()
         if self._space_weather_poller is not None and self._space_weather_poller.isRunning():
             self._space_weather_poller.requestInterruption()
+        if self._update_check_poller is not None and self._update_check_poller.isRunning():
+            self._update_check_poller.requestInterruption()
+        if self._update_download_poller is not None and self._update_download_poller.isRunning():
+            self._update_download_poller.requestInterruption()
         # Every external poller has a bounded socket/request timeout.  They
         # are asked to stop before waiting so they cannot leave a hidden
         # Python/Qt process behind after the main window disappears.
@@ -1661,6 +1822,10 @@ class MainWindow(QMainWindow):
             self._wavelog_lotw_poller.wait(9_000)
         if self._space_weather_poller is not None and self._space_weather_poller.isRunning():
             self._space_weather_poller.wait(6_000)
+        if self._update_check_poller is not None and self._update_check_poller.isRunning():
+            self._update_check_poller.wait(9_000)
+        if self._update_download_poller is not None and self._update_download_poller.isRunning():
+            self._update_download_poller.wait(22_000)
         self.stop_requested.emit()
         if not self._thread.wait(8_000):
             # Do not hide the window while a radio-owning backend is still
@@ -1677,6 +1842,8 @@ class MainWindow(QMainWindow):
                 ("indicatifs spéciaux", self._special_call_poller),
                 ("Wavelog", self._wavelog_lotw_poller),
                 ("NOAA", self._space_weather_poller),
+                ("mise à jour", self._update_check_poller),
+                ("téléchargement mise à jour", self._update_download_poller),
             )
             if poller is not None and poller.isRunning()
         ]
@@ -1700,6 +1867,7 @@ class MainWindow(QMainWindow):
             QTableWidget::item { padding: 5px; }
             QPushButton { background: #17242d; border: 1px solid #334651; border-radius: 4px; padding: 7px 11px; font-weight: 700; }
             QPushButton:hover { background: #20323e; }
+            #updateButton[available='true'] { color: #efbd67; border-color: #8c6936; background: #2a2115; }
             #armButton { color: #efbd67; border-color: #8c6936; min-width: 115px; }
             #armButton[armed='true'] { background: #65262a; color: #ffffff; border-color: #df5a60; }
             #statusPill { background: #222b31; color: #92a1aa; border-radius: 10px; padding: 5px 10px; font-weight: 700; }
@@ -1764,3 +1932,4 @@ def _path_picker(parent: QWidget, line_edit: QLineEdit, file_filter: str, save: 
     layout.addWidget(line_edit, 1)
     layout.addWidget(button)
     return widget
+

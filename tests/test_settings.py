@@ -66,6 +66,8 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
         wavelog_api_token="wl2_test-token",
         wavelog_lotw_refresh_minutes=90,
         wavelog_unconfirmed_dxcc_only=True,
+        launch_wsjtx_with_autopilot=True,
+        wsjtx_executable_path=" C:/Radio/WSJT-X/bin/wsjtx.exe ",
     )
 
     store.save(settings)
@@ -109,6 +111,8 @@ def test_settings_round_trip_without_runtime_arming(tmp_path) -> None:
     assert loaded.wavelog_api_token == "wl2_test-token"
     assert loaded.wavelog_lotw_refresh_minutes == 90
     assert loaded.wavelog_unconfirmed_dxcc_only
+    assert loaded.launch_wsjtx_with_autopilot
+    assert loaded.wsjtx_executable_path == "C:/Radio/WSJT-X/bin/wsjtx.exe"
     assert "usb_mod_gain" not in payload["ftx1_band_profiles"]["20m"]
     assert "armed" not in payload
 
@@ -121,6 +125,28 @@ def test_invalid_settings_fall_back_safely(tmp_path) -> None:
 
     assert loaded.direct_call_policy is DirectCallPolicy.ALWAYS_PRIORITY
     assert loaded.blacklist == set()
+
+
+def test_existing_legacy_settings_enable_bundled_ap1_once(monkeypatch, tmp_path) -> None:
+    app_root = tmp_path / "app"
+    bundled = app_root / "_internal" / "wsjtx-ap1" / "bin" / "wsjtx.exe"
+    bundled.parent.mkdir(parents=True)
+    bundled.touch()
+    monkeypatch.setenv("WSJTX_AUTOPILOT_APP_DIR", str(app_root))
+    path = tmp_path / "settings.json"
+    path.write_text('{"local_callsign": "F4NJU"}', encoding="utf-8")
+
+    assert SettingsStore(path).load().launch_wsjtx_with_autopilot
+
+
+def test_existing_explicitly_disabled_integrated_wsjtx_is_preserved(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        '{"local_callsign": "F4NJU", "launch_wsjtx_with_autopilot": false}',
+        encoding="utf-8",
+    )
+
+    assert not SettingsStore(path).load().launch_wsjtx_with_autopilot
 
 
 def test_non_object_settings_fall_back_safely(tmp_path) -> None:
@@ -168,3 +194,4 @@ def test_ftx1_profiles_ignore_legacy_learning_data(tmp_path) -> None:
     loaded = store.load()
 
     assert loaded.ftx1_band_profiles == {"20m": {"tx_audio_attenuation": 118}}
+

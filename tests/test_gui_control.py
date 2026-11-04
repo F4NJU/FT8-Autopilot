@@ -127,6 +127,29 @@ def test_gui_arm_uses_same_unlimited_control_instance(tmp_path, monkeypatch) -> 
         backend._close_backend()
 
 
+def test_integrated_wsjtx_mode_requires_a_live_udp_connection_before_arm() -> None:
+    class Transport:
+        def sendto(self, data: bytes, endpoint: tuple[str, int]) -> int:
+            return len(data)
+
+    class Listener:
+        @staticmethod
+        def receive():
+            return None
+
+    control = WsjtxUdpControl(Transport(), 15, None, armed=False)
+    backend = BackendWorker(UserSettings(launch_wsjtx_with_autopilot=True))
+    backend._runtime = AutopilotRuntime(AppConfig(), control=control)
+    backend._listener = Listener()
+    errors: list[str] = []
+    backend.error.connect(errors.append)
+
+    backend.arm()
+
+    assert not control.armed
+    assert errors == ["WSJT-X est en cours de démarrage : attends sa connexion avant d’armer AutoPilot"]
+
+
 def test_gui_worker_uses_prefix_fallback_for_candidate_and_working_metadata(tmp_path, monkeypatch) -> None:
     backend = worker(tmp_path, monkeypatch)
     try:
@@ -513,6 +536,22 @@ def test_preferences_apply_ok_and_cancel_are_wired() -> None:
     assert cancelled.result() == QDialog.DialogCode.Rejected
 
 
+def test_preferences_can_manage_wsjtx_as_a_background_companion() -> None:
+    QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        UserSettings(
+            launch_wsjtx_with_autopilot=True,
+            wsjtx_executable_path=" C:/Radio/WSJT-X/bin/wsjtx.exe ",
+        ),
+        ap1_available=True,
+    )
+
+    assert dialog.manage_wsjtx.isChecked()
+    assert dialog.wsjtx_executable_path.text().strip().endswith("wsjtx.exe")
+    assert dialog.settings().launch_wsjtx_with_autopilot
+    assert dialog.settings().wsjtx_executable_path == "C:/Radio/WSJT-X/bin/wsjtx.exe"
+
+
 def test_preferences_can_prioritize_active_special_calls_in_reply() -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(
@@ -814,3 +853,4 @@ def test_swr_safety_disarm_shows_explicit_notification(monkeypatch) -> None:
     assert messages[0][1] == "Protection SWR — AutoPilot désarmé"
     assert "arrêté l’émission" in messages[0][2]
     assert "SWR SAFETY 2.50" in messages[0][2]
+

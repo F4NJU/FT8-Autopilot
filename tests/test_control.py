@@ -369,7 +369,7 @@ def test_adaptive_parity_flip_requires_ap1_and_safe_idle() -> None:
     assert not period.tx_first
 
 
-def test_adaptive_scan_channel_change_requires_status_confirmation() -> None:
+def test_adaptive_band_hop_requires_status_confirmation() -> None:
     transport = FakeTransport()
     config = replace(
         AppConfig(),
@@ -386,11 +386,11 @@ def test_adaptive_scan_channel_change_requires_status_confirmation() -> None:
     app.handle(None, NOW + timedelta(seconds=1), ENDPOINT)
     command = parse_datagram(transport.sent[-1][0])
     assert isinstance(command, SetDialFrequencyPacket)
-    assert command.frequency_hz == 14_090_000
+    assert command.frequency_hz == 18_100_000
     assert app.adaptive_state is AdaptiveState.BAND_CHANGING
 
     app.handle(
-        runtime_status("", schema=3, frequency=14_090_000, tx_enabled=False),
+        runtime_status("", schema=3, frequency=18_100_000, tx_enabled=False),
         NOW + timedelta(seconds=2),
         ENDPOINT,
     )
@@ -418,7 +418,7 @@ def test_adaptive_unknown_tx_period_skips_directly_to_band_hop() -> None:
 
     command = parse_datagram(transport.sent[-1][0])
     assert isinstance(command, SetDialFrequencyPacket)
-    assert command.frequency_hz == 14_090_000
+    assert command.frequency_hz == 18_100_000
     assert app.adaptive_state is AdaptiveState.BAND_CHANGING
 
 
@@ -439,7 +439,7 @@ def test_band_trial_can_request_another_hop_when_no_viable_cq_appears() -> None:
     app.adaptive_state = AdaptiveState.BAND_HOP_PENDING
     app.handle(None, NOW + timedelta(seconds=1), ENDPOINT)
     app.handle(
-        runtime_status("", schema=3, frequency=14_090_000, tx_enabled=False),
+        runtime_status("", schema=3, frequency=18_100_000, tx_enabled=False),
         NOW + timedelta(seconds=2),
         ENDPOINT,
     )
@@ -449,7 +449,7 @@ def test_band_trial_can_request_another_hop_when_no_viable_cq_appears() -> None:
     app.handle(None, NOW + timedelta(seconds=20), ENDPOINT)
     command = parse_datagram(transport.sent[-1][0])
     assert isinstance(command, SetDialFrequencyPacket)
-    assert command.frequency_hz == 18_100_000
+    assert command.frequency_hz == 14_074_000
 
 
 def test_worked_and_unreachable_cqs_exhaust_current_band_without_failure_threshold() -> None:
@@ -472,7 +472,7 @@ def test_worked_and_unreachable_cqs_exhaust_current_band_without_failure_thresho
     app.handle(None, NOW + timedelta(seconds=2), ENDPOINT)
     command = parse_datagram(transport.sent[-1][0])
     assert isinstance(command, SetDialFrequencyPacket)
-    assert command.frequency_hz == 14_090_000
+    assert command.frequency_hz == 18_100_000
 
 
 def test_adaptive_snapshot_exposes_viable_count_and_quiet_countdown() -> None:
@@ -2113,3 +2113,4 @@ def test_mode_change_closes_finalization_and_new_runtime_starts_empty() -> None:
     assert not app.finalization.active
     fresh = control_runtime(FakeTransport(), max_actions=3, direct_reply_patched=True)
     assert not fresh.finalization.active
+

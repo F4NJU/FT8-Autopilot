@@ -52,6 +52,8 @@ class UserSettings:
     ignore_minutes: int = 10
     cty_dat_path: str | None = None
     wsjtx_log_path: str | None = None
+    launch_wsjtx_with_autopilot: bool = False
+    wsjtx_executable_path: str = ""
     sync_adif_on_startup: bool = True
     worked_store_path: str | None = None
     max_actions: int = 1
@@ -124,6 +126,8 @@ class UserSettings:
         if not self.discord_application_id:
             self.discord_presence_enabled = False
         self.special_calls_api_key = str(self.special_calls_api_key).strip()
+        self.launch_wsjtx_with_autopilot = self.launch_wsjtx_with_autopilot is True
+        self.wsjtx_executable_path = str(self.wsjtx_executable_path).strip()
         self.prioritize_special_calls_in_reply = self.prioritize_special_calls_in_reply is True
         self.prioritize_favorable_path_in_reply = self.prioritize_favorable_path_in_reply is True
         self.rare_stations_only = self.rare_stations_only is True
@@ -280,9 +284,24 @@ class SettingsStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_settings_path()
 
+    @staticmethod
+    def _fresh_install_defaults() -> UserSettings:
+        """Use the bundled AP1 automatically for a brand-new installation only."""
+
+        settings = UserSettings()
+        try:
+            from wsjtx_autopilot.wsjtx_process import bundled_wsjtx_executable
+
+            settings.launch_wsjtx_with_autopilot = bundled_wsjtx_executable() is not None
+        except OSError:
+            # A preference load must never fail because a frozen application
+            # directory cannot be inspected.
+            pass
+        return settings
+
     def load(self) -> UserSettings:
         if not self.path.is_file():
-            return UserSettings()
+            return self._fresh_install_defaults()
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -315,6 +334,13 @@ class SettingsStore:
                 except ValueError:
                     values[key] = ActivityPolicy.NORMAL
         settings = UserSettings(**values)
+        # Older profiles predate the integrated-AP1 preference.  Preserve a
+        # choice that was actually saved, but make the bundled runtime the
+        # same sensible default as a brand-new installation otherwise.
+        if "launch_wsjtx_with_autopilot" not in payload:
+            settings.launch_wsjtx_with_autopilot = (
+                self._fresh_install_defaults().launch_wsjtx_with_autopilot
+            )
         settings.normalize()
         return settings
 
@@ -338,3 +364,4 @@ def default_data_dir() -> Path:
 
 def default_settings_path() -> Path:
     return AppPaths.from_environment().settings_path
+

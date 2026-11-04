@@ -20,6 +20,7 @@ from wsjtx_autopilot.worked.service import WorkedTodayService
 from wsjtx_autopilot.worked.bands import BandResolver
 from wsjtx_autopilot.worked.sync import synchronize_adif
 from wsjtx_autopilot.worked.store import WorkedQsoStore
+from wsjtx_autopilot.wsjtx_process import WsjtxProcessManager
 
 from .viewmodels import ActivityRow, StatusView
 
@@ -64,6 +65,7 @@ class BackendWorker(QObject):
         self._discord_presence: DiscordPresencePublisher | None = None
         self._special_calls: set[str] = set()
         self._dxcc_resolver = None
+        self._wsjtx_process = WsjtxProcessManager()
 
     @Slot()
     def start(self) -> None:
@@ -72,6 +74,7 @@ class BackendWorker(QObject):
         except Exception as exc:
             LOGGER.exception("Unable to start GUI backend")
             self._close_backend()
+            self._wsjtx_process.stop()
             self.error.emit(str(exc))
             return
         self._timer = QTimer(self)
@@ -88,6 +91,7 @@ class BackendWorker(QObject):
         if self._runtime is not None:
             self._runtime.clear_finalization("application shutdown")
         self._close_backend()
+        self._wsjtx_process.stop()
         self.stopped.emit()
 
     @Slot(object)
@@ -100,6 +104,7 @@ class BackendWorker(QObject):
         except Exception as exc:
             LOGGER.exception("Unable to apply GUI settings")
             self._close_backend()
+            self._wsjtx_process.stop()
             self.error.emit(str(exc))
 
     @Slot()
@@ -107,6 +112,9 @@ class BackendWorker(QObject):
         LOGGER.info("[WORKER] ARM request received")
         if self._runtime is None or self._listener is None:
             self.error.emit("Backend is not running")
+            return
+        if self._settings.launch_wsjtx_with_autopilot and not self._connected:
+            self.error.emit("WSJT-X est en cours de démarrage : attends sa connexion avant d’armer AutoPilot")
             return
         control = self._runtime.control
         if not isinstance(control, WsjtxUdpControl):
@@ -491,6 +499,13 @@ class BackendWorker(QObject):
 
         engine = DecisionEngine(config, worked_lookup, self._scorer, self._on_engine_event, cq_eligibility)
         self._listener = UdpListener(config.bind_address, config.udp_port, timeout=0)
+        wsjtx_launch = self._wsjtx_process.reconcile(
+            self._settings.launch_wsjtx_with_autopilot,
+            self._settings.wsjtx_executable_path,
+        )
+        LOGGER.info("[WSJTX] integrated lifecycle state=%s detail=%s", wsjtx_launch.state, wsjtx_launch.message)
+        if wsjtx_launch.state in {"unavailable", "failed"}:
+            self.error.emit(wsjtx_launch.message)
         control = WsjtxUdpControl(
             self._listener,
             config.stale_decode_seconds,
@@ -570,3 +585,4 @@ class BackendWorker(QObject):
             control.disarm(reason, source=source)
         else:
             control.disarm(reason)
+
