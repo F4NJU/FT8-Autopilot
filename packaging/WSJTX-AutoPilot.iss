@@ -8,7 +8,7 @@
 [Setup]
 AppId={{F8C1E36B-D6B9-40A2-A9D0-76B0C2AB89B8}
 AppName=WSJTX AutoPilot
-AppVersion=1.0.2
+AppVersion=1.0.3
 AppPublisher=F4NJU
 DefaultDirName={autopf}\WSJTX-AutoPilot
 DefaultGroupName=WSJTX AutoPilot

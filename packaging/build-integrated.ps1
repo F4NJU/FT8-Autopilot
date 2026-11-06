@@ -15,7 +15,9 @@ $env:FT8_REQUIRE_AP1_BUNDLE = '1'
 
 Push-Location $projectRoot
 try {
-    py -m PyInstaller -y packaging\wsjtx-autopilot.spec
+    # Always discard PyInstaller's analysis cache: it includes the embedded
+    # build metadata, which must match the version being released.
+    py -m PyInstaller --clean -y packaging\wsjtx-autopilot.spec
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 }
 finally {
