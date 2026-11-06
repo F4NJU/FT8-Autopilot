@@ -8,7 +8,7 @@
 [Setup]
 AppId={{F8C1E36B-D6B9-40A2-A9D0-76B0C2AB89B8}
 AppName=WSJTX AutoPilot
-AppVersion=1.0.3
+AppVersion=1.0.4
 AppPublisher=F4NJU
 DefaultDirName={autopf}\WSJTX-AutoPilot
 DefaultGroupName=WSJTX AutoPilot
@@ -31,4 +31,4 @@ Name: "{autodesktop}\WSJTX AutoPilot"; Filename: "{app}\WSJTX-AutoPilot.exe"; Ta
 Name: "desktopicon"; Description: "Créer un raccourci sur le bureau"; Flags: unchecked
 
 [Run]
-Filename: "{app}\WSJTX-AutoPilot.exe"; Description: "Lancer WSJTX AutoPilot"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\WSJTX-AutoPilot.exe"; Description: "Lancer WSJTX AutoPilot"; Flags: nowait

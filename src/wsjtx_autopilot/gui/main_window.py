@@ -1569,17 +1569,23 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Mise à jour vérifiée",
-            "La somme SHA-256 est correcte. AutoPilot va se fermer, puis l'installateur va démarrer. Continuer ?",
+            "La somme SHA-256 est correcte. AutoPilot va se fermer, s'installer discrètement, puis redémarrer. Continuer ?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )
         if answer != QMessageBox.StandardButton.Yes:
             self.statusBar().showMessage("Installateur vérifié, prêt lorsque tu cliqueras à nouveau sur MISE À JOUR.", 8_000)
             return
-        if not QProcess.startDetached(str(path), ["/SP-", "/CLOSEAPPLICATIONS"]):
+        installer_arguments = [
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS",
+        ]
+        if not QProcess.startDetached(str(path), installer_arguments):
             QMessageBox.critical(self, "Mise à jour", "Impossible de démarrer l'installateur vérifié.")
             return
-        self.statusBar().showMessage("Installateur lancé : arrêt d'AutoPilot…")
+        self.statusBar().showMessage("Mise à jour silencieuse lancée : arrêt d'AutoPilot…")
         QTimer.singleShot(0, self.close)
 
     def _restart_special_refresh_timer(self) -> None:
