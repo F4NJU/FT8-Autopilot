@@ -29,6 +29,7 @@ from wsjtx_autopilot.wsjtx.models import (
     QsoLoggedPacket,
     StatusPacket,
     TxAudioAttenuationStatePacket,
+    TuneStatePacket,
     WsjtxPacket,
 )
 from wsjtx_autopilot.worked.service import WorkedTodayService
@@ -49,6 +50,8 @@ _SWR_RX_CONFIRM_TIMEOUT = timedelta(seconds=5)
 _WATCHDOG_HALT_CONFIRM_TIMEOUT = timedelta(seconds=2)
 _SWR_AUTOMATIC_RECOVERY_ENABLED = True
 _MINIMUM_DXCC_MQTT_PATH_PROBABILITY = 55
+_ATU100_TUNE_ACK_TIMEOUT = timedelta(seconds=3)
+_ATU100_TUNE_DURATION = timedelta(seconds=5)
 
 # The normal FT8 watering holes are defined in DEFAULT_BAND_PROFILES.  These
 # additional dial frequencies are the conventional DXpedition / secondary FT8
@@ -164,6 +167,17 @@ class PendingWatchdogHalt:
 
 
 @dataclass(slots=True)
+class PendingAtu100Tune:
+    """A bounded AP1 Tune carrier requested after a confirmed band change."""
+
+    instance_id: str
+    band: str
+    ack_deadline: datetime
+    stop_at: datetime | None = None
+    active_confirmed: bool = False
+
+
+@dataclass(slots=True)
 class SwrRecovery:
     phase: str
     origin_band: str | None
@@ -257,6 +271,7 @@ class AutopilotRuntime:
         self._pending_alc_profile_band: str | None = None
         self.last_hamlib_alc: float | None = None
         self.last_hamlib_swr: float | None = None
+        self.last_hamlib_swr_protection = "uncertain"
         self.last_hamlib_power_watts: float | None = None
         self.last_hamlib_requested_power_watts: float | None = None
         self.last_qso_notice = ""
@@ -274,6 +289,7 @@ class AutopilotRuntime:
         self._pending_ftx1_band_change: PendingDialFrequency | None = None
         self._pending_ftx1_profile_apply: PendingDialFrequency | None = None
         self._blocked_band_drive_change: PendingDialFrequency | None = None
+        self._pending_atu100_tune: PendingAtu100Tune | None = None
         self.ftx1_band_drive = ftx1_band_drive
         direct_ftx1_allowed = config.ftx1_cat2_confirmed_ftx1 and not config.ftx1_hamlib_enabled
         if self.ftx1_band_drive is None and config.ftx1_cat2_enabled and (config.ftx1_hamlib_enabled or direct_ftx1_allowed):
@@ -736,6 +752,8 @@ class AutopilotRuntime:
             self._observe_tx_audio_attenuation(packet.attenuation, now)
             self._finish_pending_ftx1_profile_apply(now)
             self._complete_pending_ftx1_band_change(now)
+        elif isinstance(packet, TuneStatePacket):
+            self._observe_atu100_tune_state(packet, now)
         elif isinstance(packet, StatusPacket):
             was_transmitting = self.status.transmitting
             period = _tr_period_seconds(packet.tr_period)
@@ -869,6 +887,7 @@ class AutopilotRuntime:
         self._expire_tx_audio_attenuation_request(now)
         self._query_tx_audio_attenuation_if_needed(self._attenuation_query_instance_id, now)
         self._complete_pending_ftx1_band_change(now)
+        self._run_pending_atu100_tune(now)
         if self._hunt_active:
             self._run_hunt(now)
         else:
@@ -1465,6 +1484,8 @@ class AutopilotRuntime:
             self._band_resume_band = pending.band
             LOGGER.info("[BAND] SWR recovery confirmed=%s without retune", pending.band)
             return
+        if self._begin_atu100_tune_after_band_change(pending, now):
+            return
         if pending.source == "forced":
             self._start_forced_band_hop_dwell(pending.band, now)
             settle_seconds = self.config.forced_band_hop_settle_seconds
@@ -1476,6 +1497,75 @@ class AutopilotRuntime:
             self._band_resume_at = now + timedelta(seconds=period_seconds or 15)
             self._band_resume_band = None
         LOGGER.info("[BAND] confirmed=%s", pending.band)
+
+    def _begin_atu100_tune_after_band_change(self, pending: PendingDialFrequency, now: datetime) -> bool:
+        """Request a short, acknowledged AP1 Tune carrier for an external ATU-100.
+
+        This deliberately controls only the WSJT-X Tune generator: the tuner is
+        external and receives no CAT command from AutoPilot.
+        """
+        if not self.config.atu100_tune_on_band_change or not self.ap1_controls_available:
+            return False
+        if self.status.transmitting or not pending.instance_id:
+            LOGGER.warning("[ATU-100] Tune skipped band=%s transmitting=%s", pending.band, self.status.transmitting)
+            return False
+        if not self.control.set_tune(pending.instance_id, True):
+            self.last_qso_notice = f"ATU-100 Tune refused on {pending.band}"
+            LOGGER.warning("[ATU-100] Tune request rejected band=%s", pending.band)
+            return False
+        self._pending_atu100_tune = PendingAtu100Tune(
+            pending.instance_id,
+            pending.band,
+            now + _ATU100_TUNE_ACK_TIMEOUT,
+        )
+        # Keep QSO selection paused until the short carrier has finished.
+        self._band_resume_at = now + _ATU100_TUNE_ACK_TIMEOUT + _ATU100_TUNE_DURATION
+        self._band_resume_band = pending.band
+        self.last_qso_notice = f"ATU-100 Tune requested on {pending.band}"
+        LOGGER.info("[ATU-100] Tune requested after confirmed band change band=%s", pending.band)
+        return True
+
+    def _observe_atu100_tune_state(self, packet: TuneStatePacket, now: datetime) -> None:
+        pending = self._pending_atu100_tune
+        if pending is None or packet.header.instance_id != pending.instance_id:
+            return
+        if packet.active:
+            pending.active_confirmed = True
+            pending.stop_at = now + _ATU100_TUNE_DURATION
+            self.last_qso_notice = f"ATU-100 Tune active on {pending.band}"
+            LOGGER.info("[ATU-100] Tune active confirmed band=%s", pending.band)
+            return
+        if pending.active_confirmed:
+            self._finish_atu100_tune(now, "stopped by AP1")
+
+    def _run_pending_atu100_tune(self, now: datetime) -> None:
+        pending = self._pending_atu100_tune
+        if pending is None:
+            return
+        if not pending.active_confirmed:
+            if now > pending.ack_deadline:
+                self._pending_atu100_tune = None
+                self.last_qso_notice = f"ATU-100 Tune unconfirmed on {pending.band}; protection SWR uncertain"
+                self._band_resume_at = now + timedelta(seconds=self.status.period or 15)
+                self._band_resume_band = pending.band
+                LOGGER.warning("[ATU-100] Tune confirmation timeout band=%s", pending.band)
+            return
+        if pending.stop_at is not None and now >= pending.stop_at:
+            if not self.control.set_tune(pending.instance_id, False):
+                self.last_qso_notice = f"ATU-100 Tune stop refused on {pending.band}; AutoPilot paused"
+                LOGGER.error("[ATU-100] Tune stop request rejected band=%s", pending.band)
+                return
+            self._finish_atu100_tune(now, "carrier completed")
+
+    def _finish_atu100_tune(self, now: datetime, detail: str) -> None:
+        pending = self._pending_atu100_tune
+        if pending is None:
+            return
+        self._pending_atu100_tune = None
+        self._band_resume_at = now + timedelta(seconds=self.status.period or 15)
+        self._band_resume_band = pending.band
+        self.last_qso_notice = f"ATU-100 Tune complete on {pending.band} ({detail})"
+        LOGGER.info("[ATU-100] Tune complete band=%s detail=%s", pending.band, detail)
 
     def _requires_band_drive_restore(self, pending: PendingDialFrequency) -> bool:
         # A safety recovery must never wait on a WSJT-X audio profile: the
@@ -1660,8 +1750,12 @@ class AutopilotRuntime:
         read_power = getattr(cat, "read_power", None)
         read_alc = getattr(cat, "read_alc", None)
         read_swr = getattr(cat, "read_swr", None)
+        swr_capability = getattr(cat, "swr_protection_capability", None)
         power = read_power() if callable(read_power) else None
         alc = read_alc() if callable(read_alc) else None
+        self.last_hamlib_swr_protection = (
+            str(swr_capability()) if callable(swr_capability) else "numeric" if callable(read_swr) else "uncertain"
+        )
         swr = read_swr() if callable(read_swr) else None
         self.last_hamlib_power_watts = float(power) if power is not None else None
         self.last_hamlib_alc = float(alc) if alc is not None else None
@@ -2132,6 +2226,7 @@ class AutopilotRuntime:
                 self._pending_dial_frequency,
                 self._pending_ftx1_band_change,
                 self._pending_ftx1_profile_apply,
+                self._pending_atu100_tune,
                 self._blocked_band_drive_change,
             )
         )
@@ -2186,6 +2281,7 @@ class AutopilotRuntime:
                     ),
                     "alc": self.last_hamlib_alc,
                     "swr": self.last_hamlib_swr,
+                    "swr_protection": self.last_hamlib_swr_protection,
                     "power_watts": self.last_hamlib_power_watts,
                     "requested_power_watts": self.last_hamlib_requested_power_watts,
                     "swr_fault": self._hamlib_swr_fault_latched,

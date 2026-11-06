@@ -336,6 +336,9 @@ def test_ap1_controls_require_ap1_heartbeat_and_preserve_instance_session() -> N
     assert isinstance(dial, SetDialFrequencyPacket)
     assert dial.header.instance_id == "WSJT-X"
     assert dial.frequency_hz == 18_100_000
+    assert adapter.set_tune("WSJT-X", True)
+    tune = transport.sent[-1][0]
+    assert tune[8:12] == (24).to_bytes(4, "big")
 
 
 def test_ap1_controls_are_rejected_without_ap1_heartbeat() -> None:
@@ -345,6 +348,7 @@ def test_ap1_controls_are_rejected_without_ap1_heartbeat() -> None:
 
     assert not adapter.set_tx_period("WSJT-X", True)
     assert not adapter.set_dial_frequency("WSJT-X", 18_100_000)
+    assert not adapter.set_tune("WSJT-X", True)
     assert transport.sent == []
 
 

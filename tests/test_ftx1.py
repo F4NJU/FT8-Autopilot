@@ -6,7 +6,7 @@ from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.ftx1 import FTX1BandDriveController, FTX1CatController
 from wsjtx_autopilot.hamlib import HamlibFtx1Controller, list_supported_radios
 from wsjtx_autopilot.runtime import AutopilotRuntime, PendingDialFrequency
-from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, StatusPacket, TxAudioAttenuationStatePacket
+from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, StatusPacket, TuneStatePacket, TxAudioAttenuationStatePacket
 from wsjtx_autopilot.wsjtx.protocol import parse_datagram
 
 
@@ -115,6 +115,35 @@ class FakeHamlibCat(FakeCat):
         return False
 
 
+def test_hamlib_swr_capability_uses_only_advertised_numeric_level() -> None:
+    controller = HamlibFtx1Controller("COM4", 38_400, 0.1)
+    controller._identified = True
+    commands: list[str] = []
+
+    def command(value: str) -> str | None:
+        commands.append(value)
+        return "ALC RFPOWER" if value == "l ?" else None
+
+    controller._command = command  # type: ignore[method-assign]
+
+    assert controller.swr_protection_capability() == "uncertain"
+    assert controller.read_swr() is None
+    assert commands == ["l ?"]
+
+
+def test_hamlib_swr_capability_reads_numeric_swr_when_advertised() -> None:
+    controller = HamlibFtx1Controller("COM4", 38_400, 0.1)
+    controller._identified = True
+
+    def command(value: str) -> str | None:
+        return "SWR ALC" if value == "l ?" else "1.4"
+
+    controller._command = command  # type: ignore[method-assign]
+
+    assert controller.swr_protection_capability() == "numeric"
+    assert controller.read_swr() == 1.4
+
+
 class FakeTransport:
     def __init__(self) -> None:
         self.sent: list[tuple[bytes, tuple[str, int]]] = []
@@ -156,6 +185,28 @@ def test_band_change_uses_hamlib_frequency_instead_of_wsjtx_ap1() -> None:
     assert runtime._request_band_change("40m", 7_074_000, NOW, "adaptive")
     assert cat.frequency_requests == [7_074_000]
     assert transport.sent == []
+
+
+def test_atu100_tune_is_bounded_after_a_confirmed_band_change() -> None:
+    transport = FakeTransport()
+    runtime = AutopilotRuntime(
+        AppConfig(atu100_tune_on_band_change=True),
+        control=WsjtxUdpControl(transport, 15, None, armed=True),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    transport.sent.clear()
+    pending = PendingDialFrequency("WSJT-X", 7_074_000, "40m", NOW, "20m")
+
+    runtime._finish_band_change(pending, 15, NOW)
+
+    assert parse_datagram(transport.sent[-1][0]).header.packet_type == 24
+    runtime.handle(TuneStatePacket(PacketHeader(3, 25, "WSJT-X"), True), NOW, ENDPOINT)
+    runtime._run_pending_atu100_tune(NOW + timedelta(seconds=5))
+
+    assert parse_datagram(transport.sent[-1][0]).header.packet_type == 24
+    assert transport.sent[-1][0][-1] == 0
+    assert runtime._pending_atu100_tune is None
 
 
 def test_halt_tx_drops_hamlib_ptt_before_cancelling_wsjtx() -> None:

@@ -18,6 +18,7 @@ from .models import (
     SetTxPeriodPacket,
     SetDialFrequencyPacket,
     TxAudioAttenuationStatePacket,
+    TuneStatePacket,
     StatusPacket,
     UnknownPacket,
     WsjtxPacket,
@@ -296,6 +297,8 @@ def parse_datagram(data: bytes) -> WsjtxPacket:
         return SetDialFrequencyPacket(header, reader.u64())
     if packet_type == 23:
         return TxAudioAttenuationStatePacket(header, reader.u16())
+    if packet_type == 25:
+        return TuneStatePacket(header, reader.boolean())
     return UnknownPacket(header)
 
 
@@ -383,6 +386,19 @@ def serialize_set_tx_audio_attenuation(schema: int, instance_id: str, attenuatio
         raise ProtocolError("invalid TX audio attenuation")
     encoded_id = instance_id.encode("utf-8")
     return struct.pack(">III", MAGIC, schema, 21) + struct.pack(">I", len(encoded_id)) + encoded_id + struct.pack(">H", attenuation)
+
+
+def serialize_set_tune(schema: int, instance_id: str, active: bool) -> bytes:
+    """Serialize AP1's private Tune control (type 24)."""
+    if schema not in SUPPORTED_SCHEMAS:
+        raise ProtocolError("unsupported WSJT-X schema")
+    encoded_id = instance_id.encode("utf-8")
+    return (
+        struct.pack(">III", MAGIC, schema, 24)
+        + struct.pack(">I", len(encoded_id))
+        + encoded_id
+        + struct.pack(">B", int(active))
+    )
 
 
 def serialize_query_tx_audio_attenuation(schema: int, instance_id: str) -> bytes:

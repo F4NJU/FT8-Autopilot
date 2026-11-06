@@ -74,6 +74,7 @@ class AppConfig:
     ftx1_swr_protection_enabled: bool = True
     ftx1_swr_limit: float = 2.0
     ftx1_swr_trip_samples: int = 2
+    atu100_tune_on_band_change: bool = False
     ftx1_auto_apply_band_profiles: bool = False
     ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
     cty_dat_path: Path | None = None

@@ -103,6 +103,7 @@ class HamlibFtx1Controller:
         self.detected_radio_model = GENERIC_RADIO_NAME
         self.detected_cat_id: str | None = None
         self._ftx1_tuner_prefix: str | None = None
+        self._supported_get_levels: frozenset[str] | None = None
         self.last_identification_response: str | None = None
         self.last_frequency_response: str | None = None
         self.last_configured_power_response: str | None = None
@@ -263,6 +264,7 @@ class HamlibFtx1Controller:
         self.detected_radio_model = GENERIC_RADIO_NAME
         self.detected_cat_id = None
         self._ftx1_tuner_prefix = None
+        self._supported_get_levels = None
 
     def identify(self) -> bool:
         if self._identified:
@@ -371,7 +373,24 @@ class HamlibFtx1Controller:
         return self._read_level("ALC")
 
     def read_swr(self) -> float | None:
+        if self.swr_protection_capability() != "numeric":
+            return None
         return self._read_level("SWR")
+
+    def swr_protection_capability(self) -> str:
+        """Return the safety feedback genuinely exposed by this Hamlib backend.
+
+        ``numeric`` is the only generic, threshold-capable mode.  Hamlib does
+        not standardize a radio's vendor-specific high-SWR alarm, so all other
+        rigs stay explicitly ``uncertain`` until a tested adapter is added.
+        """
+        if not self.identify():
+            return "unavailable"
+        if self._supported_get_levels is None:
+            response = self._command("l ?")
+            self._supported_get_levels = frozenset((response or "").upper().split())
+            LOGGER.info("[HAMLIB] supported get levels=%s", " ".join(sorted(self._supported_get_levels)) or "none")
+        return "numeric" if "SWR" in self._supported_get_levels else "uncertain"
 
     def read_power(self) -> float | None:
         return self._read_level("RFPOWER_METER_WATTS")

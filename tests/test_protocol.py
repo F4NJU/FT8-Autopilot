@@ -13,6 +13,7 @@ from wsjtx_autopilot.wsjtx.models import (
     StatusPacket,
     SetTxPeriodPacket,
     SetDialFrequencyPacket,
+    TuneStatePacket,
     TxAudioAttenuationStatePacket,
     UnknownPacket,
 )
@@ -24,6 +25,7 @@ from wsjtx_autopilot.wsjtx.protocol import (
     serialize_reply,
     serialize_set_tx_period,
     serialize_set_dial_frequency,
+    serialize_set_tune,
 )
 
 
@@ -241,6 +243,27 @@ def test_serializes_ap1_tx_audio_attenuation() -> None:
 
     assert data.endswith(b"\x00\xdc")
     assert data[8:12] == (21).to_bytes(4, "big")
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_serializes_ap1_set_tune(active: bool) -> None:
+    data = serialize_set_tune(3, "WSJT-X", active)
+
+    assert data == (
+        struct.pack(">III", MAGIC, 3, 24)
+        + qbytearray("WSJT-X")
+        + bytes([active])
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_parses_ap1_tune_state(active: bool) -> None:
+    data = struct.pack(">III", MAGIC, 3, 25) + qbytearray("WSJT-X") + bytes([active])
+
+    packet = parse_datagram(data)
+
+    assert isinstance(packet, TuneStatePacket)
+    assert packet.active is active
 
 
 @pytest.mark.parametrize("attenuation", [0, 125, 450])

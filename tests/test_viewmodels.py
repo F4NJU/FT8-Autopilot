@@ -12,6 +12,7 @@ from wsjtx_autopilot.engine.models import (
 )
 from wsjtx_autopilot.gui.viewmodels import CandidateRow, StatusView
 from wsjtx_autopilot.runtime import WsjtxStatus
+from wsjtx_autopilot.wsjtx.models import PacketHeader, QsoLoggedPacket
 
 
 def test_candidate_view_exposes_score_explanation() -> None:
@@ -43,3 +44,35 @@ def test_status_view_formats_radio_state() -> None:
     assert status.frequency == "14.074000 MHz"
     assert status.mode == "FT8"
     assert status.tx_state == "TX ENABLED"
+
+
+def test_session_map_point_keeps_only_qso_logged_details() -> None:
+    packet = QsoLoggedPacket(
+        PacketHeader(3, 5, "wsjtx"),
+        datetime(2026, 11, 5, 18, 42, tzinfo=timezone.utc),
+        "EA7CTA",
+        "IM87",
+        14_074_000,
+        "FT8",
+        "-10",
+        "-08",
+        "",
+        "",
+        datetime(2026, 11, 5, 18, 40, tzinfo=timezone.utc),
+        "F4NJU",
+        "F4NJU",
+        "JN19",
+        "",
+        "",
+        "",
+        "",
+    )
+
+    from wsjtx_autopilot.gui.viewmodels import SessionQsoMapPoint
+
+    point = SessionQsoMapPoint.from_qso_logged(packet, "20m")
+
+    assert point.callsign == "EA7CTA"
+    assert point.grid == "IM87"
+    assert point.band == "20m"
+    assert point.logged_at == packet.time_off

@@ -104,6 +104,7 @@ class UserSettings:
     ftx1_swr_protection_enabled: bool = True
     ftx1_swr_limit: float = 2.0
     ftx1_swr_trip_samples: int = 2
+    atu100_tune_on_band_change: bool = False
     ftx1_auto_apply_band_profiles: bool = False
     ftx1_band_profiles: dict[str, dict[str, int]] = field(default_factory=dict)
     discord_presence_enabled: bool = True
@@ -196,6 +197,7 @@ class UserSettings:
         self.ftx1_swr_protection_enabled = self.ftx1_swr_protection_enabled is True
         self.ftx1_swr_limit = max(1.1, min(5.0, float(self.ftx1_swr_limit)))
         self.ftx1_swr_trip_samples = max(1, min(10, int(self.ftx1_swr_trip_samples)))
+        self.atu100_tune_on_band_change = self.atu100_tune_on_band_change is True
         self.ftx1_auto_apply_band_profiles = self.ftx1_auto_apply_band_profiles is True
         raw_band_profiles = self.ftx1_band_profiles if isinstance(self.ftx1_band_profiles, dict) else {}
         self.ftx1_band_profiles = {
@@ -272,6 +274,7 @@ class UserSettings:
             ftx1_swr_protection_enabled=self.ftx1_swr_protection_enabled,
             ftx1_swr_limit=self.ftx1_swr_limit,
             ftx1_swr_trip_samples=self.ftx1_swr_trip_samples,
+            atu100_tune_on_band_change=self.atu100_tune_on_band_change,
             ftx1_auto_apply_band_profiles=self.ftx1_auto_apply_band_profiles,
             ftx1_band_profiles=deepcopy(self.ftx1_band_profiles),
             cty_dat_path=Path(self.cty_dat_path) if self.cty_dat_path else None,

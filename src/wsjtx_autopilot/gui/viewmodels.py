@@ -4,7 +4,7 @@ from datetime import datetime
 from wsjtx_autopilot.engine.models import Candidate, EngineEvent
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.runtime import WsjtxStatus
-from wsjtx_autopilot.wsjtx.models import DecodePacket
+from wsjtx_autopilot.wsjtx.models import DecodePacket, QsoLoggedPacket
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,3 +88,24 @@ class StatusView:
         frequency = "-" if status.dial_frequency is None else f"{status.dial_frequency / 1_000_000:.6f} MHz"
         tx_state = "TX" if status.transmitting else "TX ENABLED" if status.tx_enabled else "RX"
         return cls(frequency, status.mode or "-", status.dx_call or "-", tx_state, status.local_grid)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionQsoMapPoint:
+    """One WSJT-X QSOLogged event, retained only by the current GUI session."""
+
+    logged_at: datetime
+    callsign: str
+    grid: str
+    band: str
+    mode: str
+
+    @classmethod
+    def from_qso_logged(cls, packet: QsoLoggedPacket, band: str) -> "SessionQsoMapPoint":
+        return cls(
+            packet.time_off,
+            packet.dx_call.strip().upper() or "—",
+            packet.dx_grid.strip().upper(),
+            band,
+            packet.mode.strip().upper() or "—",
+        )

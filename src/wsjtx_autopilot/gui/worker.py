@@ -22,7 +22,7 @@ from wsjtx_autopilot.worked.sync import synchronize_adif
 from wsjtx_autopilot.worked.store import WorkedQsoStore
 from wsjtx_autopilot.wsjtx_process import WsjtxProcessManager
 
-from .viewmodels import ActivityRow, StatusView
+from .viewmodels import ActivityRow, SessionQsoMapPoint, StatusView
 
 LOGGER = logging.getLogger(__name__)
 CONNECTION_TIMEOUT_SECONDS = 45
@@ -43,6 +43,7 @@ class BackendWorker(QObject):
     ftx1_band_profiles_changed = Signal(object)
     hunt_changed = Signal(bool, str)
     rare_station_worked = Signal(str, str)
+    session_qso_logged = Signal(object)
     unconfirmed_dxcc_spotted = Signal(object)
     wavelog_lotw_changed = Signal(int, int, bool, str)
     diagnostics_changed = Signal(object)
@@ -361,6 +362,9 @@ class BackendWorker(QObject):
             packet = received.packet
             if isinstance(packet, DecodePacket):
                 self.activity_received.emit(ActivityRow.from_decode(packet, now))
+            if isinstance(packet, QsoLoggedPacket):
+                band = BandResolver().resolve(packet.tx_frequency) or "—"
+                self.session_qso_logged.emit(SessionQsoMapPoint.from_qso_logged(packet, band))
             if isinstance(packet, QsoLoggedPacket) and packet.dx_call.strip().upper() in self._special_calls:
                 band = BandResolver().resolve(packet.tx_frequency) or "—"
                 self.rare_station_worked.emit(packet.dx_call.strip().upper(), band)

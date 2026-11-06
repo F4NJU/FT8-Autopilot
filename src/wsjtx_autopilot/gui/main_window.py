@@ -59,7 +59,8 @@ from wsjtx_autopilot.updates import RELEASES_PAGE_URL, UpdateCheckResult, Update
 
 from .hunt import HuntPanel, PskReporterMqttPoller, SpaceWeatherPoller, SpecialCallPoller, WavelogLotwPoller
 from .updates import UpdateCheckPoller, UpdateDownloadPoller
-from .viewmodels import ActivityRow, CandidateRow, StatusView
+from .session_map import SessionQsoMapDialog
+from .viewmodels import ActivityRow, CandidateRow, SessionQsoMapPoint, StatusView
 from .worker import BackendWorker
 
 LOGGER = logging.getLogger(__name__)
@@ -176,6 +177,7 @@ class SettingsDialog(QDialog):
             ftx1_swr_protection_enabled=self.ftx1_swr_protection.isChecked(),
             ftx1_swr_limit=self.ftx1_swr_limit.value(),
             ftx1_swr_trip_samples=self.ftx1_swr_samples.value(),
+            atu100_tune_on_band_change=self.atu100_automatic_tune.isChecked(),
             ftx1_auto_apply_band_profiles=self.ftx1_alc_control.isChecked(),
             ftx1_band_profiles=self._settings.ftx1_band_profiles,
             discord_presence_enabled=self.discord_presence_enabled.isChecked(),
@@ -529,8 +531,15 @@ class SettingsDialog(QDialog):
         self.ftx1_swr_samples = QSpinBox()
         self.ftx1_swr_samples.setRange(1, 10)
         self.ftx1_swr_samples.setValue(self._settings.ftx1_swr_trip_samples)
+        self.atu100_automatic_tune = QCheckBox("ATU-100 : Tune après changement de bande")
+        self.atu100_automatic_tune.setToolTip(
+            "Demande une porteuse Tune à AP1 après une bascule de bande confirmée. "
+            "N'active pas une mesure SWR si le poste ne la fournit pas."
+        )
+        self.atu100_automatic_tune.setChecked(self._settings.atu100_tune_on_band_change)
         hamlib_form.addRow(self.ftx1_swr_protection)
         hamlib_form.addRow("SWR trip threshold", self.ftx1_swr_limit)
+        hamlib_form.addRow(self.atu100_automatic_tune)
         hamlib_form.addRow(QLabel("Les délais, intervalles et seuils internes sont gérés automatiquement."))
         layout.addWidget(hamlib_group)
 
@@ -724,6 +733,8 @@ class MainWindow(QMainWindow):
         self._available_update: UpdateRelease | None = None
         self._current_version = str(build_metadata().get("app_version", ""))
         self._local_grid = ""
+        self._session_qso_points: list[SessionQsoMapPoint] = []
+        self._session_map_dialog: SessionQsoMapDialog | None = None
         self.setWindowTitle("WSJTX AutoPilot")
         self.resize(1120, 700)
         self.setMinimumSize(820, 540)
@@ -768,6 +779,7 @@ class MainWindow(QMainWindow):
         self._worker.ftx1_band_profiles_changed.connect(self._update_ftx1_band_profiles)
         self._worker.hunt_changed.connect(self._show_hunt_state)
         self._worker.rare_station_worked.connect(self._add_rare_station_worked)
+        self._worker.session_qso_logged.connect(self._add_session_qso_map_point)
         self._worker.wavelog_lotw_changed.connect(self._show_wavelog_lotw_state)
         self._worker.diagnostics_changed.connect(self._show_session_diagnostics)
         self._worker.error.connect(self._show_error)
@@ -939,9 +951,13 @@ class MainWindow(QMainWindow):
         self.exclude_worked_history_action.setChecked(self._settings.exclude_previously_worked_calls)
         self.exclude_worked_history_action.setToolTip("Écarte une station présente dans l'historique ADIF/WSJT-X, même un autre jour ou sur une autre bande.")
         self.reply_options_button.setMenu(reply_menu)
+        self.session_map_button = QPushButton("CARTE QSO (0)")
+        self.session_map_button.setToolTip("Ouvre la carte des QSO journalisés pendant cette session AutoPilot.")
+        self.session_map_button.clicked.connect(self._show_session_qso_map)
         self.reply_mode_summary = QLabel()
         self.reply_mode_summary.setObjectName("infoText")
         reply_options.addWidget(self.reply_options_button)
+        reply_options.addWidget(self.session_map_button)
         reply_options.addWidget(self.reply_mode_summary, 1)
         reply_layout.addLayout(reply_options)
         diagnostics_panel = QFrame()
@@ -1247,6 +1263,26 @@ class MainWindow(QMainWindow):
         self.mode.setText(status.mode)
         self.tx_state.setText(status.tx_state)
         self._local_grid = status.local_grid
+        self._refresh_session_qso_map()
+
+    def _add_session_qso_map_point(self, point: object) -> None:
+        if not isinstance(point, SessionQsoMapPoint):
+            return
+        self._session_qso_points.append(point)
+        self.session_map_button.setText(f"CARTE QSO ({len(self._session_qso_points)})")
+        self._refresh_session_qso_map()
+
+    def _show_session_qso_map(self) -> None:
+        if self._session_map_dialog is None:
+            self._session_map_dialog = SessionQsoMapDialog(self)
+        self._refresh_session_qso_map()
+        self._session_map_dialog.show()
+        self._session_map_dialog.raise_()
+        self._session_map_dialog.activateWindow()
+
+    def _refresh_session_qso_map(self) -> None:
+        if self._session_map_dialog is not None:
+            self._session_map_dialog.set_snapshot(self._local_grid, tuple(self._session_qso_points))
 
     def _show_adaptive(self, snapshot: dict[str, object]) -> None:
         available = bool(snapshot["ap1_available"])
@@ -1337,14 +1373,21 @@ class MainWindow(QMainWindow):
                 if saved_att is not None
                 else "No profile"
             )
+            protection_labels = {
+                "numeric": "SWR mesuré",
+                "alarm": "alarme SWR",
+                "unavailable": "protection SWR indisponible",
+                "uncertain": "protection SWR incertaine",
+            }
+            protection_text = protection_labels.get(str(ftx1.get("swr_protection") or "uncertain"), "protection SWR incertaine")
             self.ftx1_status.setText(
                 f"{radio_model}: {'Connectée' if ftx1.get('connected') else 'Déconnectée'} | "
                 f"ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} | "
-                f"{power_text}ALC {float(ftx1['alc']):.2f} / SWR {float(ftx1['swr']):.1f} | {profile_text}"
+                f"{power_text}ALC {float(ftx1['alc']):.2f} / SWR {float(ftx1['swr']):.1f} | {protection_text} | {profile_text}"
                 if ftx1.get("alc") is not None and ftx1.get("swr") is not None
                 else
                 f"{radio_model}: {'Connectée' if ftx1.get('connected') else 'Déconnectée'} | "
-                f"ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} | {profile_text}"
+                f"ATT {ftx1.get('current_tx_audio_attenuation') if ftx1.get('current_tx_audio_attenuation') is not None else '—'} | {protection_text} | {profile_text}"
             )
             self.ftx1_status.setVisible(True)
             self.save_ftx1_current_band_profile_button.setVisible(False)

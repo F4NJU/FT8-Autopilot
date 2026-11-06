@@ -15,6 +15,7 @@ from wsjtx_autopilot.wsjtx.protocol import (
     serialize_reply,
     serialize_set_tx_period,
     serialize_set_dial_frequency,
+    serialize_set_tune,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -273,6 +274,22 @@ class WsjtxUdpControl:
             LOGGER.error("[CONTROL] SetDialFrequency failed partial send")
             return False
         LOGGER.info("[CONTROL] SetDialFrequency frequency=%d", frequency_hz)
+        return True
+
+    def set_tune(self, instance_id: str, active: bool) -> bool:
+        session = self._ap1_session(instance_id)
+        if session is None:
+            return False
+        try:
+            datagram = serialize_set_tune(session.schema, instance_id, active)
+            sent = self._transport.sendto(datagram, session.endpoint)
+        except (OSError, ProtocolError) as exc:
+            LOGGER.error("[CONTROL] SetTune failed error=%s", exc)
+            return False
+        if sent != len(datagram):
+            LOGGER.error("[CONTROL] SetTune failed partial send")
+            return False
+        LOGGER.info("[CONTROL] SetTune active=%s", active)
         return True
 
     def set_tx_audio_attenuation(self, instance_id: str, attenuation: int) -> bool:

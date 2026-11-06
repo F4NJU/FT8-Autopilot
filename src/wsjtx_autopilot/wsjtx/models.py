@@ -126,6 +126,14 @@ class TxAudioAttenuationStatePacket:
 
 
 @dataclass(frozen=True, slots=True)
+class TuneStatePacket:
+    """Private AP1 acknowledgement for an externally requested Tune carrier."""
+
+    header: PacketHeader
+    active: bool
+
+
+@dataclass(frozen=True, slots=True)
 class UnknownPacket:
     header: PacketHeader
 
@@ -141,5 +149,6 @@ WsjtxPacket = (
     | SetTxPeriodPacket
     | SetDialFrequencyPacket
     | TxAudioAttenuationStatePacket
+    | TuneStatePacket
     | UnknownPacket
 )

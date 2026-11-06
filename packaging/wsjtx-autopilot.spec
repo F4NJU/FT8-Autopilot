@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -17,12 +18,19 @@ try:
 except (OSError, subprocess.CalledProcessError):
     GIT_COMMIT = "unknown"
 BUILD_INFO_PATH = Path(tempfile.gettempdir()) / "ft8-autopilot-build-info.json"
+version_source = (PROJECT_ROOT / "src" / "wsjtx_autopilot" / "__init__.py").read_text(
+    encoding="utf-8"
+)
+version_match = re.search(r'^__version__\s*=\s*"([^"]+)"', version_source, re.MULTILINE)
+if version_match is None:
+    raise SystemExit("Unable to determine AutoPilot version from __init__.py")
+APP_VERSION = f"v{version_match.group(1)}"
 BUILD_INFO_PATH.write_text(
     json.dumps(
         {
             "app_version": os.environ.get("FT8_AUTOPILOT_VERSION")
             or os.environ.get("GITHUB_REF_NAME")
-            or "v1.0.0",
+            or APP_VERSION,
             "git_commit": os.environ.get("FT8_AUTOPILOT_GIT_COMMIT")
             or os.environ.get("GITHUB_SHA")
             or GIT_COMMIT,
@@ -51,11 +59,11 @@ def bundled_ap1_data() -> list[tuple[str, str]]:
         raise SystemExit("FT8_REQUIRE_AP1_BUNDLE=1 requires WSJTX_AP1_SOURCE_URL")
     notice = Path(tempfile.gettempdir()) / "AP1-SOURCE.txt"
     notice.write_text(
-        "Bundled FT8 engine: WSJT-X Improved / AP1\\n"
-        f"Runtime source directory: {runtime.name}\\n"
-        f"Corresponding source: {source_url or 'not bundled in this developer build'}\\n"
-        "AutoPilot AP1 changes: patches/wsjtx-3.2-direct-reply.patch in the AutoPilot source tree.\\n"
-        "Licence: GNU GPL version 3 or later.\\n",
+        "Bundled FT8 engine: WSJT-X Improved / AP1\n"
+        f"Runtime source directory: {runtime.name}\n"
+        f"Corresponding source: {source_url or 'not bundled in this developer build'}\n"
+        "AutoPilot AP1 changes: patches/wsjtx-3.2-direct-reply.patch in the AutoPilot source tree.\n"
+        "Licence: GNU GPL version 3 or later.\n",
         encoding="utf-8",
     )
     files = [
@@ -70,6 +78,10 @@ def bundled_ap1_data() -> list[tuple[str, str]]:
 DATA_FILES = [
     (str(BUILD_INFO_PATH), "."),
     (str(PROJECT_ROOT / "LICENSE"), "licenses"),
+    (
+        str(PROJECT_ROOT / "src" / "wsjtx_autopilot" / "gui" / "assets" / "naturalearth-110m-countries.geojson"),
+        "wsjtx_autopilot/gui/assets",
+    ),
     *bundled_ap1_data(),
 ]
 

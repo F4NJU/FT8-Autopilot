@@ -47,3 +47,7 @@ class DryRunControl:
     def set_dial_frequency(self, instance_id: str, frequency_hz: int) -> bool:
         LOGGER.info("[WOULD_ACTION] SET_DIAL_FREQUENCY instance=%s frequency=%d", instance_id, frequency_hz)
         return False
+
+    def set_tune(self, instance_id: str, active: bool) -> bool:
+        LOGGER.info("[WOULD_ACTION] SET_TUNE instance=%s active=%s", instance_id, active)
+        return False
