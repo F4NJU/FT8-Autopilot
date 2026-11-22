@@ -16,6 +16,14 @@ def test_runtime_config_keeps_alc_and_band_profile_options_independent() -> None
     assert config.ftx1_auto_apply_band_profiles
 
 
+def test_runtime_config_propagates_max_actions() -> None:
+    settings = UserSettings(max_actions=7)
+
+    config = settings.to_app_config(Path("worked.sqlite3"))
+
+    assert config.max_initiation_attempts == 7
+
+
 def test_legacy_alc_target_is_migrated_to_power_correlated_reference() -> None:
     settings = UserSettings(ftx1_alc_minimum=0.02, ftx1_alc_maximum=0.08)
 

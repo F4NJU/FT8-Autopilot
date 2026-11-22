@@ -7,7 +7,7 @@ import pytest
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.engine.decision import DecisionEngine
-from wsjtx_autopilot.engine.models import ActionOutcome, CandidateKind, CooldownKind, DecodeEvent, IntendedAction, OriginalDecode, StationMetadata, WorkedCheck
+from wsjtx_autopilot.engine.models import ActionOutcome, CooldownKind, DecodeEvent, IntendedAction, OriginalDecode, StationMetadata, WorkedCheck
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.scoring import CandidateScorer, ScoringPreferences
 from wsjtx_autopilot.engine.dxcc import StaticDxccResolver
@@ -86,7 +86,7 @@ def test_busy_station_is_temporarily_skipped_in_the_next_rx_period() -> None:
     assert cooldown.reason == "observed working K1ABC"
 
 
-def test_fresh_direct_call_overrides_passive_busy_cooldown() -> None:
+def test_fresh_direct_call_does_not_override_passive_busy_cooldown() -> None:
     app = engine(remote_busy_cooldown_seconds=180)
     app.note_station_working_other(event("K1ABC TA1SW -10", period=0))
 
@@ -96,10 +96,10 @@ def test_fresh_direct_call_overrides_passive_busy_cooldown() -> None:
         next_period,
     )
 
-    assert direct is not None
-    assert direct.station == "TA1SW"
-    assert direct.kind is CandidateKind.DIRECT_CALLER
-    assert app.cooldown_for("TA1SW", next_period) is None
+    assert direct is None
+    cooldown = app.cooldown_for("TA1SW", next_period)
+    assert cooldown is not None
+    assert cooldown.kind is CooldownKind.REMOTE_BUSY_OTHER_QSO
 
 
 def test_preflight_skips_selected_cq_when_fresher_decode_shows_other_qso() -> None:
@@ -181,11 +181,7 @@ def test_worked_direct_call_does_not_block_cq() -> None:
 
 @pytest.mark.parametrize(
     "cooldown_kind",
-    [
-        CooldownKind.STATION_RETRY,
-        CooldownKind.STALLED_QSO,
-        CooldownKind.REMOTE_RETURNED_TO_CQ,
-    ],
+    [CooldownKind.STATION_RETRY],
 )
 def test_direct_call_overrides_soft_cooldown_after_failed_attempt(
     cooldown_kind: CooldownKind,
@@ -230,6 +226,36 @@ def test_direct_call_overrides_soft_cooldown_after_failed_attempt(
     assert app.cooldown_for("YO2LFP", inbound_at) is None
     assert f"override soft blocker={cooldown_kind.name}" in caplog.text
     assert "candidate accepted station=YO2LFP" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "cooldown_kind",
+    [
+        CooldownKind.STALLED_QSO,
+        CooldownKind.REMOTE_BUSY_OTHER_QSO,
+        CooldownKind.REMOTE_RETURNED_TO_CQ,
+    ],
+)
+def test_direct_call_does_not_override_abandon_cooldown(cooldown_kind: CooldownKind) -> None:
+    app = engine(allow_dupes=True)
+    inbound_at = NOW + timedelta(seconds=135)
+    app._set_station_cooldown(  # type: ignore[attr-defined]
+        "YO2LFP",
+        NOW + timedelta(seconds=21),
+        300,
+        cooldown_kind,
+        "abandon cooldown",
+    )
+
+    direct = app.observe(
+        event("F4NJU YO2LFP -13", identity="inbound", observed_at=inbound_at),
+        inbound_at,
+    )
+
+    assert direct is None
+    cooldown = app.cooldown_for("YO2LFP", inbound_at)
+    assert cooldown is not None
+    assert cooldown.kind is cooldown_kind
 
 
 def test_exact_failed_yo2lfp_capture_never_selects_es3bh() -> None:

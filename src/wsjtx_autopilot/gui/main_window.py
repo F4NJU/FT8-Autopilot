@@ -178,7 +178,7 @@ class SettingsDialog(QDialog):
             ftx1_swr_limit=self.ftx1_swr_limit.value(),
             ftx1_swr_trip_samples=self.ftx1_swr_samples.value(),
             atu100_tune_on_band_change=self.atu100_automatic_tune.isChecked(),
-            ftx1_auto_apply_band_profiles=self.ftx1_alc_control.isChecked(),
+            ftx1_auto_apply_band_profiles=self.ftx1_auto_apply_band_profiles.isChecked(),
             ftx1_band_profiles=self._settings.ftx1_band_profiles,
             discord_presence_enabled=self.discord_presence_enabled.isChecked(),
             discord_application_id=self.discord_application_id.text().strip(),

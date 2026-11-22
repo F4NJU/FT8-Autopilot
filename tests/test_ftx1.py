@@ -662,6 +662,49 @@ def test_hamlib_identification_timeout_blocks_arm_when_swr_protection_is_enabled
     assert runtime.last_qso_notice.startswith("SWR SAFETY UNAVAILABLE")
 
 
+def test_uncertain_swr_capability_blocks_arm_when_swr_protection_is_enabled() -> None:
+    cat = FakeHamlibCat()
+    cat.identify = lambda: True  # type: ignore[attr-defined]
+    cat.swr_protection_capability = lambda: "uncertain"  # type: ignore[attr-defined]
+    transport = FakeTransport()
+    control = WsjtxUdpControl(transport, 15, None, armed=False)
+    runtime = AutopilotRuntime(
+        AppConfig(
+            ftx1_cat2_enabled=True,
+            ftx1_hamlib_enabled=True,
+            ftx1_swr_protection_enabled=True,
+        ),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+
+    assert not runtime.arm_control()
+    assert not control.armed
+    assert runtime.antenna_safety_level == "fault"
+    assert "numeric SWR measurement unavailable" in runtime.last_qso_notice
+
+
+def test_numeric_swr_capability_allows_arm_when_swr_protection_is_enabled() -> None:
+    cat = FakeHamlibCat()
+    cat.identify = lambda: True  # type: ignore[attr-defined]
+    cat.swr_protection_capability = lambda: "numeric"  # type: ignore[attr-defined]
+    transport = FakeTransport()
+    control = WsjtxUdpControl(transport, 15, None, armed=False)
+    runtime = AutopilotRuntime(
+        AppConfig(
+            ftx1_cat2_enabled=True,
+            ftx1_hamlib_enabled=True,
+            ftx1_swr_protection_enabled=True,
+        ),
+        control=control,
+        ftx1_band_drive=FTX1BandDriveController(cat),
+    )
+
+    assert runtime.arm_control()
+    assert control.armed
+    assert runtime.antenna_safety_level == "ok"
+
+
 def test_low_power_swr_sample_does_not_trip_protection() -> None:
     cat = FakeCat(35, alc=0.05, swr=9.9, power=0.0)
     transport = FakeTransport()

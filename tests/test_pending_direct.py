@@ -85,8 +85,8 @@ def test_pending_direct_overrides_soft_cooldown_when_promoted() -> None:
     engine.observe(event("F4NJU S51DD +01", df=1200, identity="pending"), NOW)
     engine._cooldowns["S51DD"] = StationCooldown(  # type: ignore[attr-defined]
         NOW + timedelta(minutes=5),
-        CooldownKind.STALLED_QSO,
-        "temporary stalled-QSO cooldown",
+        CooldownKind.STATION_RETRY,
+        "initiation cooldown",
     )
     assert engine.complete_qso("R5DT", "WSJT-X", "test completion")
     engine.observe(event("CQ SP9MOC JO90", df=1400, identity="cq"), NOW)
@@ -97,3 +97,23 @@ def test_pending_direct_overrides_soft_cooldown_when_promoted() -> None:
     assert action.station == "S51DD"
     assert action.reason == "PENDING_DIRECT_CALL"
     assert engine.cooldown_for("S51DD", NOW + timedelta(seconds=1)) is None
+
+
+def test_pending_direct_does_not_override_abandon_cooldown() -> None:
+    engine = active_engine()
+    engine.observe(event("F4NJU S51DD +01", df=1200, identity="pending"), NOW)
+    engine._cooldowns["S51DD"] = StationCooldown(  # type: ignore[attr-defined]
+        NOW + timedelta(minutes=5),
+        CooldownKind.STALLED_QSO,
+        "temporary stalled-QSO cooldown",
+    )
+    assert engine.complete_qso("R5DT", "WSJT-X", "test completion")
+    engine.observe(event("CQ SP9MOC JO90", df=1400, identity="cq"), NOW)
+
+    action = engine.decide(NOW + timedelta(seconds=1))
+
+    assert action is not None
+    assert action.station == "SP9MOC"
+    cooldown = engine.cooldown_for("S51DD", NOW + timedelta(seconds=1))
+    assert cooldown is not None
+    assert cooldown.kind is CooldownKind.STALLED_QSO

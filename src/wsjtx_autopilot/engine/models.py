@@ -146,12 +146,15 @@ class CooldownKind(Enum):
     REMOTE_RETURNED_TO_CQ = auto()
 
     def is_soft_for_direct_call(self) -> bool:
+        """Only local retry/ignore cooldowns may be cleared by a fresh direct call.
+
+        Abandon cooldowns protect the operator against a station that repeatedly
+        stalls a QSO, works somebody else, or returns to CQ.  They must stay
+        effective even when that station calls us again.
+        """
         return self in {
             CooldownKind.STATION_RETRY,
-            CooldownKind.STALLED_QSO,
             CooldownKind.TEMPORARY_IGNORE,
-            CooldownKind.REMOTE_BUSY_OTHER_QSO,
-            CooldownKind.REMOTE_RETURNED_TO_CQ,
         }
 
 

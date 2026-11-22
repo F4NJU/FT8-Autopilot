@@ -34,7 +34,13 @@ def decode(message: str, *, schema: int = 2, sequence: int = 0) -> DecodePacket:
     )
 
 
-def worker(tmp_path, monkeypatch, *, direct_patched: bool = False) -> BackendWorker:
+def worker(
+    tmp_path,
+    monkeypatch,
+    *,
+    direct_patched: bool = False,
+    max_actions: int = 1,
+) -> BackendWorker:
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
     backend = BackendWorker(
@@ -43,6 +49,7 @@ def worker(tmp_path, monkeypatch, *, direct_patched: bool = False) -> BackendWor
             allow_dupes=True,
             worked_store_path=str(tmp_path / "worked.sqlite3"),
             direct_reply_patched=direct_patched,
+            max_actions=max_actions,
         ),
     )
     backend._open_backend()
@@ -110,14 +117,14 @@ def test_gui_worker_opens_identified_ftx1_cat2_from_persisted_settings(tmp_path,
         backend._close_backend()
 
 
-def test_gui_arm_uses_same_unlimited_control_instance(tmp_path, monkeypatch) -> None:
+def test_gui_arm_uses_same_configured_control_instance(tmp_path, monkeypatch) -> None:
     backend = worker(tmp_path, monkeypatch)
     try:
         assert backend._runtime is not None
         control = backend._runtime.control
         assert isinstance(control, WsjtxUdpControl)
         assert not control.armed
-        assert control.max_actions is None
+        assert control.max_actions == 1
 
         backend.arm()
 
@@ -358,8 +365,8 @@ def test_gui_direct_call_sends_exact_reply_to_decode_source(tmp_path, monkeypatc
         backend._close_backend()
 
 
-def test_gui_control_remains_armed_after_ten_replies(tmp_path, monkeypatch) -> None:
-    backend = worker(tmp_path, monkeypatch)
+def test_gui_control_remains_armed_within_configured_action_budget(tmp_path, monkeypatch) -> None:
+    backend = worker(tmp_path, monkeypatch, max_actions=10)
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receiver.bind(("127.0.0.1", 0))
     endpoint = (str(receiver.getsockname()[0]), int(receiver.getsockname()[1]))
@@ -368,7 +375,7 @@ def test_gui_control_remains_armed_after_ten_replies(tmp_path, monkeypatch) -> N
         assert backend._runtime is not None
         control = backend._runtime.control
         assert isinstance(control, WsjtxUdpControl)
-        for index in range(10):
+        for index in range(9):
             original = OriginalDecode(
                 "WSJT-X",
                 2,
@@ -389,9 +396,52 @@ def test_gui_control_remains_armed_after_ten_replies(tmp_path, monkeypatch) -> N
             )
             assert outcome is ActionOutcome.SENT
 
-        assert control.actions_used == 10
-        assert control.max_actions is None
+        assert control.actions_used == 9
+        assert control.max_actions == 10
         assert control.armed
+    finally:
+        receiver.close()
+        backend._close_backend()
+
+
+def test_gui_control_disarms_when_default_action_budget_is_reached(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    caplog.set_level("INFO")
+    backend = worker(tmp_path, monkeypatch)
+    receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    receiver.bind(("127.0.0.1", 0))
+    endpoint = (str(receiver.getsockname()[0]), int(receiver.getsockname()[1]))
+    original = OriginalDecode(
+        "WSJT-X",
+        2,
+        time(12, 0),
+        -8,
+        0.2,
+        1200,
+        "~",
+        "CQ K0ABC FN31",
+        False,
+        True,
+        endpoint,
+    )
+    try:
+        backend.arm()
+        assert backend._runtime is not None
+        control = backend._runtime.control
+        assert isinstance(control, WsjtxUdpControl)
+        control.observe(decode(original.message), endpoint)
+        assert control.max_actions == 1
+        assert (
+            control.execute(
+                IntendedAction(ActionKind.CQ_REPLY, "K0ABC", "test", original, NOW),
+                NOW,
+            )
+            is ActionOutcome.SENT
+        )
+        assert control.actions_used == 1
+        assert not control.armed
+        assert "DISARM reason=action_limit_reached" in caplog.text
     finally:
         receiver.close()
         backend._close_backend()
@@ -597,6 +647,7 @@ def test_radio_preferences_use_hamlib_and_preserve_learned_profiles(monkeypatch)
     dialog.ftx1_cat2_port.setText("COM5")
     dialog.ftx1_cat2_baudrate.setValue(38_400)
     dialog.ftx1_alc_control.setChecked(True)
+    dialog.ftx1_auto_apply_band_profiles.setChecked(True)
     saved = dialog.settings()
 
     assert saved.ftx1_cat2_enabled
@@ -608,17 +659,21 @@ def test_radio_preferences_use_hamlib_and_preserve_learned_profiles(monkeypatch)
     assert saved.ftx1_band_profiles == profiles
 
 
-def test_profile_auto_apply_follows_alc_control() -> None:
+def test_profile_auto_apply_is_independent_from_alc_control() -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(UserSettings(), ap1_available=True)
 
     assert dialog.ftx1_alc_control.isChecked()
+    assert not dialog.ftx1_auto_apply_band_profiles.isChecked()
     dialog.ftx1_alc_control.setChecked(False)
     assert not dialog.settings().ftx1_auto_apply_band_profiles
-    dialog.ftx1_alc_control.setChecked(True)
-    saved = dialog.settings()
 
-    assert saved.ftx1_auto_apply_band_profiles
+    dialog.ftx1_alc_control.setChecked(True)
+    dialog.ftx1_auto_apply_band_profiles.setChecked(True)
+    assert dialog.settings().ftx1_auto_apply_band_profiles
+
+    dialog.ftx1_alc_control.setChecked(False)
+    assert dialog.settings().ftx1_auto_apply_band_profiles
 
 
 def test_manual_profile_table_is_hidden() -> None:

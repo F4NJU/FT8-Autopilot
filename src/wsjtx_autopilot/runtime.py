@@ -573,25 +573,34 @@ class AutopilotRuntime:
             and self.config.ftx1_hamlib_enabled
             and (self.config.ftx1_alc_control_enabled or self.config.ftx1_swr_protection_enabled)
         ):
-            radio_ready = bool(
-                self.ftx1_band_drive is not None
-                and self.ftx1_band_drive.cat.identify()
-            )
+            cat = self.ftx1_band_drive.cat if self.ftx1_band_drive is not None else None
+            radio_ready = bool(cat is not None and cat.identify())
+            swr_unavailable_reason: str | None = None
+            swr_unavailable_event: str | None = None
             if not radio_ready:
                 if self.config.ftx1_swr_protection_enabled:
-                    self.antenna_safety_level = "fault"
-                    self.last_qso_notice = (
-                        "SWR SAFETY UNAVAILABLE - Hamlib radio not ready - AutoPilot disarmed"
-                    )
-                    self._antenna_event(
-                        self._last_runtime_at or datetime.now(timezone.utc),
-                        "Armement refusé : protection SWR indisponible (Hamlib ne répond pas)",
-                    )
-                    self.control.disarm(
-                        "swr_protection_unavailable",
-                        source="AutopilotRuntime.arm_control",
-                    )
-                    return False
+                    swr_unavailable_reason = "Hamlib radio not ready"
+                    swr_unavailable_event = "Hamlib ne répond pas"
+            elif self.config.ftx1_swr_protection_enabled:
+                capability = getattr(cat, "swr_protection_capability", None)
+                if not (callable(capability) and capability() == "numeric"):
+                    swr_unavailable_reason = "numeric SWR measurement unavailable"
+                    swr_unavailable_event = "Hamlib ne fournit pas de mesure SWR numérique"
+            if swr_unavailable_reason is not None:
+                self.antenna_safety_level = "fault"
+                self.last_qso_notice = (
+                    f"SWR SAFETY UNAVAILABLE - {swr_unavailable_reason} - AutoPilot disarmed"
+                )
+                self._antenna_event(
+                    self._last_runtime_at or datetime.now(timezone.utc),
+                    f"Armement refusé : protection SWR indisponible ({swr_unavailable_event})",
+                )
+                self.control.disarm(
+                    "swr_protection_unavailable",
+                    source="AutopilotRuntime.arm_control",
+                )
+                return False
+            if not radio_ready:
                 LOGGER.warning(
                     "[HAMLIB] radio source unavailable during ARM; ALC monitoring will retry during TX"
                 )

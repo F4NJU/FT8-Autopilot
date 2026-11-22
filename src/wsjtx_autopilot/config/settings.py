@@ -224,7 +224,7 @@ class UserSettings:
             udp_port=self.udp_port,
             allow_dupes=self.allow_dupes,
             exclude_previously_worked_calls=self.exclude_previously_worked_calls,
-            max_initiation_attempts=1,
+            max_initiation_attempts=self.max_actions,
             wsjtx_direct_reply_patched=self.direct_reply_patched,
             worked_store_path=worked_store_path,
             wsjtx_log_path=Path(self.wsjtx_log_path) if self.wsjtx_log_path else None,

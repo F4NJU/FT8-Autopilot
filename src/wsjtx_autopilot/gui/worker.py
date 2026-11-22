@@ -513,7 +513,7 @@ class BackendWorker(QObject):
         control = WsjtxUdpControl(
             self._listener,
             config.stale_decode_seconds,
-            None,
+            config.max_initiation_attempts,
             self._paths.data_dir / "DISARM_AUTOPILOT",
             config.local_callsign,
             config.wsjtx_direct_reply_patched,
