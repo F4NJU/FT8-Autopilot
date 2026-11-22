@@ -5,6 +5,9 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
+from wsjtx_autopilot import __version__
 from wsjtx_autopilot.config import AppPaths, UserSettings
 from wsjtx_autopilot.logging_setup import (
     cleanup_logs,
@@ -32,7 +35,11 @@ def flush_logs() -> None:
         handler.flush()
 
 
-def test_configure_logging_creates_timestamped_session_with_metadata(tmp_path: Path) -> None:
+def test_configure_logging_creates_timestamped_session_with_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_version = f"v{__version__}-wip.5"
+    monkeypatch.setenv("FT8_AUTOPILOT_VERSION", expected_version)
     session = configure_logging(paths(tmp_path), now=NOW)
     logging.getLogger("test").info("[TEST] visible")
     flush_logs()
@@ -40,7 +47,7 @@ def test_configure_logging_creates_timestamped_session_with_metadata(tmp_path: P
     assert session.path.parent == tmp_path / "Local" / "FT8-AutoPilot" / "logs"
     assert session.path.name == "FT8-AutoPilot_2026-08-26_123456_789.log"
     content = session.path.read_text(encoding="utf-8")
-    assert "[APP] FT8-AutoPilot version=v1.0.1-wip.5" in content
+    assert f"[APP] FT8-AutoPilot version={expected_version}" in content
     assert "[APP] git_commit=" in content
     assert "[APP] build_time=" in content
     assert "[TEST] visible" in content

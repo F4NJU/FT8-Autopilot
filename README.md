@@ -147,8 +147,13 @@ sécurité sans exclure la bande.
 - **Smart TX** et la planification automatique du décalage TX ont été retirés ;
 - l'apprentissage automatique de drive a été retiré ;
 - AutoPilot ne modifie plus l'**USB MOD gain** ;
-- un changement de bande normal ne lance jamais d'accord automatique :
-  l'accord Hamlib est réservé à la récupération après un incident SWR ;
+- un changement de bande normal ne lance jamais d'accord automatique par
+  Hamlib : l'accord Hamlib est réservé à la récupération après un incident SWR ;
+- l'option expérimentale **ATU-100 : Tune après changement de bande**, désactivée
+  par défaut, demande une version d'AP1 avec les messages privés 24/25
+  (`SetTune` / `TuneState`). L'AP1 intégré à la v1.0.4 ne les contient pas :
+  l'option n'a donc aucun effet avec cette version. Sans accusé de réception,
+  AutoPilot attend un cycle de sécurité et reprend sans exclure la bande ;
 - un spot Internet (Hunt ou MQTT) ne déclenche jamais seul une émission : un
   Decode local WSJT-X reste obligatoire.
 

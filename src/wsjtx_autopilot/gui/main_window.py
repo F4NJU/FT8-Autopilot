@@ -533,8 +533,11 @@ class SettingsDialog(QDialog):
         self.ftx1_swr_samples.setValue(self._settings.ftx1_swr_trip_samples)
         self.atu100_automatic_tune = QCheckBox("ATU-100 : Tune après changement de bande")
         self.atu100_automatic_tune.setToolTip(
-            "Demande une porteuse Tune à AP1 après une bascule de bande confirmée. "
-            "N'active pas une mesure SWR si le poste ne la fournit pas."
+            "Expérimental, désactivé par défaut. Demande une porteuse Tune à AP1 "
+            "après une bascule de bande confirmée. Nécessite un AP1 avec les "
+            "messages privés 24/25 (SetTune/TuneState), absent de l'AP1 intégré "
+            "à la v1.0.4 : sans accusé, AutoPilot reprend après un cycle de "
+            "sécurité. N'active pas une mesure SWR si le poste ne la fournit pas."
         )
         self.atu100_automatic_tune.setChecked(self._settings.atu100_tune_on_band_change)
         hamlib_form.addRow(self.ftx1_swr_protection)
