@@ -81,7 +81,10 @@ jobs:
           python tools/release.py verify
           if ($LASTEXITCODE -ne 0) { throw 'Checksum verification failed' }
 
-          $bad = (Get-Content dist/SHA256SUMS.txt -Raw) -replace '^[0-9a-f]', '0'
+          [string]$checksumLine = [IO.File]::ReadAllLines((Resolve-Path dist/SHA256SUMS.txt))[0]
+          $first = $checksumLine[0]
+          $replacement = if ($first -eq '0') { '1' } else { '0' }
+          $bad = $replacement + $checksumLine.Substring(1)
           Set-Content dist/SHA256SUMS.txt -Value $bad -NoNewline
           python tools/release.py verify
           if ($LASTEXITCODE -eq 0) { throw 'Verification accepted a corrupted checksum' }
