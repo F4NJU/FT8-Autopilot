@@ -73,11 +73,12 @@ def test_missing_installer_is_rejected(tmp_path: Path) -> None:
         release_tools.write_checksums(tmp_path)
 
 
-def _artifact_tree(tmp_path: Path, version: str = __version__) -> Path:
+def _artifact_tree(tmp_path: Path, version: str = __version__, build_info_dir: Path = Path(".")) -> Path:
     bundle = tmp_path / release_tools.BUNDLE_NAME
-    bundle.mkdir()
+    build_info_folder = bundle / build_info_dir
+    build_info_folder.mkdir(parents=True)
     (bundle / release_tools.APP_EXE_NAME).write_bytes(b"exe payload")
-    (bundle / release_tools.BUILD_INFO_NAME).write_text(
+    (build_info_folder / release_tools.BUILD_INFO_NAME).write_text(
         json.dumps(
             {
                 "app_version": f"v{version}",
@@ -92,8 +93,11 @@ def _artifact_tree(tmp_path: Path, version: str = __version__) -> Path:
     return bundle
 
 
-def test_built_artifact_carries_the_source_version_and_a_valid_checksum(tmp_path: Path) -> None:
-    _artifact_tree(tmp_path)
+@pytest.mark.parametrize("build_info_dir", [Path("."), Path("_internal")])
+def test_built_artifact_carries_the_source_version_and_a_valid_checksum(
+    tmp_path: Path, build_info_dir: Path
+) -> None:
+    _artifact_tree(tmp_path, build_info_dir=build_info_dir)
 
     details = release_tools.check_artifact(tmp_path)
 

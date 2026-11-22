@@ -21,6 +21,9 @@ CHECKSUMS_NAME = "SHA256SUMS.txt"
 BUNDLE_NAME = "WSJTX-AutoPilot"
 APP_EXE_NAME = "WSJTX-AutoPilot.exe"
 BUILD_INFO_NAME = "ft8-autopilot-build-info.json"
+# PyInstaller 6 moved bundled data into ``_internal`` for one-folder builds;
+# older releases placed it at the bundle root.  Both layouts are valid inputs.
+BUILD_INFO_DIRS = (Path("_internal"), Path("."))
 _VERSION_ASSIGNMENT = re.compile(r'^__version__\s*=\s*"(\d+\.\d+\.\d+)"', re.MULTILINE)
 
 
@@ -95,12 +98,16 @@ def check_artifact(dist_dir: Path, installer_name: str = INSTALLER_NAME) -> dict
 
     bundle = dist_dir / BUNDLE_NAME
     executable = bundle / APP_EXE_NAME
-    build_info_path = bundle / BUILD_INFO_NAME
     checksums_path = dist_dir / CHECKSUMS_NAME
     if not executable.is_file():
         raise ReleaseError(f"Built executable not found: {executable}")
-    if not build_info_path.is_file():
-        raise ReleaseError(f"Build info not found: {build_info_path}")
+    build_info_path = next(
+        (bundle / folder / BUILD_INFO_NAME for folder in BUILD_INFO_DIRS if (bundle / folder / BUILD_INFO_NAME).is_file()),
+        None,
+    )
+    if build_info_path is None:
+        searched = ", ".join(str(bundle / folder / BUILD_INFO_NAME) for folder in BUILD_INFO_DIRS)
+        raise ReleaseError(f"Build info not found; searched {searched}")
     if not checksums_path.is_file():
         raise ReleaseError(f"Checksum file not found: {checksums_path}")
 
