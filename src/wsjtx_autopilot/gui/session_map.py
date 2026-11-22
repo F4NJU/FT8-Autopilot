@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import datetime, timezone
-from functools import lru_cache
 import json
+from collections import defaultdict
+from datetime import timezone
+from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from wsjtx_autopilot.engine.location import StationLocation, grid_to_location
+from wsjtx_autopilot.engine.location import grid_to_location
 
 from .viewmodels import SessionQsoMapPoint
 

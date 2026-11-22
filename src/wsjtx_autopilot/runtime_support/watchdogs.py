@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.engine.adaptive import AttemptOutcome
 from wsjtx_autopilot.engine.state import QsoState
+from wsjtx_autopilot.wsjtx.models import StatusPacket
 
 from .models import PendingWatchdogHalt
 

@@ -8,18 +8,18 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from wsjtx_autopilot.config import AppPaths, SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.discord_presence import DiscordPresencePublisher
-from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.cq import CqEligibility
+from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
 from wsjtx_autopilot.engine.models import EngineEvent, StationProfile
 from wsjtx_autopilot.engine.scoring import CandidateScorer, ScoringPreferences
 from wsjtx_autopilot.runtime import AutopilotRuntime, HuntRemoteSpot
+from wsjtx_autopilot.worked.bands import BandResolver
+from wsjtx_autopilot.worked.service import WorkedTodayService
+from wsjtx_autopilot.worked.store import WorkedQsoStore
+from wsjtx_autopilot.worked.sync import synchronize_adif
 from wsjtx_autopilot.wsjtx.listener import UdpListener
 from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, QsoLoggedPacket, StatusPacket
-from wsjtx_autopilot.worked.service import WorkedTodayService
-from wsjtx_autopilot.worked.bands import BandResolver
-from wsjtx_autopilot.worked.sync import synchronize_adif
-from wsjtx_autopilot.worked.store import WorkedQsoStore
 from wsjtx_autopilot.wsjtx_process import WsjtxProcessManager
 
 from .viewmodels import ActivityRow, SessionQsoMapPoint, StatusView

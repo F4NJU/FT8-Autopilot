@@ -7,49 +7,60 @@ from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.base import ControlAdapter, Endpoint
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
-from wsjtx_autopilot.engine.adaptive import AdaptiveState, AttemptOutcome, AttemptRecord, BandOpportunityTracker, StagnationTracker
+from wsjtx_autopilot.engine.adaptive import AdaptiveState, AttemptOutcome, BandOpportunityTracker, StagnationTracker
 from wsjtx_autopilot.engine.cq import CqEligibility
 from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.dxcc import CtyDatResolver, FallbackDxccResolver, PrefixDxccResolver
 from wsjtx_autopilot.engine.finalization import FinalizationTracker
 from wsjtx_autopilot.engine.location import StationLocatorCache, distance_and_bearing, grid_to_location
-from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, Candidate, CooldownKind, DecodeEvent, EngineEvent, EngineEventKind, IntendedAction, MessageKind, OriginalDecode, StationMetadata, StationProfile
+from wsjtx_autopilot.engine.models import (
+    Candidate,
+    CooldownKind,
+    DecodeEvent,
+    IntendedAction,
+    MessageKind,
+    OriginalDecode,
+    StationMetadata,
+    StationProfile,
+)
 from wsjtx_autopilot.engine.parser import parse_ft8_message
-from wsjtx_autopilot.engine.progress import QsoProgressStage
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.ftx1 import FTX1BandDriveController, FTX1CatController
 from wsjtx_autopilot.hamlib import HamlibFtx1Controller
 from wsjtx_autopilot.logging_setup import current_logging_session
+from wsjtx_autopilot.runtime_support.adaptive import AdaptiveMixin
+from wsjtx_autopilot.runtime_support.attenuation import AttenuationMixin
+from wsjtx_autopilot.runtime_support.atu100 import Atu100Mixin
+from wsjtx_autopilot.runtime_support.band_hop import BandHopMixin
+from wsjtx_autopilot.runtime_support.band_transitions import BandTransitionMixin
+from wsjtx_autopilot.runtime_support.constants import _tr_period_seconds
+from wsjtx_autopilot.runtime_support.decision import DecisionMixin
+from wsjtx_autopilot.runtime_support.frequencies import FrequencyPlanMixin
+from wsjtx_autopilot.runtime_support.hamlib_meters import HamlibMetersMixin
+from wsjtx_autopilot.runtime_support.hunt import HuntMixin
+from wsjtx_autopilot.runtime_support.models import (
+    HuntRemoteSpot,
+    HuntTarget,
+    PendingAtu100Tune,
+    PendingDialFrequency,
+    PendingWatchdogHalt,
+)
+from wsjtx_autopilot.runtime_support.swr import SwrRecovery, SwrRecoveryMixin
+from wsjtx_autopilot.runtime_support.watchdogs import _WATCHDOG_HALT_CONFIRM_TIMEOUT, WatchdogMixin
+from wsjtx_autopilot.worked.bands import BandResolver
+from wsjtx_autopilot.worked.service import WorkedTodayService
 from wsjtx_autopilot.wsjtx.models import (
     ClearPacket,
     DecodePacket,
     HeartbeatPacket,
     QsoLoggedPacket,
     StatusPacket,
-    TxAudioAttenuationStatePacket,
     TuneStatePacket,
+    TxAudioAttenuationStatePacket,
     WsjtxPacket,
 )
-from wsjtx_autopilot.worked.service import WorkedTodayService
-from wsjtx_autopilot.worked.bands import BandResolver
-from wsjtx_autopilot.runtime_support.atu100 import Atu100Mixin
-from wsjtx_autopilot.runtime_support.band_hop import BandHopMixin
-from wsjtx_autopilot.runtime_support.frequencies import FrequencyPlanMixin
-from wsjtx_autopilot.runtime_support.hamlib_meters import HamlibMetersMixin, _SWR_TUNE_MIN_RF_WATTS
-from wsjtx_autopilot.runtime_support.hunt import HuntMixin
-from wsjtx_autopilot.runtime_support.models import (
-    HuntRemoteSpot,
-    HuntTarget,
-    PendingAtu100Tune,
-    PendingWatchdogHalt,
-)
-from wsjtx_autopilot.runtime_support.watchdogs import WatchdogMixin, _WATCHDOG_HALT_CONFIRM_TIMEOUT
 
 LOGGER = logging.getLogger(__name__)
-_DECODE_MODE_MARKERS = {"~": "FT8", "+": "FT4"}
-_AUTOMATION_MODES = frozenset({"FT8", "FT4"})
-_ATTENUATION_QUERY_INTERVAL = timedelta(seconds=2)
-_UNKNOWN_TR_PERIOD = 0xFFFFFFFF
 _SWR_TUNE_TIMEOUT = timedelta(seconds=15)
 _SWR_TUNE_RF_START_TIMEOUT = timedelta(seconds=3)
 _SWR_TUNE_POLL_INTERVAL = timedelta(seconds=0.5)
@@ -60,19 +71,6 @@ _SWR_AUTOMATIC_RECOVERY_ENABLED = True
 _MINIMUM_DXCC_MQTT_PATH_PROBABILITY = 55
 
 
-
-def _tr_period_seconds(raw_period: int) -> int | None:
-    """Normalize the WSJT-X T/R period to whole seconds.
-
-    WSJT-X variants have emitted this field both as seconds (15) and as
-    milliseconds (15000).  Round millisecond values up so AutoPilot never
-    resumes in the middle of a transmit/receive period.
-    """
-    if raw_period == _UNKNOWN_TR_PERIOD or raw_period <= 0:
-        return None
-    if raw_period >= 1000:
-        return max(1, (raw_period + 999) // 1000)
-    return raw_period
 
 
 @dataclass(slots=True)
@@ -130,16 +128,6 @@ class SessionDiagnostics:
         }
 
 
-@dataclass(slots=True)
-class PendingDialFrequency:
-    instance_id: str
-    frequency_hz: int
-    band: str
-    deadline: datetime
-    previous_band: str | None
-    source: str = "adaptive"
-
-
 @dataclass(frozen=True, slots=True)
 class HaltTxResult:
     radio_ok: bool
@@ -147,25 +135,6 @@ class HaltTxResult:
     observed_ptt: bool | None = None
 
 
-
-@dataclass(slots=True)
-class SwrRecovery:
-    phase: str
-    origin_band: str | None
-    current_band: str | None
-    rx_deadline: datetime | None = None
-    original_power_fraction: float | None = None
-    tune_started_at: datetime | None = None
-    next_poll_at: datetime | None = None
-    seen_rf: bool = False
-    tuner_state_supported: bool = False
-    seen_tuning_state: bool = False
-    swr_samples: list[float] | None = None
-    tune_attempts: int = 0
-
-    def __post_init__(self) -> None:
-        if self.swr_samples is None:
-            self.swr_samples = []
 
 
 
@@ -177,6 +146,11 @@ class AutopilotRuntime(
     HamlibMetersMixin,
     BandHopMixin,
     WatchdogMixin,
+    AttenuationMixin,
+    SwrRecoveryMixin,
+    DecisionMixin,
+    BandTransitionMixin,
+    AdaptiveMixin,
 ):
     """Connect parsed WSJT-X packets to the dry-run decision engine."""
 
@@ -442,7 +416,6 @@ class AutopilotRuntime(
 
     def reset_swr_safety_and_rearm(self) -> bool:
         """Clear session SWR safety state and resume after an explicit operator reset."""
-        now = self._last_runtime_at or datetime.now(timezone.utc)
         if self.status.transmitting:
             self.last_qso_notice = "SWR RESET REFUSED - transmission active"
             LOGGER.warning("[ANTENNA-SAFETY] Réinitialisation refusée : émission encore active")
@@ -783,7 +756,6 @@ class AutopilotRuntime(
                 packet.message,
             )
             return None
-        band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency is not None else None
         parsed = parse_ft8_message(packet.message)
         if parsed is None:
             LOGGER.info("[ENGINE] type=ignored reason=ambiguous/free-text text=%s", packet.message)
@@ -1022,116 +994,6 @@ class AutopilotRuntime(
                     LOGGER.info("[ADAPT] New viable CQ %s; pending switch cancelled", parsed.sender)
         return candidate
 
-    def _try_rare_reply_from_decode(self, event: DecodeEvent, now: datetime) -> bool:
-        """Use WSJT-X's Reply command as a rare-station double click.
-
-        This is intentionally restricted to the explicit Reply rare-tracking
-        mode, a fresh local Decode, idle QSO state, and AP1/direct-Reply
-        capable WSJT-X.  The original Decode is forwarded unchanged.
-        """
-        parsed = event.parsed
-        if not (
-            self._remote_hunt_enabled
-            and self._rare_target_accepts(parsed.sender)
-            and parsed.kind in {MessageKind.DIRECTED, MessageKind.REPORT, MessageKind.R_REPORT}
-            and not parsed.is_addressed_to(self.config.local_callsign)
-            and self.engine.state.session.state is QsoState.IDLE
-            and not self.finalization.active
-            and event.original is not None
-        ):
-            return False
-        action = IntendedAction(ActionKind.RARE_REPLY, parsed.sender, "rare station local Decode", event.original, now)
-        outcome = self.control.execute(action, now)
-        if outcome is ActionOutcome.SENT:
-            self.engine.clear_candidates()
-            self.engine.state.start_station(event, now)
-            self.last_qso_notice = f"Rare station Reply sent: {parsed.sender}"
-            LOGGER.warning("[REPLY] rare double-click sent station=%s message=%s", parsed.sender, parsed.raw)
-        elif outcome is ActionOutcome.REJECTED_LOCAL:
-            LOGGER.info("[REPLY] rare double-click not available station=%s", parsed.sender)
-        return outcome is not ActionOutcome.REJECTED_LOCAL
-
-    def _can_preempt_unanswered_cq_attempt(self, event: DecodeEvent) -> bool:
-        blocker = self._direct_preemption_blocker(event)
-        if blocker is not None:
-            LOGGER.info(
-                "[DIRECT] preemption unavailable station=%s blocker=%s",
-                event.parsed.sender,
-                blocker,
-            )
-            return False
-        return True
-
-    def _direct_preemption_blocker(self, event: DecodeEvent) -> str | None:
-        session = self.engine.state.session
-        checks = (
-            (
-                not (self.ap1_controls_available or self.config.wsjtx_direct_reply_patched),
-                "AP1_DIRECT_REPLY_UNAVAILABLE",
-            ),
-            (not isinstance(self.control, WsjtxUdpControl), "CONTROL_NOT_UDP"),
-            (not getattr(self.control, "armed", False), "CONTROL_DISARMED"),
-            (not self.status.tx_enabled, "TX_DISABLED"),
-            (self.status.transmitting, "CURRENTLY_TRANSMITTING"),
-            (self.finalization.active, "FINALIZATION_ACTIVE"),
-            (self._pending_dial_frequency is not None, "DIAL_CHANGE_PENDING"),
-            (self._pending_ftx1_band_change is not None, "FTX1_BAND_CHANGE_PENDING"),
-            (self._pending_ftx1_profile_apply is not None, "FTX1_PROFILE_PENDING"),
-            (session.state is not QsoState.CALLING_STATION, f"QSO_STATE_{session.state.name}"),
-            (session.progress_stage is not QsoProgressStage.CALL_OR_GRID, "QSO_ALREADY_PROGRESSED"),
-            (event.original is None, "MISSING_ORIGINAL_DECODE"),
-            (event.parsed.sender == session.remote_callsign, "CURRENT_REMOTE"),
-        )
-        for blocked, reason in checks:
-            if blocked:
-                return reason
-        assert event.original is not None
-        if session.instance_id != event.original.instance_id:
-            return "DECODE_INSTANCE_MISMATCH"
-        if self.status.instance_id != session.instance_id:
-            return "STATUS_INSTANCE_MISMATCH"
-        if session.frequency != self.status.dial_frequency:
-            return "FREQUENCY_MISMATCH"
-        if session.mode != event.mode:
-            return "MODE_MISMATCH"
-        if self.status.dx_call.upper() != session.remote_callsign:
-            return "WSJTX_TARGET_MISMATCH"
-        previous = parse_ft8_message(session.last_message or "")
-        if previous is None or previous.kind not in {MessageKind.CQ, MessageKind.QRZ}:
-            return "CURRENT_QSO_HAS_REMOTE_EXCHANGE"
-        maximum = self.control.max_actions
-        if maximum is not None and self.control.actions_used >= maximum:
-            return "ACTION_LIMIT_REACHED"
-        return None
-
-    def _log_rejected_direct_packet(self, packet: DecodePacket, blocker: str) -> None:
-        parsed = parse_ft8_message(packet.message)
-        if parsed is None or not parsed.is_addressed_to(self.config.local_callsign):
-            return
-        LOGGER.info("[DIRECT] received station=%s df=%d", parsed.sender, packet.delta_frequency)
-        LOGGER.info("[DIRECT] hard_blockers=[%s]", blocker)
-        LOGGER.info("[DIRECT] soft_blockers=[]")
-        LOGGER.info("[DIRECT] rejected station=%s blocker=%s", parsed.sender, blocker)
-
-    def _execute_action(self, action: IntendedAction, now: datetime) -> None:
-        if not self.engine.preflight_action(action):
-            self.last_qso_notice = f"Reply skipped - {action.station} is already working another station"
-            return
-        outcome = self.control.execute(action, now)
-        LOGGER.info("[RUNTIME] control outcome=%s station=%s", outcome.name, action.station)
-        self.engine.record_action_outcome(action, outcome, now)
-        if outcome is ActionOutcome.SENT:
-            self.session_diagnostics.replies_sent += 1
-            self.session_diagnostics.note(f"Reply envoyé : {action.station}")
-            self.last_qso_notice = ""
-            self._watchdog_halt_failed = False
-        elif outcome is ActionOutcome.REJECTED_LOCAL:
-            self.session_diagnostics.local_rejections += 1
-            self.session_diagnostics.note(f"Reply refusé par WSJT-X : {action.station}")
-        elif outcome is ActionOutcome.FAILED:
-            self.session_diagnostics.control_failures += 1
-            self.session_diagnostics.note(f"Échec d'envoi Reply : {action.station}")
-
     def _observe_finalization_status(
         self,
         packet: StatusPacket,
@@ -1182,286 +1044,6 @@ class AutopilotRuntime(
             LOGGER.error("[CONTROL] SetTxPeriod validation failed requested=%s observed=%s", self.requested_tx_period, observed)
             self.requested_tx_period = None
 
-    def _confirm_dial_frequency(self, packet: StatusPacket, now: datetime) -> None:
-        pending = self._pending_dial_frequency
-        if pending is None or packet.header.instance_id != pending.instance_id:
-            return
-        if packet.dial_frequency != pending.frequency_hz:
-            return
-        self._pending_dial_frequency = None
-        if pending.source == "forced":
-            LOGGER.info("[BAND-HOP] Frequency confirmed: %s / %.3f MHz", pending.band, pending.frequency_hz / 1_000_000)
-            if self.ftx1_band_drive is None or not self.config.ftx1_auto_apply_band_profiles:
-                self._block_for_unready_band_drive(pending, "automatic per-band drive profiles are unavailable")
-                return
-        if self._requires_band_drive_restore(pending):
-            self._pending_ftx1_band_change = pending
-            self._complete_pending_ftx1_band_change(now)
-            return
-        self._finish_band_change(pending, _tr_period_seconds(packet.tr_period), now)
-
-    def _observe_manual_band_change(self, packet: StatusPacket, now: datetime) -> None:
-        band = BandResolver().resolve(packet.dial_frequency)
-        previous_band = self._last_reported_band
-        self._last_reported_band = band
-        if (
-            band is None
-            or previous_band is None
-            or band == previous_band
-            or self._pending_dial_frequency is not None
-            or self._pending_ftx1_band_change is not None
-            or self._pending_ftx1_profile_apply is not None
-            or self.status.transmitting
-            or self.ftx1_band_drive is None
-            or not self.config.ftx1_auto_apply_band_profiles
-        ):
-            return
-        if band.lower() not in self.ftx1_band_drive.profiles:
-            LOGGER.info("[DRIVE] No saved drive profile for manually selected %s", band)
-            return
-        LOGGER.info("[DRIVE] Manual band change detected: restoring saved drive profile for %s", band)
-        self._pending_ftx1_band_change = PendingDialFrequency(
-            packet.header.instance_id,
-            packet.dial_frequency,
-            band,
-            now + timedelta(seconds=self.config.dial_change_confirmation_timeout_seconds),
-            previous_band,
-            "manual",
-        )
-        self._complete_pending_ftx1_band_change(now)
-
-    def _complete_pending_ftx1_band_change(self, now: datetime) -> None:
-        pending = self._pending_ftx1_band_change
-        if pending is None or self.status.transmitting:
-            return
-        assert self.ftx1_band_drive is not None
-        if pending.band.lower() not in self.ftx1_band_drive.profiles:
-            self._pending_ftx1_band_change = None
-            if pending.source == "forced":
-                self._block_for_unready_band_drive(pending, "no saved destination drive profile")
-                return
-            self.ftx1_band_drive.apply_profile(pending.band, self.current_tx_audio_attenuation)
-            self._finish_band_change(pending, self.status.period, now)
-            return
-        if self.current_tx_audio_attenuation is None:
-            self._query_tx_audio_attenuation_if_needed(pending.instance_id, now)
-            return
-        self._pending_ftx1_band_change = None
-        if pending.source == "forced":
-            LOGGER.info("[DRIVE] Restoring saved drive profile for %s", pending.band)
-            profile = self.ftx1_band_drive.profiles[pending.band.lower()]
-            LOGGER.info("[DRIVE] Requesting TX attenuation: %d", profile.tx_audio_attenuation)
-        applied = self.ftx1_band_drive.apply_profile(
-            pending.band,
-            self.current_tx_audio_attenuation,
-            force_attenuation=pending.source == "forced",
-        )
-        if not applied:
-            if pending.source == "forced":
-                self._block_for_unready_band_drive(pending, "destination drive profile could not be applied")
-                return
-            self._finish_band_change(pending, self.status.period, now)
-            return
-        if self.pending_tx_audio_attenuation is not None:
-            self._pending_ftx1_profile_apply = pending
-            if pending.source == "forced":
-                LOGGER.info("[DRIVE] Waiting for attenuation confirmation")
-            return
-        self._finish_band_change(pending, self.status.period, now)
-
-    def _finish_pending_ftx1_profile_apply(self, now: datetime) -> None:
-        pending = self._pending_ftx1_profile_apply
-        if pending is None or self.pending_tx_audio_attenuation is not None:
-            return
-        self._pending_ftx1_profile_apply = None
-        if pending.source == "forced":
-            LOGGER.info("[BAND-HOP] Drive state ready")
-        self._finish_band_change(pending, self.status.period, now)
-
-    def _finish_band_change(self, pending: PendingDialFrequency, period_seconds: int | None, now: datetime) -> None:
-        self.adaptive_state = AdaptiveState.BAND_TRIAL
-        self.stagnation.reset()
-        self.opportunities.reset(pending.band, self.status.mode or "unknown", now)
-        self.last_band_change_at = now
-        if pending.source == "swr_recovery":
-            if self._swr_recovery is not None:
-                self._swr_recovery = None
-                self._hamlib_swr_fault_latched = False
-                self._hamlib_high_swr_samples = 0
-                self.antenna_safety_level = "warning"
-                self._antenna_event(
-                    now,
-                    f"Bande {pending.band} confirmée, reprise sans nouvel accord automatique",
-                )
-                self.last_qso_notice = f"SWR BAND EXCLUDED - resumed on {pending.band} without tune"
-            self._band_resume_at = now + timedelta(seconds=period_seconds or 15)
-            self._band_resume_band = pending.band
-            LOGGER.info("[BAND] SWR recovery confirmed=%s without retune", pending.band)
-            return
-        if self._begin_atu100_tune_after_band_change(pending, now):
-            return
-        if pending.source == "forced":
-            self._start_forced_band_hop_dwell(pending.band, now)
-            settle_seconds = self.config.forced_band_hop_settle_seconds
-            self._band_resume_at = now + timedelta(seconds=settle_seconds)
-            self._band_resume_band = pending.band
-            LOGGER.info("[BAND-HOP] Confirmed on %s", pending.band)
-            LOGGER.info("[BAND-HOP] Settling for %g s", settle_seconds)
-        else:
-            self._band_resume_at = now + timedelta(seconds=period_seconds or 15)
-            self._band_resume_band = None
-        LOGGER.info("[BAND] confirmed=%s", pending.band)
-
-
-    def _requires_band_drive_restore(self, pending: PendingDialFrequency) -> bool:
-        # A safety recovery must never wait on a WSJT-X audio profile: the
-        # tuner and RF power are controlled and verified directly via Hamlib.
-        if pending.source == "swr_recovery":
-            return False
-        return self.ftx1_band_drive is not None and self.config.ftx1_auto_apply_band_profiles
-
-    def _block_for_unready_band_drive(self, pending: PendingDialFrequency, reason: str) -> None:
-        self._blocked_band_drive_change = pending
-        LOGGER.warning("[BAND-HOP] Drive state for %s is not ready: %s; automatic TX remains blocked", pending.band, reason)
-
-    def _expire_dial_frequency_request(self, now: datetime) -> None:
-        pending = self._pending_dial_frequency
-        if pending is None or now <= pending.deadline:
-            return
-        if pending.source == "swr_recovery":
-            self._pending_dial_frequency = None
-            self._finish_swr_recovery_fault(now, f"confirmation de la bande {pending.band} expirée")
-            return
-        if pending.source == "forced":
-            LOGGER.warning("[BAND-HOP] Request to %s / %.3f MHz timed out waiting for Status", pending.band, pending.frequency_hz / 1_000_000)
-            self._forced_band_hop_pending_band = None
-            current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
-            if current_band is not None:
-                self._start_forced_band_hop_dwell(current_band, now)
-        else:
-            LOGGER.error("[BAND] requested=%d confirmation timeout", pending.frequency_hz)
-        self._pending_dial_frequency = None
-        self.adaptive_state = AdaptiveState.NORMAL
-
-    def note_adaptive_failure(
-        self,
-        callsign: str | None,
-        outcome: AttemptOutcome,
-        now: datetime,
-    ) -> None:
-        if not self.config.adaptive_operation_enabled or not callsign:
-            return
-        band = BandResolver().resolve(self.status.dial_frequency) or "unknown" if self.status.dial_frequency else "unknown"
-        self.stagnation.record(
-            AttemptRecord(callsign.upper(), band, self.status.mode or "unknown", now, self.current_tx_first, outcome)
-        )
-        LOGGER.info(
-            "[ADAPT] attempts=%d failed=%d unique=%d",
-            len(self.stagnation.snapshot()), self.stagnation.failed_attempts, self.stagnation.unique_calls,
-        )
-        self.opportunities.mark_unavailable(
-            callsign, now, max(self.config.stalled_qso_cooldown_seconds, self.opportunities.observation.total_seconds())
-        )
-
-    def _adaptive_success(self) -> None:
-        self.stagnation.reset()
-        self.adaptive_state = AdaptiveState.NORMAL
-        self._adaptive_pending_origin = None
-        LOGGER.info("[ADAPT] QSO success")
-        LOGGER.info("[ADAPT] stagnation reset")
-
-    def reset_adaptive_strategy(self) -> None:
-        self.stagnation.reset()
-        band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
-        self.opportunities.reset(band, self.status.mode, self._last_runtime_at or datetime.now(timezone.utc))
-        if self._pending_dial_frequency is None:
-            self.adaptive_state = AdaptiveState.NORMAL
-            self._adaptive_pending_origin = None
-        LOGGER.info("[ADAPT] strategy reset")
-
-    def set_tx_audio_attenuation_confirmed(self, attenuation: int, timeout_seconds: float = 2.0) -> bool:
-        if not 0 <= attenuation <= 450:
-            LOGGER.info("[DRIVE] action skipped reason=OUT_OF_BOUNDS")
-            return False
-        if self.status.transmitting:
-            LOGGER.info("[DRIVE] action skipped reason=TX_ACTIVE")
-            return False
-        if not self.status.instance_id:
-            LOGGER.info("[DRIVE] action skipped reason=ATTENUATION_UNKNOWN")
-            return False
-        if self.pending_tx_audio_attenuation is not None:
-            LOGGER.info("[DRIVE] action skipped reason=PENDING_CONFIRMATION")
-            return False
-        if not isinstance(self.control, WsjtxUdpControl) or not self.control.set_tx_audio_attenuation(self.status.instance_id, attenuation):
-            LOGGER.info("[DRIVE] action skipped reason=AP1_SEND_FAILED")
-            return False
-        LOGGER.info("[DRIVE] applying attenuation %s -> %d", self.current_tx_audio_attenuation, attenuation)
-        self.pending_tx_audio_attenuation = attenuation
-        self._tx_audio_attenuation_deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
-        LOGGER.info("[WSJTX] Request TX attenuation=%d", attenuation)
-        return True
-
-    def _request_ftx1_profile_attenuation(self, attenuation: int) -> bool:
-        """Apply a user-saved attenuation only while WSJT-X is confirmed in RX."""
-        return not self.status.transmitting and self.set_tx_audio_attenuation_confirmed(attenuation)
-
-    def _observe_tx_audio_attenuation(self, attenuation: int, now: datetime) -> None:
-        previous = self.current_tx_audio_attenuation
-        requested = self.pending_tx_audio_attenuation
-        LOGGER.info("[WSJTX] AP1 attenuation state packet received value=%d", attenuation)
-        self.current_tx_audio_attenuation = attenuation
-        self.tx_audio_attenuation_last_update = now
-        LOGGER.info("[WSJTX] current_tx_audio_attenuation=%d", self.current_tx_audio_attenuation)
-        if requested == attenuation:
-            self.pending_tx_audio_attenuation = None
-            self._tx_audio_attenuation_deadline = None
-            LOGGER.info("[WSJTX] TX attenuation confirmed=%d", attenuation)
-            if self._pending_alc_profile_band is not None and self.ftx1_band_drive is not None:
-                self.ftx1_band_drive.update_profile_attenuation(self._pending_alc_profile_band, attenuation)
-                self._pending_alc_profile_band = None
-        elif previous is not None and previous != attenuation:
-            LOGGER.info("[WSJTX] Manual TX attenuation change %d -> %d", previous, attenuation)
-        else:
-            LOGGER.info("[WSJTX] TX attenuation state=%d", attenuation)
-        pending_save = self._pending_ftx1_profile_save_band
-        if pending_save is not None and self.ftx1_band_drive is not None:
-            self._pending_ftx1_profile_save_band = None
-            if self._pending_dial_frequency is not None or self._pending_ftx1_band_change is not None or self._pending_ftx1_profile_apply is not None:
-                LOGGER.error("[BAND-DRIVE] Save current band profile refused: band changed while attenuation was queried")
-                return
-            self.ftx1_band_drive.save_current_profile(pending_save, attenuation)
-
-    def _query_tx_audio_attenuation_if_needed(self, instance_id: str, now: datetime) -> None:
-        if (
-            not instance_id
-            or not self.ap1_controls_available
-            or self.current_tx_audio_attenuation is not None
-            or not isinstance(self.control, WsjtxUdpControl)
-        ):
-            return
-        if (
-            self._attenuation_query_instance_id == instance_id
-            and self._last_attenuation_query_at is not None
-            and now - self._last_attenuation_query_at < _ATTENUATION_QUERY_INTERVAL
-        ):
-            return
-        self._attenuation_query_instance_id = instance_id
-        self._last_attenuation_query_at = now
-        if self.control.query_tx_audio_attenuation(instance_id):
-            LOGGER.info("[WSJTX] AP1 attenuation query sent")
-
-    def invalidate_tx_audio_attenuation_state(self, reason: str) -> None:
-        if self.current_tx_audio_attenuation is not None:
-            LOGGER.info("[WSJTX] current_tx_audio_attenuation invalidated: %s", reason)
-        self.current_tx_audio_attenuation = None
-        self.tx_audio_attenuation_last_update = None
-        self.pending_tx_audio_attenuation = None
-        self._tx_audio_attenuation_deadline = None
-        self._attenuation_query_instance_id = ""
-        self._last_attenuation_query_at = None
-        self._pending_alc_profile_band = None
-
-
     def _trip_hamlib_swr(self, measured_swr: float, now: datetime) -> None:
         if self._hamlib_swr_fault_latched:
             return
@@ -1506,266 +1088,6 @@ class AutopilotRuntime(
         if not halted and not isinstance(self.control, DryRunControl):
             LOGGER.warning("[HAMLIB] hardware PTT stop unconfirmed; waiting for WSJT-X RX status")
 
-    def _run_swr_recovery(self, now: datetime) -> None:
-        recovery = self._swr_recovery
-        controller = self.ftx1_band_drive
-        if recovery is None or controller is None:
-            return
-        cat = controller.cat
-        if recovery.phase == "changing_band":
-            return
-        if recovery.phase == "wait_rx":
-            if self.status.transmitting:
-                if recovery.rx_deadline is not None and now >= recovery.rx_deadline:
-                    self._finish_swr_recovery_fault(now, "émission toujours active après 5 secondes")
-                return
-            recovery.rx_deadline = None
-            self._antenna_event(now, "Réception confirmée, lancement de l'accord automatique")
-            read_power = getattr(cat, "read_rf_power_fraction", None)
-            set_tuner = getattr(cat, "set_tuner_enabled", None)
-            start_tune = getattr(cat, "start_tune", None)
-            if not callable(read_power) or not callable(set_tuner) or not callable(start_tune):
-                self._finish_swr_recovery_fault(now, "commandes Hamlib d'accord indisponibles")
-                return
-            recovery.original_power_fraction = read_power()
-            if recovery.original_power_fraction is None:
-                self._finish_swr_recovery_fault(now, "puissance RF initiale illisible")
-                return
-            recovery.swr_samples = []
-            recovery.seen_rf = False
-            recovery.tuner_state_supported = bool(getattr(cat, "tuner_reports_active_state", False))
-            recovery.seen_tuning_state = False
-            self._antenna_event(
-                now,
-                f"Accord automatique {recovery.current_band or 'bande inconnue'} "
-                f"(puissance mémorisée {recovery.original_power_fraction * 100:.0f} W)",
-            )
-            if not set_tuner(True) or not start_tune():
-                self._complete_swr_tune(now, success=False, detail="commande d'accord refusée")
-                return
-            recovery.tune_attempts += 1
-            recovery.phase = "tuning"
-            recovery.tune_started_at = now
-            recovery.next_poll_at = now + timedelta(seconds=0.2)
-            LOGGER.warning("[HAMLIB] SWR recovery tune started band=%s", recovery.current_band)
-            return
-        if recovery.phase != "tuning" or recovery.tune_started_at is None:
-            return
-        if recovery.next_poll_at is not None and now < recovery.next_poll_at:
-            return
-        recovery.next_poll_at = now + _SWR_TUNE_POLL_INTERVAL
-        read_power_meter = getattr(cat, "read_power", None)
-        read_swr = getattr(cat, "read_swr", None)
-        read_tuner_state = getattr(cat, "read_tuner_state", None)
-        tuner_state = read_tuner_state() if recovery.tuner_state_supported and callable(read_tuner_state) else None
-        power = read_power_meter() if callable(read_power_meter) else None
-        swr = read_swr() if callable(read_swr) else None
-        self.last_hamlib_power_watts = float(power) if power is not None else None
-        self.last_hamlib_swr = float(swr) if swr is not None else None
-        elapsed = now - recovery.tune_started_at
-        if power is not None and float(power) >= _SWR_TUNE_MIN_RF_WATTS:
-            recovery.seen_rf = True
-            if swr is not None:
-                recovery.swr_samples.append(float(swr))
-            LOGGER.info("[HAMLIB] tune meters band=%s SWR=%s PWR_W=%s", recovery.current_band, swr, power)
-        if tuner_state == 3:
-            recovery.seen_tuning_state = True
-        LOGGER.info(
-            "[HAMLIB] tune poll band=%s elapsed=%.2fs tuner_state=%s power_w=%s swr=%s "
-            "seen_active=%s seen_rf=%s samples=%d",
-            recovery.current_band,
-            elapsed.total_seconds(),
-            tuner_state,
-            power,
-            swr,
-            recovery.seen_tuning_state,
-            recovery.seen_rf,
-            len(recovery.swr_samples or []),
-        )
-        tuner_finished = (
-            recovery.tuner_state_supported
-            and recovery.seen_tuning_state
-            and recovery.seen_rf
-            and elapsed >= _SWR_TUNE_MIN_ACTIVE_TIME
-            and tuner_state in {0, 1}
-        )
-        generic_tune_finished = (
-            not recovery.tuner_state_supported
-            and recovery.seen_rf
-            and (power is None or float(power) < _SWR_TUNE_MIN_RF_WATTS)
-        )
-        if tuner_finished or generic_tune_finished:
-            self._evaluate_swr_tune(now)
-            return
-        # AC..3 alone is not sufficient proof that the FTX-1 really emitted a
-        # tuning carrier: rigctld can briefly return a stale state immediately
-        # after the start command. Require RF too before accepting AC..1 as the
-        # end of the sweep.
-        tune_confirmed = (
-            recovery.seen_tuning_state and recovery.seen_rf
-            if recovery.tuner_state_supported
-            else recovery.seen_rf
-        )
-        if not tune_confirmed and now - recovery.tune_started_at >= _SWR_TUNE_RF_START_TIMEOUT:
-            self._finish_swr_recovery_fault(
-                now,
-                "accord automatique non démarré (état tuner/RF non confirmé, bande conservée)",
-            )
-            return
-        if now - recovery.tune_started_at >= _SWR_TUNE_TIMEOUT:
-            self._complete_swr_tune(now, success=False, detail="délai d'accord dépassé")
-
-    def _evaluate_swr_tune(self, now: datetime) -> None:
-        recovery = self._swr_recovery
-        if recovery is None:
-            return
-        samples = recovery.swr_samples or []
-        # The FTX-1 reports AC..3 for the whole tuner sweep and returns to
-        # AC..1 when it is finished.  Ignore the expected high SWR at the
-        # beginning and require the last two RF-valid samples to be good.
-        terminal_samples = samples[-_SWR_TUNE_MIN_SAMPLES:]
-        measured = max(terminal_samples) if terminal_samples else None
-        if (
-            len(terminal_samples) >= _SWR_TUNE_MIN_SAMPLES
-            and measured is not None
-            and measured < self.config.ftx1_swr_limit
-        ):
-            self._complete_swr_tune(now, success=True, detail=f"SWR final {measured:.2f}")
-            return
-        # A completed tuner cycle with even one RF-valid sample above the
-        # safety limit is enough to reject this band.  Requiring two samples
-        # here used to turn a clear SWR 5.0 failure into a global disarm before
-        # the recovery loop could exclude the band and try the next one.
-        if measured is not None and measured >= self.config.ftx1_swr_limit:
-            count = len(terminal_samples)
-            self._complete_swr_tune(
-                now,
-                success=False,
-                detail=f"SWR final {measured:.2f} ({count} mesure{'s' if count > 1 else ''} RF)",
-            )
-            return
-        if len(samples) < _SWR_TUNE_MIN_SAMPLES:
-            self._finish_swr_recovery_fault(now, "mesures SWR insuffisantes après accord, bande conservée")
-            return
-        detail = f"SWR final {measured:.2f}"
-        self._complete_swr_tune(
-            now,
-            success=False,
-            detail=detail,
-        )
-
-    def _complete_swr_tune(self, now: datetime, *, success: bool, detail: str) -> None:
-        recovery = self._swr_recovery
-        controller = self.ftx1_band_drive
-        if recovery is None or controller is None:
-            return
-        cat = controller.cat
-        restored = True
-        if recovery.original_power_fraction is not None:
-            read_power = getattr(cat, "read_rf_power_fraction", None)
-            current_power = read_power() if callable(read_power) else None
-            radio_restores_power = bool(getattr(cat, "tuner_reports_active_state", False))
-            if radio_restores_power:
-                restored = current_power is not None and abs(float(current_power) - recovery.original_power_fraction) <= 0.011
-            else:
-                set_power = getattr(cat, "set_rf_power_fraction", None)
-                restored = bool(callable(set_power) and set_power(recovery.original_power_fraction))
-            self._antenna_event(
-                now,
-                f"Puissance radio restaurée automatiquement à {recovery.original_power_fraction * 100:.0f} W"
-                if restored and radio_restores_power
-                else f"Puissance restaurée à {recovery.original_power_fraction * 100:.0f} W"
-                if restored
-                else "Échec de restauration de la puissance RF",
-            )
-        if not restored:
-            self._finish_swr_recovery_fault(now, "puissance RF non restaurée")
-            return
-        if success:
-            band = recovery.current_band
-            self._hamlib_swr_fault_latched = False
-            self._hamlib_high_swr_samples = 0
-            self.antenna_safety_level = "warning"
-            self._antenna_event(now, f"Accord réussi sur {band or 'bande inconnue'} : {detail}")
-            self.last_qso_notice = f"SWR RECOVERED {band or ''} - {detail}"
-            self._swr_recovery = None
-            self._band_resume_at = now + timedelta(seconds=self.status.period or 15)
-            self._band_resume_band = band
-            return
-        self._fail_current_swr_band(now, detail)
-
-    def _fail_current_swr_band(self, now: datetime, detail: str) -> None:
-        recovery = self._swr_recovery
-        if recovery is None:
-            return
-        controller = self.ftx1_band_drive
-        set_tuner = getattr(controller.cat, "set_tuner_enabled", None) if controller is not None else None
-        if not callable(set_tuner) or not set_tuner(False):
-            self._finish_swr_recovery_fault(now, "accord automatique impossible à arrêter")
-            return
-        band = (recovery.current_band or "").lower()
-        if band:
-            self._swr_excluded_bands.add(band)
-            self._antenna_event(now, f"Bande {band} exclue pour la session : {detail}")
-        target = self._next_swr_recovery_band()
-        if target is None:
-            self._finish_swr_recovery_fault(now, "aucune bande autorisée utilisable")
-            return
-        frequency = self._band_frequency(target, self.status.mode or "FT8")
-        if frequency is None or not self._request_band_change(target, frequency, now, "swr_recovery"):
-            self._finish_swr_recovery_fault(now, f"changement vers {target} impossible")
-            return
-        recovery.phase = "changing_band"
-        recovery.current_band = target
-        recovery.original_power_fraction = None
-        recovery.tune_started_at = None
-        recovery.next_poll_at = None
-        recovery.seen_rf = False
-        recovery.tuner_state_supported = False
-        recovery.seen_tuning_state = False
-        recovery.swr_samples = []
-        recovery.tune_attempts = 0
-        self._antenna_event(now, f"Essai de la bande {target}")
-
-    def _next_swr_recovery_band(self) -> str | None:
-        allowed = tuple(dict.fromkeys(band.lower() for band in self.config.allowed_auto_hop_bands))
-        for band in allowed:
-            if band not in self._swr_excluded_bands and self._band_frequency(band, self.status.mode or "FT8") is not None:
-                return band
-        return None
-
-    def _finish_swr_recovery_fault(self, now: datetime, detail: str) -> None:
-        recovery = self._swr_recovery
-        if recovery is not None and self.ftx1_band_drive is not None:
-            set_tuner = getattr(self.ftx1_band_drive.cat, "set_tuner_enabled", None)
-            if callable(set_tuner):
-                set_tuner(False)
-        self.antenna_safety_level = "fault"
-        self._antenna_event(now, f"ARRÊT DÉFINITIF : {detail}")
-        self._swr_recovery = None
-        self._disarm_control("swr_safety_unrecoverable", "AutopilotRuntime._finish_swr_recovery_fault")
-        self.last_qso_notice = f"SWR SAFETY FINAL - {detail} - AutoPilot disarmed"
-        LOGGER.critical("[HAMLIB] SWR recovery failed: %s", detail)
-
-    def _antenna_event(self, now: datetime, message: str) -> None:
-        entry = f"{now.astimezone().strftime('%H:%M:%S')}  {message}"
-        self.antenna_safety_events.append(entry)
-        del self.antenna_safety_events[:-12]
-        LOGGER.warning("[ANTENNA-SAFETY] %s", message)
-
-    def _expire_tx_audio_attenuation_request(self, now: datetime) -> None:
-        if self.pending_tx_audio_attenuation is not None and self._tx_audio_attenuation_deadline is not None and now > self._tx_audio_attenuation_deadline:
-            requested = self.pending_tx_audio_attenuation
-            pending_band_change = self._pending_ftx1_profile_apply
-            LOGGER.error("[WSJTX] TX attenuation confirmation timeout requested=%d current=%s", requested, self.current_tx_audio_attenuation)
-            self.pending_tx_audio_attenuation = None
-            self._tx_audio_attenuation_deadline = None
-            self._pending_alc_profile_band = None
-            if pending_band_change is not None and pending_band_change.source == "forced":
-                self._pending_ftx1_profile_apply = None
-                self._block_for_unready_band_drive(pending_band_change, f"TX attenuation {requested} was not confirmed")
-                return
-            self._finish_pending_ftx1_profile_apply(now)
 
     def save_ftx1_current_band_profile(self) -> bool:
         controller = self.ftx1_band_drive
@@ -1821,247 +1143,3 @@ class AutopilotRuntime(
                 self._blocked_band_drive_change,
             )
         )
-
-    def adaptive_snapshot(self) -> dict[str, object]:
-        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
-        observed_at = self._last_runtime_at or datetime.now(timezone.utc)
-        opportunities = self.opportunities.snapshot(observed_at)
-        quiet_threshold = max(1.0, float(self.config.adaptive_opportunity_quiet_seconds))
-        quiet_anchor = self.opportunities.last_viable_at or self.opportunities.started_at
-        quiet_elapsed = max(0.0, (observed_at - quiet_anchor).total_seconds()) if quiet_anchor is not None else 0.0
-        opportunities.update(
-            {
-                "viable_count": len(opportunities["available"]),
-                "quiet_elapsed_seconds": min(quiet_threshold, quiet_elapsed),
-                "quiet_threshold_seconds": quiet_threshold,
-                "quiet_remaining_seconds": max(0.0, quiet_threshold - quiet_elapsed),
-                "exhausted": self.opportunities.exhausted(observed_at),
-            }
-        )
-        snapshot = {
-            "ap1_available": self.ap1_controls_available,
-            "state": self.adaptive_state.name,
-            "current_tx_first": self.current_tx_first,
-            "requested_tx_period": self.requested_tx_period,
-            "current_band": current_band,
-            "next_band": self._next_auto_hop_band(),
-            "next_frequency_hz": (
-                self._next_auto_hop_destination()[1]
-                if self._next_auto_hop_destination() is not None
-                else None
-            ),
-            "band_changing_to": self._pending_dial_frequency.band if self._pending_dial_frequency else None,
-            "opportunities": opportunities,
-            "antenna_safety": {
-                "level": self.antenna_safety_level,
-                "events": tuple(self.antenna_safety_events),
-                "excluded_bands": tuple(sorted(self._swr_excluded_bands)),
-                "recovering": self._swr_recovery is not None,
-                "phase": self._swr_recovery.phase if self._swr_recovery is not None else None,
-            },
-        }
-        if self.ftx1_band_drive is not None:
-            ftx1 = self.ftx1_band_drive.snapshot(current_band, self.current_tx_audio_attenuation)
-            ftx1.update(
-                {
-                    "hamlib_enabled": self.config.ftx1_hamlib_enabled,
-                    "radio_model": getattr(
-                        self.ftx1_band_drive.cat,
-                        "detected_radio_model",
-                        "Yaesu FTX-1" if not self.config.ftx1_hamlib_enabled else "Hamlib generic",
-                    ),
-                    "alc": self.last_hamlib_alc,
-                    "swr": self.last_hamlib_swr,
-                    "swr_protection": self.last_hamlib_swr_protection,
-                    "power_watts": self.last_hamlib_power_watts,
-                    "requested_power_watts": self.last_hamlib_requested_power_watts,
-                    "swr_fault": self._hamlib_swr_fault_latched,
-                }
-            )
-            snapshot["ftx1"] = ftx1
-        return snapshot
-
-
-
-
-    def _request_band_change(self, target: str, frequency: int, now: datetime, source: str) -> bool:
-        cat = self.ftx1_band_drive.cat if self.ftx1_band_drive is not None else None
-        set_frequency = getattr(cat, "set_frequency", None)
-        read_frequency = getattr(cat, "read_frequency", None)
-        if callable(set_frequency) and callable(read_frequency):
-            if not set_frequency(frequency):
-                LOGGER.error("[HAMLIB] frequency change rejected target=%d", frequency)
-                return False
-            observed = read_frequency()
-            if observed is None or abs(observed - frequency) > 5:
-                LOGGER.error("[HAMLIB] frequency confirmation failed requested=%d observed=%s", frequency, observed)
-                return False
-            LOGGER.info("[HAMLIB] frequency confirmed=%d", observed)
-        elif not self.control.set_dial_frequency(self.status.instance_id, frequency):
-            # Compatibility path for dry-run/tests and installations where
-            # Hamlib radio control is explicitly unavailable.
-            return False
-        self.engine.clear_candidates()
-        self.engine.invalidate_pending_context(self.status.instance_id, target, self.status.mode or "unknown")
-        self._pending_dial_frequency = PendingDialFrequency(
-            self.status.instance_id,
-            frequency,
-            target,
-            now + timedelta(seconds=self.config.dial_change_confirmation_timeout_seconds),
-            BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None,
-            source,
-        )
-        self.adaptive_state = AdaptiveState.BAND_CHANGING
-        if source == "forced":
-            LOGGER.info("[BAND-HOP] Requesting %s / %.3f MHz", target, frequency / 1_000_000)
-        else:
-            LOGGER.info("[BAND] current=%s", BandResolver().resolve(self.status.dial_frequency) or "unknown")
-            LOGGER.info("[BAND] next=%s", target)
-            LOGGER.info("[BAND] waiting confirmation")
-        return True
-
-    def _run_adaptive(self, now: datetime) -> None:
-        if self._swr_recovery is not None:
-            return
-        if self.adaptive_state in {AdaptiveState.NORMAL, AdaptiveState.PARITY_TRIAL, AdaptiveState.BAND_TRIAL} and self._adaptive_safe(now):
-            exhausted = self.opportunities.exhausted(now)
-            quiet = self.opportunities.quiet(now, self.config.adaptive_opportunity_quiet_seconds)
-            if exhausted or quiet:
-                previous = self.adaptive_state
-                self._adaptive_pending_origin = previous
-                self.adaptive_state = (
-                    AdaptiveState.PARITY_CHANGE_PENDING
-                    if previous is AdaptiveState.NORMAL and self.config.adaptive_parity_enabled and self.ap1_controls_available
-                    else AdaptiveState.BAND_HOP_PENDING
-                )
-                LOGGER.info(
-                    "[ADAPT] opportunities=%s reason=%s state=%s -> %s",
-                    self.opportunities.snapshot(now),
-                    "exhausted" if exhausted else "no new viable CQ",
-                    previous.name,
-                    self.adaptive_state.name,
-                )
-        if self.adaptive_state is AdaptiveState.PARITY_CHANGE_PENDING:
-            if not self.config.adaptive_parity_enabled or not self._adaptive_safe(now):
-                return
-            if self.current_tx_first is None:
-                self.adaptive_state = AdaptiveState.BAND_HOP_PENDING
-                LOGGER.warning("[ADAPT] TX period unknown; skipping parity trial and requesting band hop")
-            else:
-                requested = not self.current_tx_first
-                if self.control.set_tx_period(self.status.instance_id, requested):
-                    self.requested_tx_period = requested
-                    self.adaptive_state = AdaptiveState.PARITY_TRIAL
-                    self._adaptive_pending_origin = None
-                    self.stagnation.reset()
-                    band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
-                    self.opportunities.reset(band, self.status.mode or "unknown", now)
-                    LOGGER.info("[ADAPT] action=TX_PERIOD_FLIP")
-                    LOGGER.info("[ADAPT] %s -> %s", "FIRST" if self.current_tx_first else "SECOND", "FIRST" if requested else "SECOND")
-                return
-        if self.adaptive_state is AdaptiveState.BAND_HOP_PENDING:
-            if not self.config.automatic_band_hopping_enabled or not self._adaptive_safe(now):
-                return
-            if self.last_band_change_at is not None:
-                dwell = now - self.last_band_change_at
-                if dwell < timedelta(minutes=self.config.minimum_band_dwell_minutes):
-                    return
-            destination = self._next_auto_hop_destination()
-            if destination is None:
-                return
-            target, frequency = destination
-            self._request_band_change(target, frequency, now, "adaptive")
-
-    def _adaptive_safe(self, now: datetime) -> bool:
-        current_band = BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None
-        has_pending_direct = any(
-            entry["band"] == current_band for entry in self.engine.pending_direct_snapshot(now)
-        )
-        return bool(
-            self.config.adaptive_operation_enabled
-            and getattr(self.control, "armed", False)
-            and self.status.instance_id
-            and not self.status.transmitting
-            and self.engine.state.session.state is QsoState.IDLE
-            and not self.finalization.active
-            and self._pending_watchdog_halt is None
-            and self._pending_dial_frequency is None
-            and self.pending_tx_audio_attenuation is None
-            and self._blocked_band_drive_change is None
-            and not has_pending_direct
-        )
-
-
-    def clear_finalization(self, reason: str) -> None:
-        self.finalization.close(reason)
-        self.last_qso_notice = ""
-
-    def _automation_mode(self, decode_mode: str) -> str | None:
-        if decode_mode in _AUTOMATION_MODES:
-            return decode_mode
-        marker_mode = _DECODE_MODE_MARKERS.get(decode_mode)
-        if marker_mode is not None:
-            return marker_mode
-        if self.status.mode in _AUTOMATION_MODES:
-            return self.status.mode
-        return None
-
-    def _status_confirms_reply(self, packet: StatusPacket) -> bool:
-        session = self.engine.state.session
-        if session.state not in {QsoState.DIRECT_REPLY_SENT, QsoState.CALLING_STATION}:
-            return False
-        if session.remote_callsign is None or session.reply_confirmed:
-            return False
-        remote = session.remote_callsign.upper()
-        dx_matches = packet.dx_call.upper() == remote
-        tx_message_matches = remote in packet.tx_message.upper().split()
-        return dx_matches and (packet.transmitting or (packet.tx_enabled and tx_message_matches))
-
-
-    def note_engine_event(self, event: EngineEvent) -> None:
-        """Record a decision outcome without changing the decision itself."""
-        if event.kind is EngineEventKind.CANDIDATE_SELECTED:
-            self.session_diagnostics.candidates_selected += 1
-            self.session_diagnostics.note(f"Sélection : {event.station}")
-            return
-        if event.kind is not EngineEventKind.CANDIDATE_REFUSED:
-            return
-        reason = event.reason.strip()
-        if reason.lower() in {"exchange not actionable", "duplicate decode", "stale"}:
-            return
-        self.session_diagnostics.candidates_refused += 1
-        if "working " in reason.lower():
-            self.session_diagnostics.stations_busy += 1
-            self.session_diagnostics.note(f"Écartée, déjà occupée : {event.station} ({reason})")
-
-    def note_qso_completed(self, station: str) -> None:
-        self.session_diagnostics.qso_completed += 1
-        self.session_diagnostics.note(f"QSO terminé : {station}")
-
-    def session_diagnostic_snapshot(self) -> dict[str, object]:
-        return self.session_diagnostics.snapshot()
-
-    def _update_diagnostic_context(self, now: datetime) -> None:
-        session = current_logging_session()
-        if session is not None:
-            session.context.pending_direct_calls = self.engine.pending_direct_snapshot(now)
-            session.context.adaptive = {
-                "enabled": self.config.adaptive_operation_enabled,
-                "state": self.adaptive_state.name,
-                "recent_attempts": self.stagnation.snapshot(),
-                "failed_attempts": self.stagnation.failed_attempts,
-                "unique_calls": self.stagnation.unique_calls,
-                "current_tx_period": self.current_tx_first,
-                "requested_tx_period": self.requested_tx_period,
-                "current_band": BandResolver().resolve(self.status.dial_frequency) if self.status.dial_frequency else None,
-                "allowed_bands": list(self.config.allowed_auto_hop_bands),
-                "last_band_change": self.last_band_change_at.isoformat() if self.last_band_change_at else None,
-                "minimum_band_dwell_minutes": self.config.minimum_band_dwell_minutes,
-                "next_band": self._next_auto_hop_band(),
-                "next_frequency_hz": (
-                    self._next_auto_hop_destination()[1]
-                    if self._next_auto_hop_destination() is not None
-                    else None
-                ),
-                "opportunities": self.opportunities.snapshot(now),
-            }

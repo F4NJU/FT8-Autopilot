@@ -6,16 +6,23 @@ from PySide6.QtCore import QSize
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QMessageBox, QScrollArea
 
+import wsjtx_autopilot.runtime as runtime_module
 from wsjtx_autopilot.config import AppConfig, SettingsStore, UserSettings
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, EngineEvent, EngineEventKind, IntendedAction, OriginalDecode
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.ftx1 import FTX1CatController
-from wsjtx_autopilot.gui.worker import BackendWorker
 from wsjtx_autopilot.gui.main_window import MainWindow, SettingsDialog
-import wsjtx_autopilot.runtime as runtime_module
+from wsjtx_autopilot.gui.worker import BackendWorker
 from wsjtx_autopilot.runtime import AutopilotRuntime, HaltTxResult
-from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, ReplyPacket, StatusPacket, TxAudioAttenuationStatePacket
+from wsjtx_autopilot.wsjtx.models import (
+    DecodePacket,
+    HeartbeatPacket,
+    PacketHeader,
+    ReplyPacket,
+    StatusPacket,
+    TxAudioAttenuationStatePacket,
+)
 from wsjtx_autopilot.wsjtx.protocol import parse_datagram
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
@@ -937,7 +944,7 @@ def test_close_event_keeps_window_open_when_backend_is_still_alive(tmp_path, mon
 
 
 def test_swr_safety_disarm_shows_explicit_notification(monkeypatch) -> None:
-    application = QApplication.instance() or QApplication([])
+    QApplication.instance() or QApplication([])
     window = QMainWindow()
     messages: list[tuple[object, ...]] = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: messages.append(args))

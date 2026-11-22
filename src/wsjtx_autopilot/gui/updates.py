@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from wsjtx_autopilot.updates import GitHubUpdateClient, UpdateCheckResult, UpdateError, UpdateRelease
+from wsjtx_autopilot.updates import GitHubUpdateClient, UpdateError, UpdateRelease
 
 
 class UpdateCheckPoller(QThread):

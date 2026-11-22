@@ -3,12 +3,18 @@ from pathlib import Path
 
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
-from wsjtx_autopilot.ftx1 import FTX1BandDriveController, FTX1CatController
+from wsjtx_autopilot.ftx1 import FTX1BandDriveController
 from wsjtx_autopilot.hamlib import HamlibFtx1Controller, list_supported_radios
 from wsjtx_autopilot.runtime import AutopilotRuntime, PendingDialFrequency
-from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, StatusPacket, TuneStatePacket, TxAudioAttenuationStatePacket
+from wsjtx_autopilot.wsjtx.models import (
+    DecodePacket,
+    HeartbeatPacket,
+    PacketHeader,
+    StatusPacket,
+    TuneStatePacket,
+    TxAudioAttenuationStatePacket,
+)
 from wsjtx_autopilot.wsjtx.protocol import parse_datagram
-
 
 NOW = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
 ENDPOINT = ("127.0.0.1", 2237)
@@ -207,6 +213,35 @@ def test_atu100_tune_is_bounded_after_a_confirmed_band_change() -> None:
     assert parse_datagram(transport.sent[-1][0]).header.packet_type == 24
     assert transport.sent[-1][0][-1] == 0
     assert runtime._pending_atu100_tune is None
+
+
+def test_atu100_tune_stays_disabled_by_default() -> None:
+    transport = FakeTransport()
+    runtime = AutopilotRuntime(
+        AppConfig(),
+        control=WsjtxUdpControl(transport, 15, None, armed=True),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+    transport.sent.clear()
+    pending = PendingDialFrequency("WSJT-X", 7_074_000, "40m", NOW, "20m")
+
+    runtime._finish_band_change(pending, 15, NOW)
+
+    assert runtime._pending_atu100_tune is None
+    assert not any(parse_datagram(data).header.packet_type == 24 for data, _endpoint in transport.sent)
+
+
+def test_adaptive_and_forced_hop_safety_guards_are_independent() -> None:
+    runtime = AutopilotRuntime(
+        AppConfig(adaptive_operation_enabled=False),
+        control=WsjtxUdpControl(FakeTransport(), 15, None, armed=True),
+    )
+    runtime.handle(heartbeat(), NOW, ENDPOINT)
+    runtime.handle(status(14_074_000), NOW, ENDPOINT)
+
+    assert runtime._forced_band_hop_safe()
+    assert not runtime._adaptive_safe(NOW)
 
 
 def test_halt_tx_drops_hamlib_ptt_before_cancelling_wsjtx() -> None:

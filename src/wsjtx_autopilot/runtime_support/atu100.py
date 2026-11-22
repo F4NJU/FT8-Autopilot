@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from .models import PendingAtu100Tune
+from wsjtx_autopilot.wsjtx.models import TuneStatePacket
+
+from .models import PendingAtu100Tune, PendingDialFrequency
 
 LOGGER = logging.getLogger(__name__)
 _ATU100_TUNE_ACK_TIMEOUT = timedelta(seconds=3)

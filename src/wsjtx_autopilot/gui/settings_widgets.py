@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QPushButton, QWidget
+from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QLineEdit, QPushButton, QWidget
 
 from wsjtx_autopilot.config import ActivityPolicy
+
 
 def _csv_set(value: str) -> set[str]:
     return {item.strip().upper() for item in value.split(",") if item.strip()}

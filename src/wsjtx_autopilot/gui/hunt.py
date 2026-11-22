@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import socket
 import ssl
 import struct
-from threading import Lock
 import time
+from datetime import datetime, timezone
+from threading import Lock
 from uuid import uuid4
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -22,19 +22,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from wsjtx_autopilot.engine.space_weather import NoaaSpaceWeatherClient
 from wsjtx_autopilot.special_calls import (
     AfuToolsProvider,
+    PskReporterSpot,
     SpecialCallActivity,
     SpecialCallCatalog,
     SpecialCallProviderError,
     SpecialCallSnapshot,
-    PskReporterSpot,
     band_subscription_topic,
     parse_spot,
     subscription_topic,
 )
 from wsjtx_autopilot.wavelog import WavelogApiError, WavelogLotwCatalog, WavelogV2Client
-from wsjtx_autopilot.engine.space_weather import NoaaSpaceWeatherClient
 
 
 class SpecialCallPoller(QThread):

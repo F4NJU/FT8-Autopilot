@@ -7,7 +7,7 @@ import pytest
 
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.control.dry_run import DryRunControl
-from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, IntendedAction
+from wsjtx_autopilot.engine.models import ActionOutcome, IntendedAction
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.runtime import AutopilotRuntime, PendingDialFrequency
 from wsjtx_autopilot.wsjtx.models import DecodePacket, PacketHeader, StatusPacket
@@ -97,6 +97,43 @@ def test_status_tr_period_milliseconds_are_normalized_to_seconds() -> None:
     app.handle(status(tr_period=15_000), NOW)
 
     assert app.status.period == 15
+
+
+def test_handle_polls_control_before_observing_packet() -> None:
+    calls: list[str] = []
+
+    class TrackingControl(CollectingControl):
+        def poll(self) -> None:
+            calls.append("poll")
+
+        def observe(self, packet, endpoint) -> None:  # type: ignore[no-untyped-def]
+            calls.append("observe")
+            super().observe(packet, endpoint)
+
+    app = AutopilotRuntime(AppConfig(), control=TrackingControl())
+
+    app.handle(decode("CQ F4NJU JN18", -8, 500), NOW, ("127.0.0.1", 2237))
+
+    assert calls[:2] == ["poll", "observe"]
+
+
+def test_handle_ignores_decode_handler_return_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    app, _ = runtime()
+    sentinel = object()
+    seen: list[object] = []
+
+    def handle_decode(*args: object) -> object:
+        seen.append(args[0])
+        return sentinel
+
+    monkeypatch.setattr(app, "_handle_decode", handle_decode)
+    monkeypatch.setattr(app.engine, "decide", lambda _now: None)
+    packet = decode("CQ F4NJU JN18", -8, 500)
+
+    result = app.handle(packet, NOW)
+
+    assert seen == [packet]
+    assert result is None
 
 
 def test_adaptive_band_change_with_millisecond_period_resumes_after_one_ft8_cycle() -> None:

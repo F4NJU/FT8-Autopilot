@@ -6,6 +6,16 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+@dataclass(slots=True)
+class PendingDialFrequency:
+    instance_id: str
+    frequency_hz: int
+    band: str
+    deadline: datetime
+    previous_band: str | None
+    source: str = "adaptive"
+
+
 @dataclass(frozen=True, slots=True)
 class HuntTarget:
     callsign: str

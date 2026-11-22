@@ -5,6 +5,7 @@ from __future__ import annotations
 from wsjtx_autopilot.engine.adaptive import DEFAULT_BAND_PROFILES
 from wsjtx_autopilot.worked.bands import BandResolver
 
+from .models import HuntRemoteSpot
 
 # The normal FT8 watering holes are defined in DEFAULT_BAND_PROFILES.  These
 # additional dial frequencies are the conventional DXpedition / secondary FT8
