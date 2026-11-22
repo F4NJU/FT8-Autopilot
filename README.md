@@ -47,6 +47,14 @@ Chaque release officielle doit donc joindre ces deux fichiers :
 - `WSJTX-AutoPilot-Setup.exe`
 - `SHA256SUMS.txt`, contenant le SHA-256 exact de l'installateur.
 
+Pour préparer une release, utiliser `packaging\release.ps1` avec le chemin du
+runtime AP1 et l'URL de sa source. Le script lit la version dans
+`src/wsjtx_autopilot/__init__.py` (seule source de vérité), construit
+l'installateur avec Inno Setup, puis génère et vérifie `SHA256SUMS.txt` avec
+`tools\release.py`. Le numéro n'est plus dupliqué dans `pyproject.toml` ni dans
+le script Inno Setup. La CI vérifie également ce fichier et teste la chaîne
+génération → vérification sur l'artefact construit.
+
 Pour le filtre **DXCC non validés LoTW uniquement**, renseigner également
 l'URL de l'API v2 Wavelog et un jeton `wl2_` ayant l'autorisation
 `confirmation:read` dans **Preferences > Diagnostic**. L'AutoPilot ne lit que
@@ -82,7 +90,9 @@ Le port UDP configuré dans AutoPilot doit être identique à celui de WSJT-X.
 5. Cliquer sur **ARM** pour autoriser AutoPilot à répondre.
 
 AutoPilot démarre désarmé. Il ne transmet rien tant que **ARM** n'a pas été
-activé.
+activé. Le nombre maximal de réponses émises par armement est défini par
+`max_actions` dans `settings.json` (1 par défaut) : une fois la limite atteinte,
+le contrôle se désarme. Un nouvel **ARM** accorde un budget neuf.
 
 ## Fonctions principales
 

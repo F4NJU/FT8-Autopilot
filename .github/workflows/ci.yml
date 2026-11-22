@@ -34,3 +34,64 @@ jobs:
         run: |
           python -m compileall -q src tests
           python -m pytest -q --cov=wsjtx_autopilot --cov-report=term-missing
+
+  release-artifacts:
+    name: Release artifact plumbing
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,gui,build]"
+
+      - name: Check single version source
+        shell: pwsh
+        run: python tools/release.py check
+
+      - name: Build PyInstaller artifact with a stub AP1 runtime
+        shell: pwsh
+        run: |
+          $stub = Join-Path $env:RUNNER_TEMP 'ap1-stub'
+          New-Item -ItemType Directory -Force (Join-Path $stub 'bin') | Out-Null
+          Set-Content -Path (Join-Path $stub 'bin\wsjtx.exe') -Value 'CI stub'
+          $env:WSJTX_AP1_RUNTIME_DIR = $stub
+          $env:WSJTX_AP1_SOURCE_URL = 'https://example.invalid/wsjtx-ap1-source.zip'
+          $env:FT8_REQUIRE_AP1_BUNDLE = '1'
+          python -m PyInstaller --clean -y packaging/wsjtx-autopilot.spec
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+
+      # The runner has neither the AP1 runtime nor Inno Setup: the copied EXE
+      # is a stand-in used only to exercise checksum generation and the exact
+      # parser used by the updater. It is NOT a published installer.
+      - name: Generate and verify release checksums
+        shell: pwsh
+        run: |
+          Copy-Item dist/WSJTX-AutoPilot/WSJTX-AutoPilot.exe dist/WSJTX-AutoPilot-Setup.exe
+          python tools/release.py checksums
+          if ($LASTEXITCODE -ne 0) { throw 'Checksum generation failed' }
+          python tools/release.py verify
+          if ($LASTEXITCODE -ne 0) { throw 'Checksum verification failed' }
+
+          $bad = (Get-Content dist/SHA256SUMS.txt -Raw) -replace '^[0-9a-f]', '0'
+          Set-Content dist/SHA256SUMS.txt -Value $bad -NoNewline
+          python tools/release.py verify
+          if ($LASTEXITCODE -eq 0) { throw 'Verification accepted a corrupted checksum' }
+          python tools/release.py checksums
+
+      - name: Upload release plumbing artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-checksum-plumbing
+          path: |
+            dist/WSJTX-AutoPilot-Setup.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error

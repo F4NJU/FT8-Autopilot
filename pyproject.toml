@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wsjtx-autopilot"
-version = "1.0.4"
+dynamic = ["version"]
 description = "Windows FT8/FT4 operating assistant for WSJT-X"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,6 +21,9 @@ wsjtx-autopilot-gui = "wsjtx_autopilot.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "wsjtx_autopilot.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
