@@ -1,7 +1,9 @@
 import socket
 from datetime import datetime, time, timedelta, timezone
+from unittest.mock import patch
 
 from PySide6.QtCore import QSize
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QMessageBox, QScrollArea
 
 from wsjtx_autopilot.config import AppConfig, SettingsStore, UserSettings
@@ -891,6 +893,44 @@ def test_gui_displays_pending_direct_call_count(tmp_path, monkeypatch) -> None:
 
         window._handle_engine_event(EngineEvent(EngineEventKind.PENDING_DIRECT_REMOVED, "S51DD", "selected"))
         assert window.pending_direct_label.text() == "Pending Direct Calls: 0"
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def _window_for_shutdown_test(tmp_path, monkeypatch) -> MainWindow:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0, worked_store_path=str(tmp_path / "worked.sqlite3")))
+    return MainWindow(store)
+
+
+def test_close_event_waits_for_backend_and_accepts(tmp_path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = _window_for_shutdown_test(tmp_path, monkeypatch)
+    application.processEvents()
+    try:
+        event = QCloseEvent()
+        with patch.object(window._thread, "wait", return_value=True) as wait:
+            window.closeEvent(event)
+        wait.assert_called_once_with(8_000)
+        assert event.isAccepted()
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def test_close_event_keeps_window_open_when_backend_is_still_alive(tmp_path, monkeypatch) -> None:
+    application = QApplication.instance() or QApplication([])
+    window = _window_for_shutdown_test(tmp_path, monkeypatch)
+    application.processEvents()
+    try:
+        event = QCloseEvent()
+        with patch.object(window._thread, "wait", return_value=False):
+            window.closeEvent(event)
+        assert not event.isAccepted()
+        assert "backend radio encore actif" in window.statusBar().currentMessage()
     finally:
         window.close()
         application.processEvents()
