@@ -314,6 +314,22 @@ def test_halt_tx_remains_available_after_action_limit_without_consuming_action(c
     assert "DISARM reason=action_limit_reached source=WsjtxUdpControl.execute" in caplog.text
 
 
+def test_explicit_rearm_grants_a_fresh_action_budget() -> None:
+    transport = FakeTransport()
+    decode = original()
+    adapter = armed_adapter(transport, decode, max_actions=1)
+    assert adapter.execute(action(decode), NOW) is ActionOutcome.SENT
+    assert not adapter.armed
+
+    assert adapter.arm()
+    second = original(message="CQ OH3ZZ JO99")
+    assert second.source_endpoint is not None
+    adapter.observe(packet(second), second.source_endpoint)
+    assert adapter.execute(action(second, station="OH3ZZ"), NOW) is ActionOutcome.SENT
+    assert adapter.actions_used == 1
+    assert not adapter.armed
+
+
 def test_manual_disarm_logs_nonempty_reason_and_source(caplog: pytest.LogCaptureFixture) -> None:
     adapter = WsjtxUdpControl(FakeTransport(), 15, 1)
 

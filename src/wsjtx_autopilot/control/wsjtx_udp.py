@@ -215,6 +215,9 @@ class WsjtxUdpControl:
             LOGGER.error("[CONTROL] ARM rejected kill switch file exists: %s", self._kill_switch_file)
             self._disarm("kill_switch_file_present", "WsjtxUdpControl.arm")
             return False
+        if not self._armed:
+            # An explicit re-arm grants a fresh action budget to the operator.
+            self._actions_used = 0
         self._armed = True
         LOGGER.warning("[CONTROL] ARMED implementation=%s max_actions=%s", type(self).__name__, self._max_actions)
         return True
