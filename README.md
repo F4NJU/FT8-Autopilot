@@ -51,9 +51,12 @@ Pour préparer une release, utiliser `packaging\release.ps1` avec le chemin du
 runtime AP1 et l'URL de sa source. Le script lit la version dans
 `src/wsjtx_autopilot/__init__.py` (seule source de vérité), construit
 l'installateur avec Inno Setup, puis génère et vérifie `SHA256SUMS.txt` avec
-`tools\release.py`. Le numéro n'est plus dupliqué dans `pyproject.toml` ni dans
-le script Inno Setup. La CI vérifie également ce fichier et teste la chaîne
-génération → vérification sur l'artefact construit.
+`tools\release.py`. La commande `check-artifact` contrôle ensuite que le bundle
+construit porte la version source, un commit et une somme correcte. Le numéro
+n'est plus dupliqué dans `pyproject.toml` ni dans le script Inno Setup. La CI
+vérifie également ce fichier et teste la chaîne génération → vérification sur
+l'artefact construit. Le déroulé complet est décrit dans
+`docs/RELEASE_CHECKLIST.md`.
 
 Pour le filtre **DXCC non validés LoTW uniquement**, renseigner également
 l'URL de l'API v2 Wavelog et un jeton `wl2_` ayant l'autorisation

@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 
 from .location import distance_and_bearing, grid_to_location
 
-
 # (near distance, useful DX distance, long-path limit), in km.  The long-path
 # side is intentionally strict on the low bands: a global spot alone should
 # not make a French station leave a productive band for an unlikely 40 m path.

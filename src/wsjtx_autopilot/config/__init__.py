@@ -82,7 +82,7 @@ class AppConfig:
     wsjtx_log_path: Path | None = None
 
 
-from .settings import ActivityPolicy, DirectCallPolicy, SettingsStore, UserSettings, default_data_dir, default_settings_path
+from .settings import ActivityPolicy, DirectCallPolicy, SettingsStore, UserSettings, default_data_dir, default_settings_path  # noqa: E402
 
 __all__ = [
     "AUTO_TX_ENABLED",

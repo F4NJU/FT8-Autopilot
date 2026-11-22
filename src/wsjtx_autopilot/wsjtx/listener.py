@@ -1,7 +1,6 @@
 import logging
 import socket
-from collections.abc import Iterator
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from .models import WsjtxPacket

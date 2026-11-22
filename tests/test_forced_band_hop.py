@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -8,7 +8,12 @@ from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.adaptive import AdaptiveState
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.runtime import AutopilotRuntime
-from wsjtx_autopilot.wsjtx.models import DecodePacket, HeartbeatPacket, PacketHeader, ReplyPacket, SetDialFrequencyPacket, StatusPacket
+from wsjtx_autopilot.wsjtx.models import (
+    HeartbeatPacket,
+    PacketHeader,
+    SetDialFrequencyPacket,
+    StatusPacket,
+)
 from wsjtx_autopilot.wsjtx.protocol import parse_datagram
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)

@@ -7,14 +7,13 @@ mandatory before an installer is launched.
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from hashlib import sha256
-import json
 from pathlib import Path
-import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
 
 GITHUB_RELEASES_URL = "https://api.github.com/repos/F4NJU/FT8-Autopilot/releases/latest"
 RELEASES_PAGE_URL = "https://github.com/F4NJU/FT8-Autopilot/releases"

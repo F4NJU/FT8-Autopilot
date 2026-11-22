@@ -1,14 +1,14 @@
-from datetime import datetime, time, timezone
+from datetime import datetime, timezone
 
 from wsjtx_autopilot.engine.models import (
     Candidate,
     CandidateKind,
     DecodeEvent,
+    MessageKind,
     ParsedMessage,
     ScoreBreakdown,
     ScoreComponent,
     StationMetadata,
-    MessageKind,
 )
 from wsjtx_autopilot.gui.viewmodels import CandidateRow, StatusView
 from wsjtx_autopilot.runtime import WsjtxStatus

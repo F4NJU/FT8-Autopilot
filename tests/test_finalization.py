@@ -2,7 +2,6 @@ from datetime import datetime, timedelta, timezone
 
 from wsjtx_autopilot.engine.finalization import FinalizationTracker
 
-
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc)
 
 

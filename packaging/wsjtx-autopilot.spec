@@ -25,12 +25,14 @@ version_match = re.search(r'^__version__\s*=\s*"([^"]+)"', version_source, re.MU
 if version_match is None:
     raise SystemExit("Unable to determine AutoPilot version from __init__.py")
 APP_VERSION = f"v{version_match.group(1)}"
+# A branch build must not advertise its ref name (``main``) as the application
+# version.  Only an explicit override or a real version tag may do that.
+REF_NAME = os.environ.get("GITHUB_REF_NAME", "").strip()
+TAG_VERSION = REF_NAME.lstrip("vV") if re.fullmatch(r"[vV]\d+\.\d+\.\d+", REF_NAME) else ""
 BUILD_INFO_PATH.write_text(
     json.dumps(
         {
-            "app_version": os.environ.get("FT8_AUTOPILOT_VERSION")
-            or os.environ.get("GITHUB_REF_NAME")
-            or APP_VERSION,
+            "app_version": os.environ.get("FT8_AUTOPILOT_VERSION") or TAG_VERSION or APP_VERSION,
             "git_commit": os.environ.get("FT8_AUTOPILOT_GIT_COMMIT")
             or os.environ.get("GITHUB_SHA")
             or GIT_COMMIT,

@@ -2,7 +2,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 
 from .bands import BandResolver

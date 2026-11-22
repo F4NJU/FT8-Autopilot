@@ -8,14 +8,19 @@ CI; it never performs network I/O or launches an installer.
 from __future__ import annotations
 
 import argparse
-from hashlib import sha256
-from pathlib import Path
+import json
 import re
 import sys
+from datetime import datetime
+from hashlib import sha256
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER_NAME = "WSJTX-AutoPilot-Setup.exe"
 CHECKSUMS_NAME = "SHA256SUMS.txt"
+BUNDLE_NAME = "WSJTX-AutoPilot"
+APP_EXE_NAME = "WSJTX-AutoPilot.exe"
+BUILD_INFO_NAME = "ft8-autopilot-build-info.json"
 _VERSION_ASSIGNMENT = re.compile(r'^__version__\s*=\s*"(\d+\.\d+\.\d+)"', re.MULTILINE)
 
 
@@ -85,6 +90,48 @@ def verify_checksums(
     return actual
 
 
+def check_artifact(dist_dir: Path, installer_name: str = INSTALLER_NAME) -> dict[str, str]:
+    """Validate that a built bundle carries the source version and a real checksum."""
+
+    bundle = dist_dir / BUNDLE_NAME
+    executable = bundle / APP_EXE_NAME
+    build_info_path = bundle / BUILD_INFO_NAME
+    checksums_path = dist_dir / CHECKSUMS_NAME
+    if not executable.is_file():
+        raise ReleaseError(f"Built executable not found: {executable}")
+    if not build_info_path.is_file():
+        raise ReleaseError(f"Build info not found: {build_info_path}")
+    if not checksums_path.is_file():
+        raise ReleaseError(f"Checksum file not found: {checksums_path}")
+
+    try:
+        info = json.loads(build_info_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError(f"Invalid build info: {exc}") from exc
+    if not isinstance(info, dict):
+        raise ReleaseError("Build info must be a JSON object")
+
+    version = str(info.get("app_version", "")).strip().lstrip("vV")
+    expected = read_version()
+    if version != expected:
+        raise ReleaseError(f"Artifact version {version!r} differs from source version {expected!r}")
+    git_commit = str(info.get("git_commit", "")).strip()
+    if not git_commit:
+        raise ReleaseError("Artifact has no git commit")
+    build_time = str(info.get("build_time", "")).strip()
+    try:
+        datetime.fromisoformat(build_time)
+    except ValueError as exc:
+        raise ReleaseError(f"Artifact has an invalid build time: {build_time!r}") from exc
+
+    contents = checksums_path.read_text(encoding="utf-8")
+    expected_line = re.compile(rf"[0-9a-f]{{64}} \*{re.escape(installer_name)}")
+    if len(contents.splitlines()) != 1 or expected_line.fullmatch(contents.strip()) is None:
+        raise ReleaseError(f"{CHECKSUMS_NAME} must contain exactly one line for {installer_name}")
+    digest = verify_checksums(dist_dir, installer_name)
+    return {"version": version, "git_commit": git_commit, "sha256": digest}
+
+
 def check_version_sources(root: Path = ROOT) -> str:
     """Fail when a second hard-coded version reappears in build inputs."""
 
@@ -110,6 +157,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version", help="print the single source version")
     sub.add_parser("check", help="verify that build inputs share one version source")
+    artifact = sub.add_parser("check-artifact", help="validate a built bundle and its checksums")
+    artifact.add_argument("--dist", type=Path, default=ROOT / "dist")
+    artifact.add_argument("--installer", default=INSTALLER_NAME)
     for command in ("checksums", "verify"):
         item = sub.add_parser(command, help=f"{command} the release installer")
         item.add_argument("--dist", type=Path, default=ROOT / "dist")
@@ -121,6 +171,11 @@ def main(argv: list[str] | None = None) -> int:
             print(read_version())
         elif args.command == "check":
             print(check_version_sources())
+        elif args.command == "check-artifact":
+            details = check_artifact(args.dist, args.installer)
+            print(
+                f"version={details['version']} commit={details['git_commit']} sha256={details['sha256']}"
+            )
         elif args.command == "checksums":
             print(write_checksums(args.dist, args.installer))
         else:

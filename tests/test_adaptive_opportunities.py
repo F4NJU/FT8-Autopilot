@@ -2,7 +2,6 @@ from datetime import datetime, timedelta, timezone
 
 from wsjtx_autopilot.engine.adaptive import BandOpportunityTracker
 
-
 NOW = datetime(2026, 9, 19, 12, 0, tzinfo=timezone.utc)
 
 

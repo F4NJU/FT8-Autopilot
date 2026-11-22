@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-
 PSK_REPORTER_HOST = "mqtt.pskreporter.info"
 PSK_REPORTER_TLS_PORT = 1884
 

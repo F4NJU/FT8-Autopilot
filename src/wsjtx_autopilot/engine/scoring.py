@@ -4,7 +4,6 @@ from datetime import datetime
 from wsjtx_autopilot.config import ActivityPolicy, DirectCallPolicy
 
 from .dxcc import DxccResolver, UnknownDxccResolver
-from .propagation import reply_path_probability
 from .models import (
     ActivityTag,
     CandidateKind,
@@ -14,6 +13,7 @@ from .models import (
     StationMetadata,
     WorkedCheck,
 )
+from .propagation import reply_path_probability
 
 
 @dataclass(slots=True)

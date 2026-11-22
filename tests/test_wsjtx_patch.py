@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 PATCH = Path(__file__).parents[1] / "patches" / "wsjtx-3.2-direct-reply.patch"
 
 

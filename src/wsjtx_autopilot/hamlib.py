@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 from typing import Callable, Protocol
 
-
 LOGGER = logging.getLogger(__name__)
 DEFAULT_HAMLIB_MODEL = 1051
 FTX1_CAT_ID = "ID0840"

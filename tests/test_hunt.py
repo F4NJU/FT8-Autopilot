@@ -1,10 +1,10 @@
 from dataclasses import replace
 
+from test_runtime import NOW, CollectingControl, decode, status
+
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.runtime import AutopilotRuntime, HuntRemoteSpot
 from wsjtx_autopilot.special_calls.models import SpecialCallActivity
-
-from test_runtime import NOW, CollectingControl, decode, status
 
 
 def target(callsign: str = "TM85VGC", band: str = "20m") -> SpecialCallActivity:

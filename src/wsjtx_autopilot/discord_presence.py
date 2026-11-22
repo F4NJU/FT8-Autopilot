@@ -11,7 +11,6 @@ from typing import Callable, Protocol
 
 from pypresence import Presence
 
-
 LOGGER = logging.getLogger(__name__)
 _RECONNECT_SECONDS = 15.0
 

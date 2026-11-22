@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from wsjtx_autopilot.config import AppConfig
+from wsjtx_autopilot.worked.bands import BandResolver
 
 from .cq import CqEligibility
 from .models import (
@@ -19,14 +20,13 @@ from .models import (
     MessageKind,
     ScoreBreakdown,
     ScoreComponent,
-    StationProfile,
     StationCooldown,
+    StationProfile,
     WorkedCheck,
 )
 from .pending_direct import PendingDirectCall, PendingDirectCallQueue
 from .scoring import CandidateScorer
 from .state import QsoState, QsoStateMachine
-from wsjtx_autopilot.worked.bands import BandResolver
 
 LOGGER = logging.getLogger(__name__)
 

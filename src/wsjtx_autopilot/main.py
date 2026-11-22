@@ -7,14 +7,14 @@ from wsjtx_autopilot.config import AppConfig, AppPaths
 from wsjtx_autopilot.control.base import ControlAdapter, DatagramTransport
 from wsjtx_autopilot.control.dry_run import DryRunControl
 from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
+from wsjtx_autopilot.logging_setup import configure_logging
 from wsjtx_autopilot.runtime import AutopilotRuntime
+from wsjtx_autopilot.worked.service import WorkedTodayService
+from wsjtx_autopilot.worked.store import WorkedQsoStore
+from wsjtx_autopilot.worked.sync import synchronize_adif
 from wsjtx_autopilot.wsjtx.capture import DatagramRecorder, replay_datagrams
 from wsjtx_autopilot.wsjtx.listener import UdpListener
 from wsjtx_autopilot.wsjtx.protocol import ProtocolError, parse_datagram
-from wsjtx_autopilot.logging_setup import configure_logging
-from wsjtx_autopilot.worked.sync import synchronize_adif
-from wsjtx_autopilot.worked.service import WorkedTodayService
-from wsjtx_autopilot.worked.store import WorkedQsoStore
 
 LOGGER = logging.getLogger(__name__)
 

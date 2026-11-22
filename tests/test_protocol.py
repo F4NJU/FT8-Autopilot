@@ -6,13 +6,13 @@ import pytest
 from wsjtx_autopilot.wsjtx.models import (
     ClearPacket,
     DecodePacket,
-    HeartbeatPacket,
     HaltTxPacket,
+    HeartbeatPacket,
     QsoLoggedPacket,
     ReplyPacket,
-    StatusPacket,
-    SetTxPeriodPacket,
     SetDialFrequencyPacket,
+    SetTxPeriodPacket,
+    StatusPacket,
     TuneStatePacket,
     TxAudioAttenuationStatePacket,
     UnknownPacket,
@@ -23,9 +23,9 @@ from wsjtx_autopilot.wsjtx.protocol import (
     parse_datagram,
     serialize_halt_tx,
     serialize_reply,
-    serialize_set_tx_period,
     serialize_set_dial_frequency,
     serialize_set_tune,
+    serialize_set_tx_period,
 )
 
 

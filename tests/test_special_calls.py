@@ -5,7 +5,6 @@ from wsjtx_autopilot.special_calls.models import SpecialCallActivity
 from wsjtx_autopilot.special_calls.providers import AfuToolsProvider
 from wsjtx_autopilot.special_calls.ranking import rank_activity
 
-
 NOW = datetime(2026, 10, 24, 12, 0, tzinfo=timezone.utc)
 
 

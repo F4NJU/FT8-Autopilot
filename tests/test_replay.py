@@ -5,7 +5,6 @@ from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.replay import ReplayFrame, replay_frames
 from wsjtx_autopilot.wsjtx.models import DecodePacket, PacketHeader
 
-
 NOW = datetime(2026, 10, 31, 18, 0, tzinfo=timezone.utc)
 HEADER = PacketHeader(2, 2, "WSJT-X")
 

@@ -6,12 +6,11 @@ radio control or make a decoded CQ ineligible.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import json
 from typing import Callable
 from urllib.request import Request, urlopen
-
 
 SOLAR_FLUX_URL = "https://services.swpc.noaa.gov/json/f107_cm_flux.json"
 PLANETARY_K_URL = "https://services.swpc.noaa.gov/json/planetary_k_index_1m.json"

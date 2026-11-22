@@ -13,9 +13,9 @@ from wsjtx_autopilot.wsjtx.protocol import (
     ProtocolError,
     serialize_halt_tx,
     serialize_reply,
-    serialize_set_tx_period,
     serialize_set_dial_frequency,
     serialize_set_tune,
+    serialize_set_tx_period,
 )
 
 LOGGER = logging.getLogger(__name__)

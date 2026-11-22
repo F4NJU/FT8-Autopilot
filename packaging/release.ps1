@@ -34,7 +34,10 @@ try {
     & @Python 'tools\release.py' verify --dist $distDir
     if ($LASTEXITCODE -ne 0) { throw 'SHA256SUMS.txt verification failed.' }
 
-    Write-Host "Published files: $distDir\WSJTX-AutoPilot-Setup.exe and $distDir\SHA256SUMS.txt"
+    & @Python 'tools\release.py' check-artifact --dist $distDir
+    if ($LASTEXITCODE -ne 0) { throw 'Built artifact validation failed.' }
+
+    Write-Host "Release files ready: $distDir\WSJTX-AutoPilot-Setup.exe and $distDir\SHA256SUMS.txt"
 }
 finally {
     Pop-Location

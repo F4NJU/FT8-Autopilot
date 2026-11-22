@@ -7,15 +7,14 @@ manually started WSJT-X instance is never terminated or reconfigured.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-from pathlib import Path
 import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Protocol
-
 
 LOGGER = logging.getLogger(__name__)
 

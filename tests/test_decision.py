@@ -1,12 +1,13 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from wsjtx_autopilot.config import AppConfig
 from wsjtx_autopilot.engine.decision import DecisionEngine
 from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, DecodeEvent
 from wsjtx_autopilot.engine.parser import parse_ft8_message
 from wsjtx_autopilot.engine.state import QsoState
-import pytest
 
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
 

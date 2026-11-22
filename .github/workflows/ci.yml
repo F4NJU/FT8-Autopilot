@@ -29,6 +29,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test,gui]"
 
+      - name: Lint
+        shell: pwsh
+        run: python -m ruff check .
+
       - name: Tests
         shell: pwsh
         run: |
@@ -89,6 +93,9 @@ jobs:
           python tools/release.py verify
           if ($LASTEXITCODE -eq 0) { throw 'Verification accepted a corrupted checksum' }
           python tools/release.py checksums
+          if ($LASTEXITCODE -ne 0) { throw 'Checksum regeneration failed' }
+          python tools/release.py check-artifact
+          if ($LASTEXITCODE -ne 0) { throw 'Built artifact validation failed' }
 
       - name: Upload release plumbing artifacts
         uses: actions/upload-artifact@v4
