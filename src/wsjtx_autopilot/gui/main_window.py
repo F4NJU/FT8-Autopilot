@@ -1,7 +1,7 @@
 import logging
 from copy import deepcopy
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QFrame,
@@ -454,6 +454,7 @@ class MainWindow(
         self.statusBar().showMessage("Formulaire de signalement ouvert sur GitHub.", 6_000)
 
     def _apply_settings(self, settings: UserSettings) -> None:
+        previous = self._settings
         self.hunt_panel.set_hunting(False)
         self.hunt_stop_requested.emit()
         self._settings = settings
@@ -464,7 +465,36 @@ class MainWindow(
         self._restart_wavelog_refresh_timer()
         self._refresh_special_calls()
         self._refresh_wavelog_lotw()
+        self._sync_reply_actions()
+        self._reconcile_reply_pollers(previous)
         self.statusBar().showMessage("Preferences saved; backend restarted DISARMED", 6000)
+
+    def _sync_reply_actions(self) -> None:
+        """Mirror Preferences into the Reply menu without re-emitting toggles."""
+
+        settings = self._settings
+        for action, checked in (
+            (self.rare_reply_tracking_action, settings.pskreporter_mqtt_enabled),
+            (self.rare_stations_only_action, settings.rare_stations_only),
+            (self.unconfirmed_dxcc_only_action, settings.wavelog_unconfirmed_dxcc_only),
+            (self.favorable_path_priority_action, settings.prioritize_favorable_path_in_reply),
+            (self.exclude_worked_history_action, settings.exclude_previously_worked_calls),
+        ):
+            if action.isChecked() != bool(checked):
+                with QSignalBlocker(action):
+                    action.setChecked(bool(checked))
+        self._update_reply_mode_summary()
+
+    def _reconcile_reply_pollers(self, previous: UserSettings) -> None:
+        settings = self._settings
+        needs_mqtt = settings.pskreporter_mqtt_enabled or settings.wavelog_unconfirmed_dxcc_only
+        was_mqtt = previous.pskreporter_mqtt_enabled or previous.wavelog_unconfirmed_dxcc_only
+        if needs_mqtt and (not was_mqtt or self._pskreporter_mqtt is None):
+            self._start_pskreporter_mqtt()
+        elif not needs_mqtt and was_mqtt:
+            self._stop_pskreporter_mqtt()
+        if settings.prioritize_favorable_path_in_reply and not previous.prioritize_favorable_path_in_reply:
+            self._refresh_space_weather()
 
     def _update_ftx1_band_profiles(self, profiles: dict[str, dict[str, int]]) -> None:
         self._settings.ftx1_band_profiles = deepcopy(profiles)

@@ -67,6 +67,14 @@ class SettingsDialog(QDialog, SettingsTabsMixin):
 
     def settings(self) -> UserSettings:
         minimum_snr = None if self.minimum_snr.value() == -51 else self.minimum_snr.value()
+        # The Reply menu couples these two flags: rare tracking supplies the
+        # special-call list, while the dialog only exposes the scoring toggle.
+        # Keep one rule in both places so the menu and the dialog cannot drift.
+        rare_tracking = (
+            self.special_call_priority.isChecked()
+            or self.rare_stations_only.isChecked()
+            or self.unconfirmed_dxcc_only.isChecked()
+        )
         return replace(
             self._settings,
             local_callsign=self.callsign.text(),
@@ -77,13 +85,16 @@ class SettingsDialog(QDialog, SettingsTabsMixin):
             direct_call_policy=DirectCallPolicy(self.direct_policy.currentData()),
             allow_direct_call_dupes=self.dupe_policy.currentData() == "direct",
             allow_dupes=self.dupe_policy.currentData() == "all",
-            exclude_previously_worked_calls=self._settings.exclude_previously_worked_calls,
+            exclude_previously_worked_calls=self.exclude_worked_history.isChecked(),
             minimum_snr=minimum_snr,
             favor_strong_signals=self.strong_signals.isChecked(),
             pota_policy=ActivityPolicy(self.pota_policy.currentData()),
             sota_policy=ActivityPolicy(self.sota_policy.currentData()),
             qrp_policy=ActivityPolicy(self.qrp_policy.currentData()),
+            pskreporter_mqtt_enabled=rare_tracking,
             prioritize_special_calls_in_reply=self.special_call_priority.isChecked(),
+            rare_stations_only=self.rare_stations_only.isChecked(),
+            prioritize_favorable_path_in_reply=self.favorable_path_priority.isChecked(),
             respond_to_cq_dx=self.respond_cq_dx.isChecked(),
             blacklist=_csv_set(self.blacklist.text()),
             ignore_minutes=self.ignore_minutes.value(),
@@ -93,6 +104,7 @@ class SettingsDialog(QDialog, SettingsTabsMixin):
             wsjtx_executable_path=self.wsjtx_executable_path.text().strip(),
             sync_adif_on_startup=self.sync_adif.isChecked(),
             direct_reply_patched=False,
+            max_actions=self.max_actions.value(),
             max_no_progress_periods=self.max_no_progress.value(),
             stalled_qso_cooldown_seconds=float(self.stalled_cooldown.value()),
             remote_busy_cooldown_seconds=float(self.remote_busy_cooldown.value()),
@@ -142,6 +154,7 @@ class SettingsDialog(QDialog, SettingsTabsMixin):
             special_calls_refresh_minutes=self.special_calls_refresh.value(),
             special_calls_lookback_minutes=self.special_calls_lookback.value(),
             wavelog_api_url=self.wavelog_api_url.text().strip(),
+            wavelog_unconfirmed_dxcc_only=self.unconfirmed_dxcc_only.isChecked(),
             wavelog_api_token=self.wavelog_api_token.text().strip(),
             wavelog_lotw_refresh_minutes=self.wavelog_lotw_refresh.value(),
             logging_level=self.logging_level.currentData(),

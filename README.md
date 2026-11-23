@@ -8,7 +8,7 @@ actuelle n'offre plus de contact intéressant.
 L'opérateur reste responsable de la station, des émissions et du respect de
 la réglementation.
 
-**Statut : version stable 1.0.4.**
+**Statut : version stable 1.0.4 ; version 1.0.5 en préparation.**
 
 ## Installation
 

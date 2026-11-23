@@ -680,6 +680,83 @@ def test_preferences_can_prioritize_active_special_calls_in_reply() -> None:
     assert not dialog.settings().prioritize_special_calls_in_reply
 
 
+def test_preferences_expose_action_budget_and_all_reply_options() -> None:
+    QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        UserSettings(
+            max_actions=3,
+            rare_stations_only=True,
+            prioritize_favorable_path_in_reply=True,
+            exclude_previously_worked_calls=True,
+            wavelog_unconfirmed_dxcc_only=True,
+        ),
+        ap1_available=True,
+    )
+
+    assert dialog.max_actions.value() == 3
+    assert dialog.rare_stations_only.isChecked()
+    assert dialog.favorable_path_priority.isChecked()
+    assert dialog.exclude_worked_history.isChecked()
+    assert dialog.unconfirmed_dxcc_only.isChecked()
+
+    saved = dialog.settings()
+
+    assert saved.max_actions == 3
+    assert saved.rare_stations_only
+    assert saved.prioritize_favorable_path_in_reply
+    assert saved.exclude_previously_worked_calls
+    assert saved.wavelog_unconfirmed_dxcc_only
+    # Rare tracking is required by both "rare only" and LoTW modes.
+    assert saved.pskreporter_mqtt_enabled
+
+
+def test_preferences_rare_tracking_flag_follows_the_reply_checkboxes() -> None:
+    QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(UserSettings(prioritize_special_calls_in_reply=True), ap1_available=True)
+
+    assert dialog.settings().pskreporter_mqtt_enabled
+
+    dialog.special_call_priority.setChecked(False)
+
+    assert not dialog.settings().pskreporter_mqtt_enabled
+
+
+def test_apply_settings_synchronizes_reply_menu_without_reemitting_toggles(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    application = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0, worked_store_path=str(tmp_path / "worked.sqlite3")))
+    window = MainWindow(store)
+    monkeypatch.setattr(window, "_start_pskreporter_mqtt", lambda: None)
+    monkeypatch.setattr(window, "_stop_pskreporter_mqtt", lambda: None)
+    monkeypatch.setattr(window, "_refresh_space_weather", lambda: None)
+    application.processEvents()
+    toggled: list[bool] = []
+    window.rare_stations_only_action.toggled.connect(lambda checked: toggled.append(checked))
+    try:
+        window._apply_settings(
+            UserSettings(
+                udp_port=0,
+                pskreporter_mqtt_enabled=True,
+                rare_stations_only=True,
+                prioritize_favorable_path_in_reply=True,
+                exclude_previously_worked_calls=True,
+                wavelog_unconfirmed_dxcc_only=True,
+            )
+        )
+
+        assert window.rare_reply_tracking_action.isChecked()
+        assert window.rare_stations_only_action.isChecked()
+        assert window.favorable_path_priority_action.isChecked()
+        assert window.exclude_worked_history_action.isChecked()
+        assert window.unconfirmed_dxcc_only_action.isChecked()
+        assert toggled == []
+    finally:
+        window.close()
+        application.processEvents()
+
+
 def test_adaptive_controls_require_ap1_and_preserve_band_order() -> None:
     QApplication.instance() or QApplication([])
     dialog = SettingsDialog(

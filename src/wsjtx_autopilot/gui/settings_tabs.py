@@ -119,6 +119,20 @@ class SettingsTabsMixin:
         self.special_call_priority.setToolTip(
             "Utilise la liste FT8 vérifiée de l'onglet Hunt. Les appels directs qui vous sont adressés restent prioritaires."
         )
+        self.rare_stations_only = QCheckBox("Stations rares uniquement")
+        self.rare_stations_only.setChecked(self._settings.rare_stations_only)
+        self.rare_stations_only.setToolTip("Ignore les CQ et appels classiques.")
+        self.favorable_path_priority = QCheckBox("Priorité chemin favorable (SFI / Kp)")
+        self.favorable_path_priority.setChecked(self._settings.prioritize_favorable_path_in_reply)
+        self.favorable_path_priority.setToolTip(
+            "Départage les CQ ordinaires avec la distance, l'heure, le SFI et le Kp. "
+            "Ne bloque aucun CQ et ne prévaut jamais sur un appel direct."
+        )
+        self.exclude_worked_history = QCheckBox("Exclure les stations déjà contactées")
+        self.exclude_worked_history.setChecked(self._settings.exclude_previously_worked_calls)
+        self.exclude_worked_history.setToolTip(
+            "Écarte une station présente dans l'historique ADIF/WSJT-X, même un autre jour ou sur une autre bande."
+        )
         self.respond_cq_dx = QCheckBox("Respond to relative CQ DX calls")
         self.respond_cq_dx.setChecked(self._settings.respond_to_cq_dx)
         form.addRow("Preferred continents", self.continents)
@@ -130,6 +144,9 @@ class SettingsTabsMixin:
         form.addRow("SOTA", self.sota_policy)
         form.addRow("QRP", self.qrp_policy)
         form.addRow("Indicatifs spéciaux", self.special_call_priority)
+        form.addRow("Stations rares", self.rare_stations_only)
+        form.addRow("Chemin favorable", self.favorable_path_priority)
+        form.addRow("Historique", self.exclude_worked_history)
         form.addRow("CQ DX", self.respond_cq_dx)
         return widget
 
@@ -149,6 +166,10 @@ class SettingsTabsMixin:
         self.max_no_progress = QSpinBox()
         self.max_no_progress.setRange(1, 100)
         self.max_no_progress.setValue(self._settings.max_no_progress_periods)
+        self.max_actions = QSpinBox()
+        self.max_actions.setRange(1, 10)
+        self.max_actions.setValue(self._settings.max_actions)
+        self.max_actions.setToolTip("Nombre maximum de réponses automatiques par QSO (1 = une seule réponse).")
         self.stalled_cooldown = QSpinBox()
         self.stalled_cooldown.setRange(0, 86_400)
         self.stalled_cooldown.setSuffix(" seconds")
@@ -240,6 +261,7 @@ class SettingsTabsMixin:
         form.addRow("Blacklist", self.blacklist)
         form.addRow("Temporary ignore (minutes)", self.ignore_minutes)
         form.addRow("Max periods without progress", self.max_no_progress)
+        form.addRow("Actions max par QSO", self.max_actions)
         form.addRow("Maximum final 73 retries", self.max_final_retries)
         form.addRow(self.adaptive_enabled)
         form.addRow("No new station before switching", self.opportunity_quiet)
@@ -463,6 +485,9 @@ class SettingsTabsMixin:
         self.special_calls_lookback.setRange(60, 2880)
         self.special_calls_lookback.setSuffix(" minutes")
         self.special_calls_lookback.setValue(self._settings.special_calls_lookback_minutes)
+        self.unconfirmed_dxcc_only = QCheckBox("Priorité DXCC non validés LoTW")
+        self.unconfirmed_dxcc_only.setChecked(self._settings.wavelog_unconfirmed_dxcc_only)
+        self.unconfirmed_dxcc_only.setToolTip("Priorise les entités DXCC non confirmées dans LoTW selon Wavelog.")
         self.wavelog_api_url = QLineEdit(self._settings.wavelog_api_url)
         self.wavelog_api_url.setPlaceholderText("https://wavelog.example/index.php/api/v2")
         self.wavelog_api_token = QLineEdit(self._settings.wavelog_api_token)
@@ -483,6 +508,7 @@ class SettingsTabsMixin:
         form.addRow("Clé activité DX/FT8 (afu.tools)", self.special_calls_api_key)
         form.addRow("Actualisation indicatifs spéciaux", self.special_calls_refresh)
         form.addRow("Historique activité FT8", self.special_calls_lookback)
+        form.addRow(self.unconfirmed_dxcc_only)
         form.addRow("URL API Wavelog v2", self.wavelog_api_url)
         form.addRow("Jeton Wavelog (confirmation:read)", self.wavelog_api_token)
         form.addRow("Actualisation validations LoTW", self.wavelog_lotw_refresh)
