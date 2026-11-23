@@ -58,6 +58,14 @@ vérifie également ce fichier et teste la chaîne génération → vérificatio
 l'artefact construit. Le déroulé complet est décrit dans
 `docs/RELEASE_CHECKLIST.md`.
 
+## Signalements et suggestions
+
+Le bouton **SIGNALER** de l'écran principal ouvre le formulaire GitHub des
+issues : la version d'AutoPilot, le système et la version de Python y sont
+préremplis. Décris le bug rencontré ou l'amélioration souhaitée ; pour un
+problème lié à la radio ou au WSJT-X, joins le dernier journal
+`FT8-AutoPilot_*.log` et précise la bande et la version du WSJT-X.
+
 Pour le filtre **DXCC non validés LoTW uniquement**, renseigner également
 l'URL de l'API v2 Wavelog et un jeton `wl2_` ayant l'autorisation
 `confirmation:read` dans **Preferences > Diagnostic**. L'AutoPilot ne lit que

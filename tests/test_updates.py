@@ -1,17 +1,20 @@
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from wsjtx_autopilot.updates import (
     CHECKSUMS_NAME,
     INSTALLER_NAME,
+    NEW_ISSUE_URL,
     GitHubUpdateClient,
     ReleaseAsset,
     UpdateError,
     UpdateRelease,
     _checksum_for,
+    feedback_issue_url,
     parse_latest_release,
     version_key,
 )
@@ -35,6 +38,29 @@ def test_stable_github_release_with_verified_installer_is_offered() -> None:
     assert result.installable
     assert result.release is not None
     assert result.release.version == "1.1.0"
+
+
+def test_feedback_issue_url_prefills_diagnostic_metadata() -> None:
+    url = feedback_issue_url({"app_version": "v1.0.4", "os": "Windows-10", "python": "3.12.0"})
+    parts = urlparse(url)
+    query = parse_qs(parts.query)
+
+    assert parts.scheme == "https"
+    assert f"{parts.netloc}{parts.path}" == "github.com/F4NJU/FT8-Autopilot/issues/new"
+    assert url.startswith(NEW_ISSUE_URL)
+    assert query["title"] == ["[Bug / Suggestion] "]
+    body = query["body"][0]
+    assert "Version AutoPilot : v1.0.4" in body
+    assert "Système : Windows-10" in body
+    assert "Python : 3.12.0" in body
+    assert "Étapes pour reproduire" in body
+
+
+def test_feedback_issue_url_tolerates_missing_metadata() -> None:
+    body = parse_qs(urlparse(feedback_issue_url({})).query)["body"][0]
+
+    assert "Version AutoPilot : inconnue" in body
+    assert "Système : inconnu" in body
 
 
 def test_prerelease_and_unsupported_versions_are_never_offered() -> None:

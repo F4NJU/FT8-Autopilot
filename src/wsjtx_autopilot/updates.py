@@ -9,17 +9,40 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 GITHUB_RELEASES_URL = "https://api.github.com/repos/F4NJU/FT8-Autopilot/releases/latest"
 RELEASES_PAGE_URL = "https://github.com/F4NJU/FT8-Autopilot/releases"
+ISSUES_PAGE_URL = "https://github.com/F4NJU/FT8-Autopilot/issues"
+NEW_ISSUE_URL = f"{ISSUES_PAGE_URL}/new"
 INSTALLER_NAME = "WSJTX-AutoPilot-Setup.exe"
 CHECKSUMS_NAME = "SHA256SUMS.txt"
 _VERSION = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$", re.IGNORECASE)
+
+
+def feedback_issue_url(metadata: Mapping[str, object]) -> str:
+    """Build a pre-filled GitHub issue URL for a bug report or a suggestion."""
+    version = str(metadata.get("app_version") or "inconnue")
+    system = str(metadata.get("os") or "inconnu")
+    python = str(metadata.get("python") or "inconnue")
+    body = (
+        "Type : bug ou suggestion\n\n"
+        f"Version AutoPilot : {version}\n"
+        f"Système : {system}\n"
+        f"Python : {python}\n\n"
+        "Description :\n\n\n"
+        "Étapes pour reproduire (si bug) :\n\n\n"
+        "Comportement attendu :\n\n\n"
+        "Remarque : si le problème est lié à la radio ou au WSJT-X, joins le dernier journal "
+        "FT8-AutoPilot_*.log et précise la bande, le mode et la version du WSJT-X.\n"
+    )
+    return f"{NEW_ISSUE_URL}?{urlencode({'title': '[Bug / Suggestion] ', 'body': body})}"
 
 
 class UpdateError(RuntimeError):

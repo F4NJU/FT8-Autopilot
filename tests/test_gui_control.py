@@ -1,6 +1,7 @@
 import socket
 from datetime import datetime, time, timedelta, timezone
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 from PySide6.QtCore import QSize
 from PySide6.QtGui import QCloseEvent
@@ -12,6 +13,7 @@ from wsjtx_autopilot.control.wsjtx_udp import WsjtxUdpControl
 from wsjtx_autopilot.engine.models import ActionKind, ActionOutcome, EngineEvent, EngineEventKind, IntendedAction, OriginalDecode
 from wsjtx_autopilot.engine.state import QsoState
 from wsjtx_autopilot.ftx1 import FTX1CatController
+from wsjtx_autopilot.gui import main_window as main_window_module
 from wsjtx_autopilot.gui.main_window import MainWindow, SettingsDialog
 from wsjtx_autopilot.gui.worker import BackendWorker
 from wsjtx_autopilot.runtime import AutopilotRuntime, HaltTxResult
@@ -260,6 +262,58 @@ def test_gui_confirmation_emits_arm_request(tmp_path, monkeypatch) -> None:
         window._toggle_arm()
 
         assert requested == [True]
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def test_gui_feedback_button_opens_prefilled_github_issue(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    application = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0, worked_store_path=str(tmp_path / "worked.sqlite3")))
+    opened: list[str] = []
+    monkeypatch.setattr(
+        main_window_module.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toString()) or True,
+    )
+    window = MainWindow(store)
+    application.processEvents()
+    try:
+        assert window.feedback_button.text() == "SIGNALER"
+
+        window.feedback_button.click()
+
+        assert len(opened) == 1
+        parts = urlparse(opened[0])
+        assert f"{parts.netloc}{parts.path}" == "github.com/F4NJU/FT8-Autopilot/issues/new"
+        body = parse_qs(parts.query)["body"][0]
+        assert f"Version AutoPilot : {window._build_metadata['app_version']}" in body
+        assert f"Système : {window._build_metadata['os']}" in body
+        assert "Formulaire de signalement ouvert sur GitHub." in window.statusBar().currentMessage()
+    finally:
+        window.close()
+        application.processEvents()
+
+
+def test_gui_feedback_button_warns_when_browser_cannot_open(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+    application = QApplication.instance() or QApplication([])
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(UserSettings(udp_port=0, worked_store_path=str(tmp_path / "worked.sqlite3")))
+    monkeypatch.setattr(main_window_module.QDesktopServices, "openUrl", lambda url: False)
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    window = MainWindow(store)
+    application.processEvents()
+    try:
+        window._open_feedback_form()
+
+        assert len(warnings) == 1
+        assert warnings[0][1] == "Signalement impossible"
     finally:
         window.close()
         application.processEvents()

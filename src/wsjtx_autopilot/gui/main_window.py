@@ -1,8 +1,8 @@
 import logging
 from copy import deepcopy
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -26,7 +26,7 @@ from wsjtx_autopilot.config import SettingsStore, UserSettings
 # existing monkeypatches of ``main_window.list_supported_radios`` still apply.
 from wsjtx_autopilot.hamlib import list_supported_radios  # noqa: F401
 from wsjtx_autopilot.logging_setup import build_metadata, set_file_log_level
-from wsjtx_autopilot.updates import UpdateRelease, version_key
+from wsjtx_autopilot.updates import UpdateRelease, feedback_issue_url, version_key
 
 from .activity_panel import ActivityPanelMixin
 from .adaptive_panel import AdaptivePanelMixin
@@ -90,7 +90,8 @@ class MainWindow(
         self._update_check_poller: UpdateCheckPoller | None = None
         self._update_download_poller: UpdateDownloadPoller | None = None
         self._available_update: UpdateRelease | None = None
-        self._current_version = str(build_metadata().get("app_version", ""))
+        self._build_metadata = build_metadata()
+        self._current_version = str(self._build_metadata.get("app_version", ""))
         self._local_grid = ""
         self._session_qso_points: list[SessionQsoMapPoint] = []
         self._session_map_dialog: SessionQsoMapDialog | None = None
@@ -199,6 +200,10 @@ class MainWindow(
         self.update_button.clicked.connect(self._on_update_button_clicked)
         settings_button = QPushButton("PREFERENCES")
         settings_button.clicked.connect(self._edit_settings)
+        self.feedback_button = QPushButton("SIGNALER")
+        self.feedback_button.setObjectName("feedbackButton")
+        self.feedback_button.setToolTip("Signaler un bug ou proposer une amélioration (formulaire GitHub).")
+        self.feedback_button.clicked.connect(self._open_feedback_form)
         self.antenna_indicator = QLabel("●  OK")
         self.antenna_indicator.setObjectName("antennaSafety")
         self.antenna_indicator.setProperty("level", "ok")
@@ -216,6 +221,7 @@ class MainWindow(
         header.addWidget(self.reset_swr_safety_button)
         header.addWidget(self.update_button)
         header.addWidget(settings_button)
+        header.addWidget(self.feedback_button)
         header.addWidget(self.arm_button)
         layout.addLayout(header)
 
@@ -433,6 +439,19 @@ class MainWindow(
         dialog = SettingsDialog(self._settings, self, self._ap1_available)
         dialog.settings_applied.connect(self._apply_settings)
         dialog.exec()
+
+    def _open_feedback_form(self) -> None:
+        url = QUrl(feedback_issue_url(self._build_metadata))
+        if not QDesktopServices.openUrl(url):
+            LOGGER.error("[GUI] unable to open feedback form url=%s", url.toString())
+            QMessageBox.warning(
+                self,
+                "Signalement impossible",
+                "Le navigateur n'a pas pu être ouvert. Ouvre manuellement la page des issues du projet sur GitHub.",
+            )
+            return
+        LOGGER.info("[GUI] feedback form opened")
+        self.statusBar().showMessage("Formulaire de signalement ouvert sur GitHub.", 6_000)
 
     def _apply_settings(self, settings: UserSettings) -> None:
         self.hunt_panel.set_hunting(False)
